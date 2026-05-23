@@ -1,33 +1,51 @@
 package admin
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/will-wang-88/llmgateway/internal/backend"
 	"github.com/will-wang-88/llmgateway/internal/config"
 	"github.com/will-wang-88/llmgateway/internal/logging"
+	"github.com/will-wang-88/llmgateway/internal/logstore"
 	"github.com/will-wang-88/llmgateway/internal/proxy"
+	"github.com/will-wang-88/llmgateway/internal/quota"
 	"github.com/will-wang-88/llmgateway/internal/store"
 )
 
 // Server hosts the /admin/* HTTP API for managing the gateway at runtime.
-// Authentication uses a static bearer token (cfg.Admin.BindToken) or basic auth
-// (cfg.Admin.Username + Password). The token is read once at startup; in
-// production deployments this should be sourced from a secret manager.
 type Server struct {
 	cfg     *config.Config
 	store   *store.Store
 	health  *backend.HealthChecker
 	logger  *logging.Logger
+	users   *Users
+	logs    logstore.Store
+	quota   *quota.Manager
 }
 
 func NewServer(cfg *config.Config, s *store.Store, hc *backend.HealthChecker, log *logging.Logger) *Server {
-	return &Server{cfg: cfg, store: s, health: hc, logger: log}
+	return &Server{cfg: cfg, store: s, health: hc, logger: log, users: NewUsers()}
 }
+
+// WithUsers attaches an in-memory user store and loads users from config.
+func (s *Server) WithUsers(u *Users) *Server { s.users = u; return s }
+
+// WithLogStore attaches a persistent log store.
+func (s *Server) WithLogStore(ls logstore.Store) *Server { s.logs = ls; return s }
+
+// WithQuota attaches a quota manager (for usage reporting).
+func (s *Server) WithQuota(q *quota.Manager) *Server { s.quota = q; return s }
+
+// Users returns the underlying user store (used by callers that need to
+// register pre-loaded users).
+func (s *Server) Users() *Users { return s.users }
 
 func (s *Server) Register(mux *http.ServeMux) {
 	auth := s.authMiddleware
@@ -53,6 +71,27 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.Handle("DELETE /admin/api-keys/{id}", auth(http.HandlerFunc(s.deleteAPIKey)))
 
 	mux.Handle("GET /admin/stats/overview", auth(http.HandlerFunc(s.statsOverview)))
+
+	mux.Handle("GET /admin/logs", auth(http.HandlerFunc(s.listLogs)))
+	mux.Handle("GET /admin/audit", auth(http.HandlerFunc(s.listAudit)))
+
+	mux.Handle("GET /admin/users", auth(http.HandlerFunc(s.listUsers)))
+	mux.Handle("POST /admin/users", auth(http.HandlerFunc(s.createUser)))
+	mux.Handle("DELETE /admin/users/{username}", auth(http.HandlerFunc(s.deleteUser)))
+
+	mux.Handle("GET /admin/api-keys/{id}/usage", auth(http.HandlerFunc(s.keyUsage)))
+
+	mux.Handle("GET /admin/me", auth(http.HandlerFunc(s.me)))
+}
+
+type ctxKey struct{ name string }
+
+var adminUserKey = ctxKey{"adminUser"}
+
+// AdminUserFromContext returns the authenticated admin User if any.
+func AdminUserFromContext(ctx context.Context) (*User, bool) {
+	u, ok := ctx.Value(adminUserKey).(*User)
+	return u, ok
 }
 
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
@@ -61,29 +100,99 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			proxy.WriteError(w, http.StatusForbidden, proxy.PermissionError("Admin API is disabled", "admin_disabled"))
 			return
 		}
+		// 1. Bearer token (super_admin)
 		if s.cfg.Admin.BindToken != "" {
-			auth := r.Header.Get("Authorization")
-			if !strings.HasPrefix(auth, "Bearer ") {
-				proxy.WriteError(w, http.StatusUnauthorized, proxy.Unauthorized("Missing admin token", "invalid_admin_token"))
-				return
+			authHeader := r.Header.Get("Authorization")
+			if strings.HasPrefix(authHeader, "Bearer ") {
+				provided := strings.TrimPrefix(authHeader, "Bearer ")
+				if subtle.ConstantTimeCompare([]byte(provided), []byte(s.cfg.Admin.BindToken)) == 1 {
+					tokenUser := &User{Username: "token", Role: RoleSuperAdmin}
+					next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), adminUserKey, tokenUser)))
+					return
+				}
 			}
-			provided := strings.TrimPrefix(auth, "Bearer ")
-			if subtle.ConstantTimeCompare([]byte(provided), []byte(s.cfg.Admin.BindToken)) != 1 {
-				proxy.WriteError(w, http.StatusUnauthorized, proxy.Unauthorized("Invalid admin token", "invalid_admin_token"))
-				return
-			}
-		} else if s.cfg.Admin.Username != "" {
+		}
+		// 2. HTTP Basic auth with multi-user RBAC
+		if s.users != nil && len(s.users.List()) > 0 {
 			u, p, ok := r.BasicAuth()
-			if !ok ||
-				subtle.ConstantTimeCompare([]byte(u), []byte(s.cfg.Admin.Username)) != 1 ||
-				subtle.ConstantTimeCompare([]byte(p), []byte(s.cfg.Admin.Password)) != 1 {
-				w.Header().Set("WWW-Authenticate", `Basic realm="admin"`)
-				proxy.WriteError(w, http.StatusUnauthorized, proxy.Unauthorized("Invalid admin credentials", "invalid_admin_credentials"))
+			if ok {
+				user, found := s.users.Get(u)
+				if found && user.PasswordHash != "" &&
+					subtle.ConstantTimeCompare([]byte(HashPassword(p)), []byte(user.PasswordHash)) == 1 {
+					next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), adminUserKey, user)))
+					return
+				}
+			}
+		}
+		// 3. Legacy single-username auth.
+		if s.cfg.Admin.Username != "" {
+			u, p, ok := r.BasicAuth()
+			if ok &&
+				subtle.ConstantTimeCompare([]byte(u), []byte(s.cfg.Admin.Username)) == 1 &&
+				subtle.ConstantTimeCompare([]byte(p), []byte(s.cfg.Admin.Password)) == 1 {
+				legacyUser := &User{Username: u, Role: RoleAdmin}
+				next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), adminUserKey, legacyUser)))
 				return
 			}
 		}
-		next.ServeHTTP(w, r)
+		w.Header().Set("WWW-Authenticate", `Basic realm="admin"`)
+		proxy.WriteError(w, http.StatusUnauthorized, proxy.Unauthorized("Invalid admin credentials", "invalid_admin_credentials"))
 	})
+}
+
+func (s *Server) requirePerm(action string, w http.ResponseWriter, r *http.Request) bool {
+	user, _ := AdminUserFromContext(r.Context())
+	if user == nil {
+		proxy.WriteError(w, http.StatusUnauthorized, proxy.Unauthorized("No admin user in context", "missing_admin_user"))
+		return false
+	}
+	if !HasPermission(user.Role, action) {
+		proxy.WriteError(w, http.StatusForbidden, proxy.PermissionError(
+			"Role "+string(user.Role)+" not allowed: "+action, "permission_denied"))
+		return false
+	}
+	return true
+}
+
+// audit emits an audit event for a successful admin write.
+func (s *Server) audit(r *http.Request, action, targetType, targetID string, oldVal, newVal map[string]any) {
+	if s.logs == nil {
+		return
+	}
+	user, _ := AdminUserFromContext(r.Context())
+	username := "anonymous"
+	if user != nil {
+		username = user.Username
+	}
+	evt := &logstore.AuditEvent{
+		ID:         uuid.New().String(),
+		AdminUser:  username,
+		Action:     action,
+		TargetType: targetType,
+		TargetID:   targetID,
+		OldValue:   oldVal,
+		NewValue:   newVal,
+		IP:         clientIP(r),
+		UserAgent:  r.Header.Get("User-Agent"),
+		CreatedAt:  time.Now().UTC(),
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := s.logs.AppendAudit(ctx, evt); err != nil {
+			s.logger.Warn("audit append failed", logging.F("error", err.Error()))
+		}
+	}()
+}
+
+func clientIP(r *http.Request) string {
+	if v := r.Header.Get("X-Forwarded-For"); v != "" {
+		if idx := strings.IndexByte(v, ','); idx > 0 {
+			return strings.TrimSpace(v[:idx])
+		}
+		return strings.TrimSpace(v)
+	}
+	return r.RemoteAddr
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -153,6 +262,9 @@ type backendBody struct {
 }
 
 func (s *Server) createBackend(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePerm("manage_backends", w, r) {
+		return
+	}
 	var b backendBody
 	if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
 		proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest("Invalid JSON: "+err.Error(), "invalid_json"))
@@ -182,6 +294,9 @@ func (s *Server) createBackend(w http.ResponseWriter, r *http.Request) {
 	}
 	s.store.UpsertBackend(bk)
 	s.health.CheckOnce(bk)
+	s.audit(r, "backend.create", "backend", b.ID, nil, map[string]any{
+		"id": b.ID, "base_url": bk.BaseURL, "models": bk.Models, "enabled": bk.Enabled,
+	})
 	writeJSON(w, http.StatusCreated, map[string]any{"id": b.ID, "status": "created"})
 }
 
@@ -213,6 +328,9 @@ func (s *Server) getBackend(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) patchBackend(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePerm("manage_backends", w, r) {
+		return
+	}
 	id := r.PathValue("id")
 	b, err := s.store.Backend(id)
 	if err != nil {
@@ -258,16 +376,24 @@ func (s *Server) patchBackend(w http.ResponseWriter, r *http.Request) {
 		b.Tags = body.Tags
 	}
 	s.store.UpsertBackend(b)
+	s.audit(r, "backend.update", "backend", b.ID, nil, nil)
 	writeJSON(w, http.StatusOK, map[string]any{"id": b.ID, "status": "updated"})
 }
 
 func (s *Server) deleteBackend(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePerm("manage_backends", w, r) {
+		return
+	}
 	id := r.PathValue("id")
 	s.store.DeleteBackend(id)
+	s.audit(r, "backend.delete", "backend", id, nil, nil)
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) enableBackend(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePerm("backend_toggle", w, r) {
+		return
+	}
 	id := r.PathValue("id")
 	b, err := s.store.Backend(id)
 	if err != nil {
@@ -276,10 +402,14 @@ func (s *Server) enableBackend(w http.ResponseWriter, r *http.Request) {
 	}
 	b.Enabled = true
 	s.store.UpsertBackend(b)
+	s.audit(r, "backend.enable", "backend", id, nil, nil)
 	writeJSON(w, http.StatusOK, map[string]any{"id": id, "enabled": true})
 }
 
 func (s *Server) disableBackend(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePerm("backend_toggle", w, r) {
+		return
+	}
 	id := r.PathValue("id")
 	b, err := s.store.Backend(id)
 	if err != nil {
@@ -288,10 +418,14 @@ func (s *Server) disableBackend(w http.ResponseWriter, r *http.Request) {
 	}
 	b.Enabled = false
 	s.store.UpsertBackend(b)
+	s.audit(r, "backend.disable", "backend", id, nil, nil)
 	writeJSON(w, http.StatusOK, map[string]any{"id": id, "enabled": false})
 }
 
 func (s *Server) healthCheck(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePerm("backend_toggle", w, r) {
+		return
+	}
 	id := r.PathValue("id")
 	b, err := s.store.Backend(id)
 	if err != nil {
@@ -340,6 +474,9 @@ type modelBody struct {
 }
 
 func (s *Server) upsertModel(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePerm("manage_models", w, r) {
+		return
+	}
 	var b modelBody
 	if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
 		proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest("Invalid JSON: "+err.Error(), "invalid_json"))
@@ -363,11 +500,17 @@ func (s *Server) upsertModel(w http.ResponseWriter, r *http.Request) {
 		Name: b.Name, Type: b.Type, Enabled: enabled, ContextLength: b.ContextLength,
 		CapabilityMode: b.CapabilityMode, Capabilities: b.Capabilities, RoutingPolicy: b.RoutingPolicy,
 	})
+	s.audit(r, "model.upsert", "model", b.Name, nil, map[string]any{"name": b.Name, "enabled": enabled})
 	writeJSON(w, http.StatusOK, map[string]any{"name": b.Name, "status": "ok"})
 }
 
 func (s *Server) deleteModel(w http.ResponseWriter, r *http.Request) {
-	s.store.DeleteModel(r.PathValue("name"))
+	if !s.requirePerm("manage_models", w, r) {
+		return
+	}
+	name := r.PathValue("name")
+	s.store.DeleteModel(name)
+	s.audit(r, "model.delete", "model", name, nil, nil)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -392,6 +535,9 @@ type aliasBody struct {
 }
 
 func (s *Server) upsertAlias(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePerm("manage_models", w, r) {
+		return
+	}
 	var b aliasBody
 	if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
 		proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest("Invalid JSON: "+err.Error(), "invalid_json"))
@@ -411,11 +557,17 @@ func (s *Server) upsertAlias(w http.ResponseWriter, r *http.Request) {
 	s.store.UpsertModelAlias(&store.ModelAlias{
 		Alias: b.Alias, InternalModel: b.InternalModel, ForwardingMode: b.ForwardingMode, Enabled: enabled,
 	})
+	s.audit(r, "alias.upsert", "alias", b.Alias, nil, map[string]any{"alias": b.Alias, "internal_model": b.InternalModel})
 	writeJSON(w, http.StatusOK, map[string]any{"alias": b.Alias, "status": "ok"})
 }
 
 func (s *Server) deleteAlias(w http.ResponseWriter, r *http.Request) {
-	s.store.DeleteModelAlias(r.PathValue("alias"))
+	if !s.requirePerm("manage_models", w, r) {
+		return
+	}
+	alias := r.PathValue("alias")
+	s.store.DeleteModelAlias(alias)
+	s.audit(r, "alias.delete", "alias", alias, nil, nil)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -463,6 +615,9 @@ func (s *Server) listAPIKeys(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) createAPIKey(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePerm("manage_keys", w, r) {
+		return
+	}
 	var b apiKeyBody
 	if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
 		proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest("Invalid JSON: "+err.Error(), "invalid_json"))
@@ -493,6 +648,9 @@ func (s *Server) createAPIKey(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.store.UpsertAPIKey(k, b.Key)
+	s.audit(r, "api_key.create", "api_key", k.ID, nil, map[string]any{
+		"id": k.ID, "allowed_models": k.AllowedModels,
+	})
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"id":         k.ID,
 		"key_prefix": k.KeyPrefix,
@@ -502,7 +660,12 @@ func (s *Server) createAPIKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteAPIKey(w http.ResponseWriter, r *http.Request) {
-	s.store.DeleteAPIKey(r.PathValue("id"))
+	if !s.requirePerm("manage_keys", w, r) {
+		return
+	}
+	id := r.PathValue("id")
+	s.store.DeleteAPIKey(id)
+	s.audit(r, "api_key.delete", "api_key", id, nil, nil)
 	w.WriteHeader(http.StatusNoContent)
 }
 

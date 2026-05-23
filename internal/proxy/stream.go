@@ -115,6 +115,9 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, resp *http.Response, start
 						opts.OnStreamUsage(u)
 					}
 				}
+				if opts.OnStreamChunk != nil {
+					opts.OnStreamChunk(res.line)
+				}
 			}
 			if res.err != nil {
 				if !errors.Is(res.err, io.EOF) {

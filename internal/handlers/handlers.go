@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,8 +16,11 @@ import (
 	"github.com/will-wang-88/llmgateway/internal/balancer"
 	"github.com/will-wang-88/llmgateway/internal/config"
 	"github.com/will-wang-88/llmgateway/internal/logging"
+	"github.com/will-wang-88/llmgateway/internal/logstore"
 	"github.com/will-wang-88/llmgateway/internal/metrics"
 	"github.com/will-wang-88/llmgateway/internal/proxy"
+	"github.com/will-wang-88/llmgateway/internal/queue"
+	"github.com/will-wang-88/llmgateway/internal/quota"
 	"github.com/will-wang-88/llmgateway/internal/ratelimit"
 	"github.com/will-wang-88/llmgateway/internal/store"
 )
@@ -30,6 +34,9 @@ type Handler struct {
 	concurrency *ratelimit.Concurrency
 	logger      *logging.Logger
 	metrics     *metrics.Metrics
+	logstore    logstore.Store
+	quota       *quota.Manager
+	queue       *queue.Manager
 }
 
 func New(
@@ -53,6 +60,15 @@ func New(
 		metrics:     m,
 	}
 }
+
+// WithLogStore attaches a persistent log store for request/audit logs.
+func (h *Handler) WithLogStore(ls logstore.Store) *Handler { h.logstore = ls; return h }
+
+// WithQuota attaches a quota manager.
+func (h *Handler) WithQuota(q *quota.Manager) *Handler { h.quota = q; return h }
+
+// WithQueue attaches a request queue for backpressure.
+func (h *Handler) WithQueue(q *queue.Manager) *Handler { h.queue = q; return h }
 
 // ListModels implements GET /v1/models.
 // It returns the union of every model declared by an enabled backend, plus any
@@ -198,16 +214,29 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 			return
 		}
 
-		// Rate limit + concurrency for the API key.
+		// Rate limit + concurrency + quota for the API key.
 		if apiKey != nil {
 			rlCode := h.applyAPIKeyLimits(apiKey)
 			if rlCode != "" {
 				h.metrics.RateLimitHits.WithLabelValues(apiKey.ID, rlCode).Inc()
+				h.recordLog(r.Context(), requestID, apiKey, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusTooManyRequests, rlCode, nil, time.Since(started).Milliseconds(), 0, raw, nil)
 				proxy.WriteError(w, http.StatusTooManyRequests, proxy.RateLimit(
 					"Rate limit exceeded: "+rlCode,
 					rlCode,
 				))
 				return
+			}
+			if h.quota != nil && apiKey.Quota != nil {
+				if code := h.quota.Check(apiKey.ID,
+					apiKey.Quota.DailyRequests, apiKey.Quota.DailyTokens,
+					apiKey.Quota.MonthlyRequests, apiKey.Quota.MonthlyTokens); code != "" {
+					h.metrics.RateLimitHits.WithLabelValues(apiKey.ID, code).Inc()
+					h.recordLog(r.Context(), requestID, apiKey, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusTooManyRequests, code, nil, time.Since(started).Milliseconds(), 0, raw, nil)
+					proxy.WriteError(w, http.StatusTooManyRequests, proxy.RateLimit(
+						"Quota exceeded: "+code, code,
+					))
+					return
+				}
 			}
 			concurrencyLimit := 0
 			if apiKey.RateLimit != nil {
@@ -215,6 +244,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 			}
 			if !h.concurrency.Acquire("key:"+apiKey.ID, concurrencyLimit) {
 				h.metrics.RateLimitHits.WithLabelValues(apiKey.ID, "concurrent_limit").Inc()
+				h.recordLog(r.Context(), requestID, apiKey, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusTooManyRequests, "concurrent_limit", nil, time.Since(started).Milliseconds(), 0, raw, nil)
 				proxy.WriteError(w, http.StatusTooManyRequests, proxy.RateLimit(
 					"Concurrent request limit exceeded",
 					"concurrent_limit",
@@ -222,6 +252,24 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 				return
 			}
 			defer h.concurrency.Release("key:" + apiKey.ID)
+		}
+
+		// Request queue (backpressure). Optional; only used if enabled.
+		if h.queue != nil && h.cfg.Queue.Enabled {
+			release, err := h.queue.Acquire(r.Context(), "model:"+internalModel)
+			if err != nil {
+				code := "queue_timeout"
+				status := http.StatusTooManyRequests
+				if errors.Is(err, queue.ErrFull) {
+					code = "queue_full"
+				}
+				h.metrics.RateLimitHits.WithLabelValues(apiKeyID(apiKey), code).Inc()
+				h.recordLog(r.Context(), requestID, apiKey, peek.Model, internalModel, "", upstreamPath, isStream, status, code, nil, time.Since(started).Milliseconds(), 0, raw, nil)
+				proxy.WriteError(w, status, proxy.RateLimit("Queue: "+code, code))
+				return
+			}
+			defer release()
+			h.metrics.QueueDepth.WithLabelValues("model:" + internalModel).Set(float64(h.queue.Depth("model:" + internalModel)))
 		}
 
 		// API-key delay (QoS).
@@ -246,7 +294,8 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 		if m, ok := h.store.Model(internalModel); ok && m.RoutingPolicy != "" {
 			policy = balancer.Policy(m.RoutingPolicy)
 		}
-		picked := h.balancer.Choose(internalModel, policy, ready)
+		hint := balancer.Hint{APIKeyID: apiKeyID(apiKey)}
+		picked := h.balancer.Choose(internalModel, policy, ready, hint)
 		if picked == nil {
 			proxy.WriteError(w, http.StatusServiceUnavailable, proxy.BackendUnavailable(
 				fmt.Sprintf("No healthy backend available for model: %s", peek.Model),
@@ -257,7 +306,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 		if !picked.AcquireSlot() {
 			// Lost the race to another request; pick again from remaining.
 			ready = filterRoutable(candidates)
-			picked = h.balancer.Choose(internalModel, policy, ready)
+			picked = h.balancer.Choose(internalModel, policy, ready, hint)
 			if picked == nil || !picked.AcquireSlot() {
 				proxy.WriteError(w, http.StatusServiceUnavailable, proxy.BackendUnavailable(
 					"All matching backends at capacity",
@@ -280,6 +329,16 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 		}
 		h.metrics.ActiveRequests.WithLabelValues(internalModel, picked.ID).Inc()
 		defer h.metrics.ActiveRequests.WithLabelValues(internalModel, picked.ID).Dec()
+		if h.quota != nil {
+			h.quota.AddRequest(apiKeyLabel)
+		}
+
+		var ttftMS int64
+		var capturedUsage proxy.Usage
+		var rawResp []byte
+		captureRawResp := h.shouldLog(apiKey, "log_raw_response")
+		captureStreamChunks := h.shouldLog(apiKey, "log_stream_chunks")
+		var streamBuf []byte
 
 		opts := proxy.ForwardOptions{
 			Method:              http.MethodPost,
@@ -294,14 +353,31 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 			APIKeyLabel:         apiKeyLabel,
 			Endpoint:            upstreamPath,
 			OnTTFT: func(d time.Duration) {
+				ttftMS = d.Milliseconds()
 				h.metrics.TTFT.WithLabelValues(internalModel, picked.ID).Observe(d.Seconds())
 			},
 			OnUsage: func(u *proxy.Usage) {
+				if u != nil {
+					capturedUsage = *u
+				}
 				h.recordUsage(u, internalModel, picked.ID, apiKeyLabel, apiKey)
 			},
 			OnStreamUsage: func(u *proxy.Usage) {
+				if u != nil {
+					capturedUsage = *u
+				}
 				h.recordUsage(u, internalModel, picked.ID, apiKeyLabel, apiKey)
 			},
+		}
+		if captureRawResp {
+			opts.OnRawResponse = func(body []byte) {
+				rawResp = append(rawResp[:0], body...)
+			}
+		}
+		if captureStreamChunks {
+			opts.OnStreamChunk = func(line []byte) {
+				streamBuf = append(streamBuf, line...)
+			}
 		}
 
 		statusCode, ferr := h.proxy.Forward(r.Context(), w, r, opts)
@@ -317,6 +393,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 			upstreamPath, internalModel, picked.ID, boolLabel(isStream),
 		).Observe(time.Since(started).Seconds())
 
+		latencyMS := time.Since(started).Milliseconds()
 		if h.shouldLog(apiKey, "log_metadata") || ferr != nil {
 			fields := logging.F(
 				"request_id", requestID,
@@ -327,7 +404,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 				"backend_id", picked.ID,
 				"status_code", statusCode,
 				"stream", isStream,
-				"latency_ms", time.Since(started).Milliseconds(),
+				"latency_ms", latencyMS,
 				"api_key_id", apiKeyLabel,
 			)
 			if h.shouldLog(apiKey, "log_raw_request") {
@@ -340,7 +417,89 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 				h.logger.Info("request completed", fields)
 			}
 		}
+
+		// Persistent request log (if a log store is attached).
+		if h.logstore != nil {
+			var rawReqForLog []byte
+			if h.shouldLog(apiKey, "log_raw_request") {
+				rawReqForLog = forwardBody
+			}
+			var rawRespForLog []byte
+			if isStream && captureStreamChunks {
+				rawRespForLog = streamBuf
+			} else if !isStream && captureRawResp {
+				rawRespForLog = rawResp
+			}
+			h.recordLog(r.Context(), requestID, apiKey, peek.Model, internalModel, picked.ID,
+				upstreamPath, isStream, statusCode, errorCodeFromForward(ferr, statusCode),
+				&capturedUsage, latencyMS, ttftMS, rawReqForLog, rawRespForLog)
+		}
 	}
+}
+
+func errorCodeFromForward(err error, statusCode int) string {
+	if err != nil && statusCode == 0 {
+		return "forward_error"
+	}
+	if statusCode >= 400 {
+		return statusCodeLabel(statusCode)
+	}
+	return ""
+}
+
+// recordLog writes a single request-log entry to the persistent log store.
+func (h *Handler) recordLog(ctx context.Context, requestID string, k *store.APIKey,
+	model, internalModel, backendID, endpoint string, stream bool, statusCode int,
+	errorCode string, usage *proxy.Usage, latencyMS, ttftMS int64,
+	rawReq, rawResp []byte) {
+	if h.logstore == nil {
+		return
+	}
+	rec := &logstore.RequestLog{
+		ID:            uuid.New().String(),
+		RequestID:     requestID,
+		Model:         model,
+		InternalModel: internalModel,
+		BackendID:     backendID,
+		Endpoint:      endpoint,
+		Stream:        stream,
+		StatusCode:    statusCode,
+		ErrorCode:     errorCode,
+		LatencyMS:     latencyMS,
+		TTFTMS:        ttftMS,
+		CreatedAt:     time.Now().UTC(),
+	}
+	if k != nil {
+		rec.APIKeyID = k.ID
+		rec.APIKeyName = k.Name
+	}
+	if usage != nil {
+		rec.PromptTokens = usage.PromptTokens
+		rec.CompletionTokens = usage.CompletionTokens
+		rec.TotalTokens = usage.TotalTokens
+		rec.ReasoningTokens = usage.ReasoningTokens
+	}
+	if len(rawReq) > 0 {
+		rec.RawRequest = string(rawReq)
+	}
+	if len(rawResp) > 0 {
+		rec.RawResponse = string(rawResp)
+	}
+	// Fire-and-forget so a slow log store can't block request completion.
+	go func(r *logstore.RequestLog) {
+		c, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := h.logstore.AppendRequest(c, r); err != nil {
+			h.logger.Warn("logstore append failed", logging.F("error", err.Error()))
+		}
+	}(rec)
+}
+
+func apiKeyID(k *store.APIKey) string {
+	if k == nil {
+		return "anonymous"
+	}
+	return k.ID
 }
 
 func (h *Handler) recordUsage(u *proxy.Usage, model, backendID, apiKeyLabel string, apiKey *store.APIKey) {
@@ -361,6 +520,9 @@ func (h *Handler) recordUsage(u *proxy.Usage, model, backendID, apiKeyLabel stri
 		if apiKey.RateLimit != nil && apiKey.RateLimit.TokensPerMinute > 0 {
 			h.limiter.AddTokens("tok:"+apiKey.ID, u.TotalTokens)
 		}
+	}
+	if h.quota != nil && u.TotalTokens > 0 {
+		h.quota.AddTokens(apiKeyLabel, u.TotalTokens)
 	}
 }
 

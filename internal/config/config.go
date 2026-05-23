@@ -17,11 +17,16 @@ type Config struct {
 	Logging     LoggingConfig     `yaml:"logging"`
 	Metrics     MetricsConfig     `yaml:"metrics"`
 	Admin       AdminConfig       `yaml:"admin"`
+	Storage     StorageConfig     `yaml:"storage"`
+	Queue       QueueConfig       `yaml:"queue"`
+	Tracing     TracingConfig     `yaml:"tracing"`
+	Dashboard   DashboardConfig   `yaml:"dashboard"`
 
-	Backends      []BackendConfig     `yaml:"backends"`
-	Models        []ModelConfig       `yaml:"models"`
-	ModelAliases  []ModelAliasConfig  `yaml:"model_aliases"`
-	APIKeys       []APIKeyConfig      `yaml:"api_keys"`
+	Backends     []BackendConfig    `yaml:"backends"`
+	Models       []ModelConfig      `yaml:"models"`
+	ModelAliases []ModelAliasConfig `yaml:"model_aliases"`
+	APIKeys      []APIKeyConfig     `yaml:"api_keys"`
+	AdminUsers   []AdminUserConfig  `yaml:"admin_users"`
 }
 
 type ServerConfig struct {
@@ -83,6 +88,39 @@ type AdminConfig struct {
 	BindToken  string `yaml:"bind_token"`
 }
 
+type AdminUserConfig struct {
+	Username     string `yaml:"username"`
+	Password     string `yaml:"password"`
+	PasswordHash string `yaml:"password_hash"`
+	Role         string `yaml:"role"` // super_admin, admin, operator, viewer, auditor
+	Email        string `yaml:"email"`
+}
+
+type StorageConfig struct {
+	Driver string `yaml:"driver"` // memory (default), sqlite
+	DSN    string `yaml:"dsn"`    // for sqlite: file path
+	LogRetentionDays int `yaml:"log_retention_days"`
+}
+
+type QueueConfig struct {
+	Enabled        bool `yaml:"enabled"`
+	MaxQueueSize   int  `yaml:"max_queue_size"`
+	QueueTimeoutMS int  `yaml:"queue_timeout_ms"`
+	PerModelLimit  int  `yaml:"per_model_limit"`
+}
+
+type TracingConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	Endpoint string `yaml:"endpoint"`     // OTLP HTTP endpoint, e.g. http://otel-collector:4318
+	Service  string `yaml:"service_name"`
+	SampleRatio float64 `yaml:"sample_ratio"`
+}
+
+type DashboardConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	BaseURL string `yaml:"base_url"` // optional reverse-proxy prefix
+}
+
 type BackendConfig struct {
 	ID                    string             `yaml:"id"`
 	Name                  string             `yaml:"name"`
@@ -139,8 +177,10 @@ type APIKeyRateLimit struct {
 }
 
 type APIKeyQuota struct {
-	DailyRequests  int64 `yaml:"daily_requests"`
-	MonthlyTokens  int64 `yaml:"monthly_tokens"`
+	DailyRequests   int64 `yaml:"daily_requests"`
+	DailyTokens     int64 `yaml:"daily_tokens"`
+	MonthlyRequests int64 `yaml:"monthly_requests"`
+	MonthlyTokens   int64 `yaml:"monthly_tokens"`
 }
 
 type APIKeyLogging struct {
@@ -194,6 +234,23 @@ func Default() *Config {
 			PrometheusPath:    "/metrics",
 		},
 		Admin: AdminConfig{
+			Enabled: true,
+		},
+		Storage: StorageConfig{
+			Driver:           "memory",
+			LogRetentionDays: 30,
+		},
+		Queue: QueueConfig{
+			Enabled:        false,
+			MaxQueueSize:   1000,
+			QueueTimeoutMS: 30000,
+		},
+		Tracing: TracingConfig{
+			Enabled:     false,
+			Service:     "llmgateway",
+			SampleRatio: 1.0,
+		},
+		Dashboard: DashboardConfig{
 			Enabled: true,
 		},
 	}

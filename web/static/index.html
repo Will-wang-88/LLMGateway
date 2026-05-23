@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LLM Gateway Dashboard</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">LLM Gateway</div>
+    <nav>
+      <a data-page="overview" class="active">Overview</a>
+      <a data-page="models">Models</a>
+      <a data-page="backends">Backends</a>
+      <a data-page="keys">API Keys</a>
+      <a data-page="logs">Logs</a>
+      <a data-page="analytics">Analytics</a>
+      <a data-page="audit">Audit</a>
+      <a data-page="users">Users</a>
+    </nav>
+    <div class="user-area">
+      <span id="who"></span>
+      <button id="logout">Log out</button>
+    </div>
+  </header>
+  <main>
+    <section id="page-overview" class="page active">
+      <h1>Overview</h1>
+      <div class="cards" id="overview-cards"></div>
+      <h2>Backends</h2>
+      <table id="overview-backends"><thead><tr>
+        <th>ID</th><th>Status</th><th>Active</th><th>Total</th><th>Errors</th><th>Last latency</th>
+      </tr></thead><tbody></tbody></table>
+    </section>
+
+    <section id="page-models" class="page">
+      <h1>Models</h1>
+      <div class="actions">
+        <button id="model-add">+ Add model</button>
+      </div>
+      <table id="models-table"><thead><tr>
+        <th>Name</th><th>Type</th><th>Enabled</th><th>Capability mode</th><th>Routing</th><th></th>
+      </tr></thead><tbody></tbody></table>
+      <h2>Aliases</h2>
+      <div class="actions">
+        <button id="alias-add">+ Add alias</button>
+      </div>
+      <table id="aliases-table"><thead><tr>
+        <th>Alias</th><th>Internal model</th><th>Forwarding</th><th>Enabled</th><th></th>
+      </tr></thead><tbody></tbody></table>
+    </section>
+
+    <section id="page-backends" class="page">
+      <h1>Backends</h1>
+      <div class="actions">
+        <button id="backend-add">+ Add backend</button>
+      </div>
+      <table id="backends-table"><thead><tr>
+        <th>ID</th><th>Name</th><th>Base URL</th><th>Models</th><th>Status</th>
+        <th>Enabled</th><th>Weight</th><th>Active/Max</th><th>Total</th><th>Errors</th><th></th>
+      </tr></thead><tbody></tbody></table>
+    </section>
+
+    <section id="page-keys" class="page">
+      <h1>API Keys</h1>
+      <div class="actions">
+        <button id="key-add">+ Add API key</button>
+      </div>
+      <table id="keys-table"><thead><tr>
+        <th>ID</th><th>Name</th><th>Prefix</th><th>Enabled</th><th>Allowed models</th>
+        <th>RPM</th><th>Concurrent</th><th>Delay</th><th>Requests</th><th>Tokens</th><th></th>
+      </tr></thead><tbody></tbody></table>
+    </section>
+
+    <section id="page-logs" class="page">
+      <h1>Request Logs</h1>
+      <form id="logs-form" class="filters">
+        <input name="model" placeholder="model">
+        <input name="backend_id" placeholder="backend_id">
+        <input name="api_key_id" placeholder="api_key_id">
+        <input name="request_id" placeholder="request_id">
+        <input name="status_code" placeholder="status_code" type="number">
+        <select name="stream"><option value="">stream?</option><option value="true">stream</option><option value="false">non-stream</option></select>
+        <button>Search</button>
+      </form>
+      <table id="logs-table"><thead><tr>
+        <th>Time</th><th>Endpoint</th><th>Model</th><th>Backend</th><th>API key</th><th>Status</th><th>Stream</th>
+        <th>Tokens</th><th>Latency</th><th>TTFT</th><th>Request ID</th>
+      </tr></thead><tbody></tbody></table>
+    </section>
+
+    <section id="page-analytics" class="page">
+      <h1>Analytics (24h)</h1>
+      <div class="cards" id="analytics-cards"></div>
+      <h2>Top models</h2>
+      <table id="analytics-models"><thead><tr><th>Model</th><th>Requests</th><th>Errors</th><th>Tokens</th></tr></thead><tbody></tbody></table>
+      <h2>Top backends</h2>
+      <table id="analytics-backends"><thead><tr><th>Backend</th><th>Requests</th><th>Errors</th><th>Tokens</th></tr></thead><tbody></tbody></table>
+      <h2>Top API keys</h2>
+      <table id="analytics-keys"><thead><tr><th>API key</th><th>Requests</th><th>Errors</th><th>Tokens</th></tr></thead><tbody></tbody></table>
+    </section>
+
+    <section id="page-audit" class="page">
+      <h1>Audit Log</h1>
+      <table id="audit-table"><thead><tr>
+        <th>Time</th><th>Admin</th><th>Action</th><th>Target</th><th>IP</th>
+      </tr></thead><tbody></tbody></table>
+    </section>
+
+    <section id="page-users" class="page">
+      <h1>Admin Users</h1>
+      <div class="actions">
+        <button id="user-add">+ Add user</button>
+      </div>
+      <table id="users-table"><thead><tr>
+        <th>Username</th><th>Email</th><th>Role</th><th></th>
+      </tr></thead><tbody></tbody></table>
+    </section>
+  </main>
+
+  <div id="modal" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-head"><span id="modal-title"></span><button id="modal-close">&times;</button></div>
+      <div id="modal-body"></div>
+      <div class="modal-foot">
+        <button id="modal-cancel" class="ghost">Cancel</button>
+        <button id="modal-submit">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

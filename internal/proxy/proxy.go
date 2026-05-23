@@ -77,10 +77,17 @@ type ForwardOptions struct {
 	APIKeyLabel  string
 	Endpoint     string
 
+	// ContentType override (defaults to application/json). When set the
+	// upstream Content-Type and Accept handling is bypassed so multipart
+	// (audio/transcriptions) requests can be relayed unchanged.
+	ContentType string
+
 	// Optional callbacks.
-	OnTTFT      func(d time.Duration)
-	OnUsage     func(usage *Usage) // called for non-streaming once response is parsed
-	OnStreamUsage func(usage *Usage) // called for streaming if usage block found in final chunk
+	OnTTFT        func(d time.Duration)
+	OnUsage       func(usage *Usage)       // called for non-streaming once response is parsed
+	OnStreamUsage func(usage *Usage)       // called for streaming if usage block found in final chunk
+	OnRawResponse func(body []byte)        // called for non-streaming, raw bytes
+	OnStreamChunk func(line []byte)        // called once per streamed chunk
 }
 
 type Usage struct {
@@ -125,14 +132,16 @@ func (p *Proxy) Forward(ctx context.Context, w http.ResponseWriter, r *http.Requ
 	} else {
 		req.Header.Del("Authorization")
 	}
-	req.Header.Set("Content-Type", "application/json")
+	if opts.ContentType != "" {
+		req.Header.Set("Content-Type", opts.ContentType)
+	} else if req.Header.Get("Content-Type") == "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	req.Header.Set("Accept-Encoding", "identity")
 	if opts.IsStream {
 		req.Header.Set("Accept", "text/event-stream")
-	} else {
-		if req.Header.Get("Accept") == "" {
-			req.Header.Set("Accept", "application/json")
-		}
+	} else if req.Header.Get("Accept") == "" {
+		req.Header.Set("Accept", "application/json")
 	}
 
 	client := p.client
@@ -197,6 +206,9 @@ func (p *Proxy) passResponse(w http.ResponseWriter, resp *http.Response, start t
 		if usage, ok := extractUsage(body); ok {
 			opts.OnUsage(usage)
 		}
+	}
+	if opts.OnRawResponse != nil {
+		opts.OnRawResponse(body)
 	}
 	_ = time.Since(start)
 	return resp.StatusCode, nil

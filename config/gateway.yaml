@@ -57,6 +57,44 @@ admin:
   # Either set bind_token here, or set LLMGATEWAY_ADMIN_TOKEN env var.
   bind_token: "change-me-admin-token"
 
+# Persistent storage for request_logs and audit_logs.
+# Driver "memory" (default) keeps the last 50k records in process.
+# Driver "sqlite" persists to a local file (pure-Go, no CGO).
+storage:
+  driver: sqlite             # memory | sqlite
+  dsn: data/llmgateway.db
+  log_retention_days: 30
+
+# Optional per-model queue with backpressure. When disabled (default) requests
+# are routed immediately.
+queue:
+  enabled: false
+  max_queue_size: 1000
+  queue_timeout_ms: 30000
+  per_model_limit: 64
+
+# Optional OTLP/HTTP tracing.
+tracing:
+  enabled: false
+  endpoint: http://otel-collector:4318
+  service_name: llmgateway
+  sample_ratio: 1.0
+
+# Web dashboard at /ui/.
+dashboard:
+  enabled: true
+
+# Multi-user RBAC. Roles: super_admin, admin, operator, viewer, auditor.
+# Passwords are SHA-256 hashed at load time.
+admin_users:
+  - username: alice
+    password: "change-me-alice"
+    email: alice@example.com
+    role: super_admin
+  - username: bob
+    password: "change-me-bob"
+    role: viewer
+
 backends:
   - id: gpu-01
     name: GPU Node 01 (vLLM)
@@ -153,6 +191,8 @@ api_keys:
       concurrent_requests: 20
     quota:
       daily_requests: 100000
+      daily_tokens: 100000000
+      monthly_requests: 3000000
       monthly_tokens: 1000000000
     delay_ms: 0
     logging:

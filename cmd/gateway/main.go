@@ -20,10 +20,15 @@ import (
 	"github.com/will-wang-88/llmgateway/internal/config"
 	"github.com/will-wang-88/llmgateway/internal/handlers"
 	"github.com/will-wang-88/llmgateway/internal/logging"
+	"github.com/will-wang-88/llmgateway/internal/logstore"
 	"github.com/will-wang-88/llmgateway/internal/metrics"
 	"github.com/will-wang-88/llmgateway/internal/proxy"
+	"github.com/will-wang-88/llmgateway/internal/queue"
+	"github.com/will-wang-88/llmgateway/internal/quota"
 	"github.com/will-wang-88/llmgateway/internal/ratelimit"
 	"github.com/will-wang-88/llmgateway/internal/store"
+	"github.com/will-wang-88/llmgateway/internal/tracing"
+	"github.com/will-wang-88/llmgateway/web"
 )
 
 const (
@@ -77,6 +82,40 @@ func main() {
 	bal := balancer.New()
 	rl := ratelimit.New()
 	cc := ratelimit.NewConcurrency()
+	qm := quota.New()
+	qq := queue.New(cfg.Queue.QueueTimeoutMS, cfg.Queue.MaxQueueSize, cfg.Queue.PerModelLimit)
+
+	// Optional persistent log store.
+	var ls logstore.Store
+	switch cfg.Storage.Driver {
+	case "", "memory":
+		ls = logstore.NewMemory(50000)
+	case "sqlite":
+		sl, err := logstore.OpenSQLite(cfg.Storage.DSN)
+		if err != nil {
+			logger.Error("failed to open sqlite log store", logging.F("error", err.Error()))
+			os.Exit(1)
+		}
+		ls = sl
+		// Background purge.
+		if cfg.Storage.LogRetentionDays > 0 {
+			go func() {
+				t := time.NewTicker(6 * time.Hour)
+				defer t.Stop()
+				for range t.C {
+					retention := time.Duration(cfg.Storage.LogRetentionDays) * 24 * time.Hour
+					_ = sl.Purge(context.Background(), retention)
+				}
+			}()
+		}
+	default:
+		logger.Error("unsupported storage driver", logging.F("driver", cfg.Storage.Driver))
+		os.Exit(1)
+	}
+	defer ls.Close()
+
+	tr := tracing.New(cfg.Tracing, logger)
+	defer tr.Stop()
 
 	hc := backend.NewHealthChecker(s, cfg.HealthCheck, logger, func(b *store.Backend, status store.BackendStatus) {
 		v := 0.0
@@ -88,8 +127,12 @@ func main() {
 	hc.Start()
 	defer hc.Stop()
 
-	h := handlers.New(cfg, s, p, bal, rl, cc, logger, m)
-	adminSrv := admin.NewServer(cfg, s, hc, logger)
+	h := handlers.New(cfg, s, p, bal, rl, cc, logger, m).
+		WithLogStore(ls).
+		WithQuota(qm).
+		WithQueue(qq)
+	adminSrv := admin.NewServer(cfg, s, hc, logger).WithLogStore(ls).WithQuota(qm)
+	adminSrv.Users().LoadFromConfig(cfg.AdminUsers)
 
 	mux := http.NewServeMux()
 
@@ -132,9 +175,19 @@ func main() {
 	mux.Handle("POST /v1/completions", v1Auth(h.Forward("/completions")))
 	mux.Handle("POST /v1/embeddings", v1Auth(h.Forward("/embeddings")))
 	mux.Handle("POST /v1/responses", v1Auth(h.Forward("/responses")))
+	mux.Handle("POST /v1/audio/transcriptions", v1Auth(h.ForwardMultipart("/audio/transcriptions")))
+	mux.Handle("POST /v1/audio/translations", v1Auth(h.ForwardMultipart("/audio/translations")))
+	mux.Handle("POST /v1/audio/speech", v1Auth(h.Forward("/audio/speech")))
 
 	// Admin API.
 	adminSrv.Register(mux)
+
+	// Web dashboard (static assets + index.html).
+	if cfg.Dashboard.Enabled {
+		web.Register(mux)
+	}
+
+	_ = tr // tracer wired in handlers in a future pass; kept available here.
 
 	srv := &http.Server{
 		Addr:              fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port),

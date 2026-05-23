@@ -210,14 +210,110 @@ config/              sample gateway.yaml
 docker/              Dockerfile
 ```
 
+## Web dashboard
+
+A built-in dashboard is served at `/ui/` (no external server required - the
+HTML/CSS/JS is embedded into the binary). Pages:
+
+- **Overview** - QPS, latency, backend health, error rate at a glance.
+- **Models** - registry + alias management.
+- **Backends** - add / enable / disable / health-check / remove backends.
+- **API Keys** - create keys (shown once), per-key allowed models, rate-limits,
+  quota, delay, usage drill-down.
+- **Logs** - query persistent request logs by model / backend / key / status.
+- **Analytics** - 24h top models / backends / API keys.
+- **Audit** - admin action log.
+- **Users** - manage RBAC users.
+
+Authentication uses either the admin bearer token (`bind_token`) or HTTP basic
+auth against `admin_users` (SHA-256 hashed in memory).
+
+## Persistent storage
+
+`storage.driver` selects the request_logs / audit_logs backend:
+
+| driver   | notes                                                            |
+|----------|------------------------------------------------------------------|
+| memory   | bounded ring buffer (default, no persistence)                    |
+| sqlite   | local file via pure-Go `modernc.org/sqlite` (WAL mode, no CGO)   |
+
+Older records are purged after `storage.log_retention_days`.
+
+## Quota and request queue
+
+- `api_keys[].quota` enforces per-key daily / monthly request and token caps.
+  Counters reset at UTC day / month boundaries.
+- `queue.enabled` turns on a per-model wait list. Requests beyond
+  `per_model_limit` block up to `queue_timeout_ms`, then return `429`. Beyond
+  `max_queue_size` they immediately return `queue_full`.
+
+## RBAC and audit log
+
+Configure admin users via the `admin_users` section. Roles:
+
+| role         | permissions                                                |
+|--------------|------------------------------------------------------------|
+| super_admin  | everything                                                 |
+| admin        | everything except `manage_users`                           |
+| operator     | read, backend enable/disable, view logs                    |
+| viewer       | read-only + view logs                                      |
+| auditor      | read + view logs + view audit                              |
+
+Every mutating admin action emits an entry to the `audit_logs` table:
+`backend.create`, `backend.update`, `backend.delete`, `backend.enable`,
+`backend.disable`, `model.upsert`, `model.delete`, `alias.upsert`,
+`alias.delete`, `api_key.create`, `api_key.delete`, `user.create`,
+`user.delete`. Query via `GET /admin/audit` or the Audit page.
+
+## Additional routing policies
+
+`models[].routing_policy` (or `routing.default_policy`):
+
+- `weighted_round_robin` (default)
+- `round_robin`
+- `least_connections`
+- `least_latency` - prefers backends with the lowest recent health-probe latency
+- `random`
+- `hash` - hash of API key id -> deterministic backend
+- `sticky` - first request from an API key pins to one backend for the model
+
+## Audio endpoints
+
+`/v1/audio/transcriptions`, `/v1/audio/translations` and `/v1/audio/speech` are
+proxied with `multipart/form-data` passthrough. The gateway reads the `model`
+field, applies the same auth / permission / load-balancing rules, then
+re-emits the multipart body to the chosen backend.
+
+## OpenTelemetry tracing
+
+When `tracing.enabled: true` and an OTLP HTTP collector is configured, the
+gateway emits span batches every 5 seconds to `tracing.endpoint + /v1/traces`.
+Spans carry `service.name`, the model, backend, latency, and status. The
+exporter is best-effort - failures are logged and dropped.
+
+## Helm chart
+
+`deploy/helm/llmgateway` provides a chart with:
+
+- Deployment + Service (+ optional Ingress)
+- ConfigMap built from the in-line `config` value
+- Secret-backed env vars (`hashSecret`, `adminToken`) via `existingSecret`
+- HPA, ServiceMonitor, PVC (for SQLite), nonroot pod security context
+
+Install:
+
+```bash
+helm install llmgateway ./deploy/helm/llmgateway \
+  --set existingSecret=llmgateway-secrets \
+  --set image.tag=latest
+```
+
 ## Roadmap
 
-The MVP shipped here delivers Phase 1 of the design spec. Out of scope for
-this iteration but designed-for in interfaces:
+Future improvements (interfaces are in place for these):
 
-- Persistent storage (PostgreSQL for config / metadata, ClickHouse for logs)
-- Redis-backed rate limiter and concurrency counters (for horizontal scaling)
-- Web dashboard (Next.js)
-- RBAC, audit log, OIDC SSO
-- OpenTelemetry tracing
-- Helm chart and HPA
+- PostgreSQL / ClickHouse log store implementations
+- Redis-backed rate limiter and concurrency counters (for true horizontal scaling)
+- OIDC / SSO for the dashboard
+- Streaming raw-response capture into the persistent log
+- Per-tenant analytics with retention tiers

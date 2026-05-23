@@ -28,6 +28,16 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprintf(w, `{"object":"list","data":[{"id":%q,"object":"model","owned_by":"fake","created":1700000000}]}`, *model)
 	})
+	mux.HandleFunc("/v1/audio/transcriptions", func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(32 << 20); err != nil {
+			http.Error(w, "parse multipart: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		model := r.FormValue("model")
+		log.Printf("audio transcription requested model=%s", model)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"text":"Hello from fake transcribed audio (model=%s)"}`, model)
+	})
 	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		log.Printf("inbound body: %s", body)
