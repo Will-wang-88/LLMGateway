@@ -161,12 +161,15 @@ func (n *Notifier) dispatch(e Event) {
 	if cooldown <= 0 {
 		cooldown = 5 * time.Minute
 	}
+	// Suppress only when a previous SUCCESSFUL send is still inside the
+	// cooldown window. A failed send must not start the cooldown, or the
+	// real alert (which is what an operator actually needs) would be
+	// silently dropped.
 	n.mu.Lock()
 	if last, ok := n.lastSent[dedupeKey]; ok && time.Since(last) < cooldown {
 		n.mu.Unlock()
 		return
 	}
-	n.lastSent[dedupeKey] = time.Now()
 	n.mu.Unlock()
 
 	subject := fmt.Sprintf("[llmgateway] %s: %s (%s -> %s)", kind, e.BackendID, e.Prev, e.Next)
@@ -181,6 +184,10 @@ func (n *Notifier) dispatch(e Event) {
 		n.resultMu.Unlock()
 		return
 	}
+	// Record success — this is the timestamp the cooldown is measured from.
+	n.mu.Lock()
+	n.lastSent[dedupeKey] = time.Now()
+	n.mu.Unlock()
 	n.resultMu.Lock()
 	n.lastSendAt = time.Now()
 	n.lastError = ""
@@ -246,13 +253,14 @@ func (s *smtpSender) Send(subject, body string, to []string) error {
 	}
 
 	if s.cfg.UseTLS {
-		// Implicit TLS (typically port 465).
+		// Implicit TLS (typically port 465). Connection is already
+		// encrypted, so tlsAlreadyActive=true.
 		conn, err := tls.Dial("tcp", addr, &tls.Config{ServerName: s.cfg.SMTPHost})
 		if err != nil {
 			return err
 		}
 		defer conn.Close()
-		return sendOverConn(conn, s.cfg.SMTPHost, auth, s.cfg.From, to, []byte(msg), false)
+		return sendOverConn(conn, s.cfg.SMTPHost, auth, s.cfg.From, to, []byte(msg), false, true)
 	}
 	// Plain TCP, optionally upgrading via STARTTLS.
 	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
@@ -260,23 +268,35 @@ func (s *smtpSender) Send(subject, body string, to []string) error {
 		return err
 	}
 	defer conn.Close()
-	return sendOverConn(conn, s.cfg.SMTPHost, auth, s.cfg.From, to, []byte(msg), s.cfg.StartTLS)
+	return sendOverConn(conn, s.cfg.SMTPHost, auth, s.cfg.From, to, []byte(msg), s.cfg.StartTLS, false)
 }
 
-func sendOverConn(conn net.Conn, host string, auth smtp.Auth, from string, to []string, msg []byte, startTLS bool) error {
+func sendOverConn(conn net.Conn, host string, auth smtp.Auth, from string, to []string, msg []byte, startTLS bool, tlsAlreadyActive bool) error {
 	c, err := smtp.NewClient(conn, host)
 	if err != nil {
 		return err
 	}
 	defer c.Close()
+	tlsActive := tlsAlreadyActive
 	if startTLS {
-		if ok, _ := c.Extension("STARTTLS"); ok {
-			if err := c.StartTLS(&tls.Config{ServerName: host}); err != nil {
-				return err
-			}
+		if ok, _ := c.Extension("STARTTLS"); !ok {
+			// Hard fail: operator asked for STARTTLS but the server does
+			// not advertise it. Silently downgrading to plaintext would
+			// expose SMTP credentials and alert bodies.
+			return errors.New("smtp: start_tls=true but server does not advertise STARTTLS")
 		}
+		if err := c.StartTLS(&tls.Config{ServerName: host}); err != nil {
+			return err
+		}
+		tlsActive = true
 	}
 	if auth != nil {
+		// Refuse to send credentials over an unencrypted channel.
+		// Operators who really need plaintext auth must turn off start_tls
+		// explicitly (and accept the warning); the default is fail-closed.
+		if !tlsActive {
+			return errors.New("smtp: refusing to authenticate over plaintext; set use_tls or start_tls")
+		}
 		if ok, _ := c.Extension("AUTH"); ok {
 			if err := c.Auth(auth); err != nil {
 				return err

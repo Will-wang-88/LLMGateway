@@ -106,7 +106,9 @@ dashboard:
   enabled: true
 
 # Notifications when a backend changes status. Disabled by default.
-# SMTP_PASSWORD should be supplied via env, not inline.
+# Supply the SMTP password via the LLMGATEWAY_SMTP_PASSWORD env var
+# (SMTP_PASSWORD is also accepted) so the YAML never contains plaintext
+# credentials. The env value overrides the inline `password` field below.
 notifications:
   email:
     enabled: false

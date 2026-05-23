@@ -1,177 +1,323 @@
-# review.md 修正報告
+# review.md (二次 Review) 修正報告
 
 報告日期：2026-05-23
-分支：`claude/review-corrections-report-Zg4tf`
+分支：`claude/review-corrections-report-rtujf`
 測試：`go test ./...`、`go test -race ./...`、`go vet ./...` 全部通過。
 
-## 一、已修正項目
+---
 
-### P0-1 degraded backend 不再被 routing 使用
-- `internal/handlers/handlers.go`：`filterRoutable` 只接受 `healthy` / `unknown`；
-  degraded 預設排除，僅當 `routing.allow_degraded_backends=true` 時才接受。
-- 測試：`TestDegradedBackendIsNotRoutable`、`TestDegradedBackendRoutableWhenConfigEnables`。
+## 一、本輪已修正項目
 
-### P0-2 model alias 不再可繞過 internal model deny list
-- 新增 `(*APIKey).ModelAllowedResolved(requested, internal)`；handler / audio path 改為先 resolve alias 再做權限檢查。
-- 測試：`TestAliasCannotBypassDeniedInternalModel`。
+### P0-1 token rate limit / daily token quota 真正生效
 
-### P0-3 disabled model registry 真正阻擋 routing
-- alias resolve 後檢查 `Model.Enabled`；false 即 404。
-- 測試：`TestDisabledRegistryModelCannotBeForwarded`、`TestDisabledRegistryModelViaAliasIsRejected`。
+**問題**：`CheckAndReserve()` 使用 `"key:"+apiKey.ID`，但 `AddTokens()` 使用 `"tok:"+apiKey.ID`，
+兩邊 bucket key 不一致，造成 `tokens_per_minute` / `tokens_per_day` / `Quota.DailyTokens` 永遠看不到累積。
 
-### P0-4 client IP 稽核 / 統計 / API key IP 存取限制
-- `internal/netutil` 新模組：trusted-proxy aware extractor、IPv4/IPv6/CIDR 比對。
-- `ServerConfig.TrustedProxies`、`APIKeyConfig.AllowedClientIPs/DeniedClientIPs`、`APIKey` struct、`LoadFromConfig`、auth middleware（deny precedence）、request_logs + SQLite + Postgres schema (`client_ip` column + index)、`/admin/logs?client_ip=` 過濾、Dashboard logs filter UI 全部一條龍。
-- 測試：`TestAPIKey{Allowed,Denied}ClientIPs`、`TestClientIPExtractorDoesNotTrustSpoofedXForwardedFor`、`TestRequestLogsIncludeClientIP`、`netutil/clientip_test.go` 4 個 test。
+**修法**：`internal/handlers/handlers.go:recordUsage` 改用 `"key:"+apiKey.ID`，與 limiter 檢查端統一。
+同時移除「只有設定 `TokensPerMinute>0` 才呼叫 AddTokens」的條件 — 即使只設定 `quota.daily_tokens` 也要累積。
+Redis limiter (`internal/ratelimit/redis.go`) 的 key naming 已經本就是 `"%s:rl:tokmin:%s"` 派生，
+與 admit 用的 key 同源，所以一律統一傳入 `"key:"+apiKey.ID` 即可。
 
-### P1-1 Authorization 必須帶 Bearer prefix
-- middleware 嚴格檢查 prefix；不符合即 401。
-- 測試：`TestAuthorizationRequiresBearerPrefix`。
+**驗收測試**：
+- `TestHandlerTokensPerMinuteBlocksAfterUsage` — 設定 `tokens_per_minute=10`，第一次回 150 tokens，第二次預期 `429 token_rate_limit_exceeded`。
+- `TestHandlerDailyTokenLimitBlocksAfterUsage` — 設定 `quota.daily_tokens=10`，第二次回 `429 daily_token_limit_exceeded`。
 
-### P1-2 token rate limit / quota 嚴格化（postpaid soft-limit + 後付估算）
-- 明確化目前實作為 postpaid soft-limit：當前請求允許超出，下一次阻擋。
-- 當 backend 回應**沒有** `usage` block 時，新增 fallback 估算：
-  以 request body 長度（每 ~4 bytes 估 1 token）加上 `max_tokens` / `max_completion_tokens` 估完成端，避免 token quota / per-minute token limit 永遠失效。
-- 程式：`internal/handlers/handlers.go` 的 `estimateTokens` + `extractMaxTokens`；`recordUsage` 改用 `(*APIKey).AddTokens` 避免重複計 request。
-- 測試：`TestFallbackTokenEstimationWhenBackendOmitsUsage`、`TestAPIKeyStatsIncrementWithoutUsage`。
+### P0-2 gateway error path 不再無視 logging policy
 
-### P1-3 API key request stats 不依賴 backend usage
-- 新增 `TouchRequest()`、`AddTokens()`；request 計數無論 backend 是否回 usage、是否 error 都會 +1。
-- 測試：`TestAPIKeyStatsIncrementWithoutUsage`。
+**問題**：成功路徑用 `shouldLog(apiKey, "log_raw_request")` 過濾，但多個 error 路徑
+（`invalid_json` / `missing_model` / `model_not_allowed` / `model_not_found` / capability reject / rate limit / `no_healthy_backend`）
+直接把 `raw` 傳進 `recordLog()`，違反 privacy default。
 
-### P1-4 raw_request 記錄 client 原始 body + 所有 gateway 錯誤都進 persistent log
-- structured log + persistent log 在 `log_raw_request=true` 時寫入 `raw`（client 原始 body）；alias rewrite 後的 body 以 `forwarded_request` 額外欄位記錄。
-- `invalid_json` / `missing_model` / `model_not_allowed` / `model_not_found` / `no_healthy_backend` / `payload_too_large` / capability 拒絕 全部都會寫入 request_logs（含 `client_ip` 與 `raw_request`，若啟用）。
-- 測試：`TestRawRequestLogKeepsClientOriginalBodyWhenAliasRewrites`、`TestGatewayErrorsArePersistentlyLogged`。
+**修法**：
+- 新增 helper `(*Handler).rawForLog(k *APIKey, raw []byte) []byte`：`log_raw_request=true` 才回 raw，否則 nil。
+- 把所有 error 路徑 `recordLog(..., raw, nil)` 改為 `recordLog(..., h.rawForLog(apiKey, raw), nil)`。
+- `payload_too_large` / `invalid_body` 因為 body 是被截斷的，仍然不寫 raw（即使開啟），避免持久化半截 JSON 造成困惑。
 
-### P1-5 streaming idle timeout 零注入
-- `proxy/stream.go`：idle timeout 觸發只 log + 關閉 upstream，不再寫 `: stream-idle-timeout` SSE comment。
-- 測試：`TestStreamIdleTimeoutDoesNotInjectSSEBytes`。
+**驗收測試**：
+- `TestGatewayErrorsDoNotPersistRawRequestWhenDisabled` — `log_raw_request=false` 時，多個 error code 的 row.RawRequest 必須為空。
+- `TestGatewayErrorsPersistRawRequestWhenEnabled` — `log_raw_request=true` 時，至少有 error row 帶 raw_request。
 
-### P1-6 health check schema 與 per-backend scheduler
-- `HealthCheckConfig` 加 `enabled`（`*bool`）、`type`（`http` / `tcp`）、`method`、`body`。
-- `HealthChecker` 改成每個 backend 一個 goroutine，per-backend interval 真實生效。`Enabled=false` 直接 skip。
-- 加 `tcp` probe（從 base_url 推 host:port，DialTimeout）和 http probe 支援自訂 method / body（給 completion-style probe 預留）。
-- Observer pattern：`AddObserver(StatusChangeObserver)`，notification 子系統就是其中一個 observer。
+### P0-3 trusted proxy 後的 XFF spoofing
 
-### P1-7 Admin API 規格 endpoint 補齊
-- `GET /admin/models/{name}`、`PATCH /admin/models/{name}`、`PATCH /admin/model-aliases/{alias}`、`GET /admin/metrics`、`GET /admin/stats/{models,backends,api-keys}`、`GET /admin/notifications/status`、`POST /admin/auth/{login,logout}`。
-- PATCH 路徑只更新傳入欄位；invalid `capability_mode` / `forwarding_mode` 直接 400。
-- 所有 mutating endpoint 全部寫 audit log。
-- 測試：`TestAdminModelsGetPatchRoutes`、`TestAdminAliasPatchRoute`、`TestAdminStatsAndMetricsRoutes`。
+**問題**：原本 `parseFirstForwardedFor()` 取 XFF **最左**值。當 trusted proxy append（不 overwrite）XFF 時，
+惡意 client 可以先送 `X-Forwarded-For: 10.0.0.5`，proxy 補成 `10.0.0.5, 203.0.113.9`，
+gateway 取 `10.0.0.5` → 繞過 `allowed_client_ips`。
 
-### P1-8 Dashboard 改善
-- 認證改成「先 `POST /admin/auth/login` 換 token，後續用 Bearer」。Dashboard 不再 sessionStorage 存密碼。
-- API Keys 列表加 Enable/Disable/Rotate 按鈕。Create 表單支援空 key 自動產生、加入 `allowed_client_ips` / `denied_client_ips` 欄位。
-- Logs filter 加 `client_ip` / `error_code` / `since` / `until`；Logs 表格顯示 Client IP 欄位。
-- Dashboard 透過新 Admin API 自然就能看 stats by model / backend / api_key 與 notifications status。
+**修法**：rewrite `internal/netutil/clientip.go` 為**最右非信任**演算法：
+1. 若 immediate peer 不在 `trusted_proxies`，完全忽略 XFF / X-Real-IP。
+2. 把 XFF 切成 IP list（無效項目跳過），從右往左掃，跳過信任 proxy。
+3. 第一個 untrusted IP 即真實 client。
+4. 若 XFF 全部是信任 proxy，再回退 X-Real-IP（同樣需 untrusted），最後 fallback 到 immediate peer。
 
-### P1-9 Metrics 完整化
-- `Requests` / `RequestLatency` 加 `routing_policy` label。
-- 拆出 `QuotaHits`（daily/monthly）與既有 `RateLimitHits`（per-min/concurrent/queue）兩個 counter。
-- 新增 `Timeouts{backend, kind}` counter（kind=`backend` / `stream_idle`）。
-- Admin `/admin/metrics` 在 dashboard 友善的視角合計 qps / tokens_per_second / 健康狀態 / 視窗成功失敗數。
-- 測試：`TestMetricsIncludeRoutingPolicyLabel`。
+**驗收測試**：
+- `TestClientIPExtractorUsesRightmostUntrustedXFF` — 多 hop 信任鏈正確抓到 untrusted client。
+- `TestClientIPExtractorIgnoresSpoofedLeftmostXFFBehindTrustedProxy` — 攻擊者插入 `10.0.0.5` 不會被誤認。
+- `TestClientIPExtractorAllTrustedFallsBack` — 全部信任時 fallback 到 peer，不會誤回信任 IP。
+- 既有 `TestExtractorRejectsSpoofedXFFFromUntrustedPeer` / `TestExtractorHonorsXFFFromTrustedProxy` / `TestExtractorFallsBackToXRealIP` 仍 pass。
 
-### P1-10 PostgreSQL store + Redis-backed rate limiter
-- `internal/logstore/postgres.go`：完整 Postgres driver（migrations、AppendRequest、QueryRequests with `client_ip` 過濾、StatsSince、AppendAudit、QueryAudit、Purge）。透過 `pgx/v5/stdlib`。
-- `internal/ratelimit/redis.go`：Redis backend，整個 admission 用一個 Lua script 原子化判斷 4 個維度。
-- `ratelimit.Backend` interface：Handler 改持 interface，memory / redis 可互換。
-- `cmd/gateway/main.go`：根據 `storage.driver=postgres` 與 `rate_limit.backend=redis` 切換實作。`LLMGATEWAY_PG_DSN` 可從 env 注入避免明文 DSN。
-- `deploy/helm/llmgateway/values.yaml`：`replicaCount` 預設 1，註解明寫「>1 需要 postgres + redis 同時生效」。
+### P1-1 client_ip 進入持久化 log（auth 拒絕也要記）
 
-### P1-11 Docker 建置與 compose 修正
-- `golang:1.25-alpine`、`--healthcheck` 子指令、compose healthcheck 真實打 `/healthz`。
+**問題**：auth middleware 直接拒絕（missing / invalid / disabled / expired key，以及 `client_ip_not_allowed`）的請求
+不進 persistent log，所以審計線索缺一塊。`Stats` 也沒有 `ByClientIP`。
 
-### P1-12 capability mode 真實作
-- 新增 `internal/capability` 模組：`passthrough`（預設、不檢查）、`declared`（依 model.capabilities 拒絕明確違規）、`strict`（連未宣告也要明確 allow）。
-- 檢測 `tools` / `tool_choice`、`messages[].content` 內 `image_url`、`reasoning_effort` / `thinking_budget` / `enable_thinking`。
-- Admin `PATCH /admin/models/{name}` 對 `capability_mode` 做白名單驗證，避免 UI 設了系統其實沒生效。
-- 測試：`internal/capability/capability_test.go` 6 個 test。
+**修法**：
+- `internal/auth/middleware.go`：新增 `WithLogStore(ls)` 注入；每個拒絕路徑透過 helper `logReject()`
+  寫一筆 `RequestLog`（含 `request_id`、`client_ip`、`endpoint`、`status_code`、`error_code`、若已解析則含 `api_key_id`）。
+  寫入採 fire-and-forget goroutine + 2s timeout，不阻擋 401/403 回傳。
+- `internal/logstore/logstore.go`：`Stats` 新增 `ByClientIP map[string]ClientIPStat`。
+  memory / sqlite / postgres 三套 store 都 group by `client_ip`（空字串不算）。
+- `cmd/gateway/main.go`：`authn = auth.New(...).WithClientIPExtractor(ipExtractor).WithLogStore(ls)`。
 
-### P1-13 Backend 異常 Mail 通知
-- 新增 `internal/notify` 模組：`Notifier` 帶非阻塞 channel + 背景 worker、per-(backend, kind) cooldown / dedupe、`notify_on` 白名單、`LastResult()` 給 admin 看送信狀態。
-- SMTP sender 支援 implicit TLS（port 465）、STARTTLS、PLAIN auth；SMTP password 不從 config dump 暴露（`json:"-"`）。
-- `cmd/gateway/main.go`：HealthChecker observer 把 status transition 包成 `notify.Event` 送進 notifier。
-- 配置範例補在 `config/gateway.yaml`，建議 `SMTP_PASSWORD` 用 env。
-- 測試：`TestBackendUnhealthySendsEmailNotification`、`TestBackendNotificationCooldown`、`TestBackendRecoverySendsEmailNotification`、`TestNotifyFilterByNotifyOn`、`TestNotifyFailureDoesNotPanicAndIsLogged`。
+**驗收測試**：
+- `TestAuthRejectedRequestsArePersistentlyLoggedWithClientIP` — 無效 key 仍寫 log，含 `client_ip`。
+- `TestClientIPNotAllowedIsLoggedWithClientIP` — IP 不在白名單，寫 log 並含 `client_ip`。
+- `TestStatsAggregateByClientIP` — `StatsSince().ByClientIP` 非空。
 
-### P2-4 Admin auth / secrets 管理改善
-- 新增 `SessionManager`：HMAC 簽章的 session token（12 小時），dashboard 用它取代 cached password。
-- `POST /admin/auth/login` 接受 HTTP Basic 換 token；`POST /admin/auth/logout` 撤銷 token。
-- Dashboard `app.js` 移除 username/password 的 sessionStorage 儲存。
-- API key create：未提供 `key` 自動產生（`sk-` + 24 byte random hex），只回傳一次。
-- sample `config/gateway.yaml` 不再放明文 admin password，改要求 `password_hash`。
+### P1-2 Admin 新增 backend 後 periodic health check
 
-### P2-5 OpenTelemetry 接入 request path
-- `internal/handlers/handlers.go`：每個 `/v1/*` request 開 `gateway.forward` span，attributes 包含 `request_id` / `endpoint` / `model` / `internal_model` / `backend_id` / `stream` / `routing_policy` / `status_code` / `latency_ms` / `ttft_ms` / `error`，status 設 `ok` / `error`。
-- 移除 `cmd/gateway/main.go` 內 `_ = tr // future` 的 TODO。
+**問題**：`HealthChecker.Start()` 只 spawn 啟動時 store 內的 backends；註解寫「Backends added after start are picked up by `Rescan()`」
+但程式並未實作 `Rescan()`。Admin `createBackend` 只 `CheckOnce(bk)`，沒有週期 loop，
+造成 runtime 新增的 backend 健康狀態不會更新、不會發 mail notification。
 
-### P2-6 README 與實作對齊
-- 新增「Implementation status」表格，逐項標出已實作。
-- Admin API 表格補齊全部 endpoint。
-- 新增 Rate-limit / quota backend 章節，明確要求多 replica 必須 postgres+redis。
-- Roadmap 縮減到真正還沒做的（OIDC、ClickHouse、completion-style probe 等）。
+**修法**：`internal/backend/health.go`：
+- HealthChecker 內加 `loops map[string]chan struct{}`（每 backend 一個 stop channel）。
+- `spawn()` 改為 idempotent：相同 ID 二度 spawn 是 no-op，避免 duplicate goroutines。
+- 新增公開方法：
+  - `AddBackend(b)` — runtime 新增 backend 時呼叫，spawn 一個 periodic loop。
+  - `RemoveBackend(id)` — 停止對應 loop，避免 goroutine leak。
+  - `Rescan()` — 與 store 對齊，新增 / 刪除一次處理。
+- `loop()` 簽名改為 `loop(b, perBackendStop)`，同時 select `h.stop` 與 per-backend stop。
+
+Admin 端：
+- `createBackend` 後呼叫 `s.health.AddBackend(bk)`（同時保留 `CheckOnce(bk)` 讓初次狀態快速 ready）。
+- `patchBackend` 若有改 `health_check` 欄位，`RemoveBackend()` 後再 `AddBackend()` 讓新 interval / type / enabled 立即生效。
+- `deleteBackend` 加 `s.health.RemoveBackend(id)`。
+
+**驗收測試**：
+- `TestAdminCreatedBackendGetsPeriodicHealthChecks` — 起 fake probe server，runtime 加 backend，
+  120ms 內必須 >= 2 次 probe。
+- `TestHealthCheckerDoesNotSpawnDuplicateLoopsForSameBackend` — 連續 AddBackend 三次，probe 速率仍是單一 goroutine。
+- `TestDeletedBackendStopsHealthLoop` — RemoveBackend 後最多一次 in-flight probe，之後不再增加。
+
+### P1-3 SMTP STARTTLS 不再默默降級
+
+**問題**：原本 `if ok, _ := c.Extension("STARTTLS"); ok` 只有 server 宣告才 upgrade，沒宣告就跳過。
+這代表 `start_tls=true` + server 不支援 STARTTLS 時，AUTH / 告警內容會以 plaintext 傳。
+
+**修法**：`internal/notify/notify.go:sendOverConn`：
+- `start_tls=true` 但 server 沒宣告 STARTTLS → return error，hard fail。
+- 任何時候 `auth != nil` 且 `tlsActive==false` → refuse；fail-closed default。
+- 為了讓 implicit TLS (`use_tls=true`，port 465) 還能 AUTH，sendOverConn 新增 `tlsAlreadyActive` 參數，
+  implicit TLS path 傳 `true`。
+
+**驗收測試**（`internal/notify/smtp_test.go`，含 fake SMTP line-protocol server）：
+- `TestSMTPSenderStartTLSRequiredFailsWhenUnsupported` — server 不宣告 STARTTLS → error，且 AUTH 不發出。
+- `TestSMTPSenderDoesNotAuthOverPlaintextByDefault` — `start_tls=false` + 有 auth → error，AUTH 不發出。
+- `TestSMTPSenderAttemptsStartTLSWhenSupported` — server 宣告 STARTTLS 時 client 至少嘗試 handshake；
+  且在 STARTTLS 成功前不發 AUTH。
+
+### P1-4 通知 cooldown 不會壓掉失敗重試
+
+**問題**：`dispatch()` 在實際 `sender.Send()` **之前**寫 `n.lastSent[dedupeKey] = time.Now()`，
+所以第一次失敗後，cooldown 期間相同 backend/kind 的事件被 suppress，operator 收不到真正告警。
+
+**修法**：`internal/notify/notify.go:dispatch`：
+- 只在 send 成功後才更新 `lastSent`。
+- 失敗時記 `resultMu.lastError` 但不動 cooldown，下個事件還會嘗試。
+
+**驗收測試**：`TestNotifyFailureDoesNotStartSuccessCooldown` — `cooldown=30s` + 第一次強制失敗 → 第二個事件還是會試 send。
+
+### P1-6 success_threshold 對 unknown 不再被繞過
+
+**問題**：`(*Backend).RecordHealthCheck` 內有特例：
+```go
+if prev == "" || prev == StatusUnknown {
+    b.status = StatusHealthy
+}
+```
+即使 `success_threshold=3`，第一次成功就 healthy。
+
+**修法**：`internal/store/store.go`：移除該特例。改為統一遵守 threshold（unknown 一樣要連續 N 次成功）。
+
+**驗收測試**：`TestUnknownBackendRequiresSuccessThreshold` — `success_threshold=3`，1、2 次成功仍 unknown，
+第 3 次才 healthy。既有 `TestBackendHealthTransitions`（threshold=2）仍 pass。
+
+### P2-1 POST /admin/models / /admin/model-aliases 也驗證 mode
+
+**問題**：PATCH 路徑會驗證 `capability_mode` / `forwarding_mode`，但 POST 不會。
+未知值會被當 passthrough，UI/API 看起來「設定成功」實際不生效。
+
+**修法**：
+- `internal/admin/admin_models.go` 抽出 `validCapabilityMode` / `validForwardingMode` 兩個 helper。
+- POST `upsertModel` / `upsertAlias` 也呼叫 helper，失敗回 400。
+- PATCH 改用 helper（去掉重複的 switch）。
+- `internal/config/config.go:Validate` 也加 mode 驗證：YAML 寫了無效值會在啟動時報錯。
+
+**驗收測試**：
+- `TestAdminModelPostRejectsInvalidCapabilityMode`
+- `TestAdminAliasPostRejectsInvalidForwardingMode`
+- `TestConfigRejectsInvalidCapabilityMode` / `TestConfigAcceptsKnownCapabilityModes` / `TestConfigRejectsInvalidForwardingMode`
+
+### P2-2 /v1/models alias 顯示與實際權限一致
+
+**問題**：`/v1/models` 對 alias 只檢查 alias 名稱（`ModelAllowed(name)`），
+但實際 request 用 `ModelAllowedResolved(requested, internal)`。
+結果 alias 顯示可用、實際呼叫 403。
+
+**修法**：`internal/handlers/handlers.go:ListModels`：
+- 內部 helper 抽成 `addResolved(name, internal)`，alias 場景傳 `(a.Alias, internal)`，
+  使用 `ResolveAlias` 拿到 terminal internal model。
+- 一般 model 仍走 `add(name)` → `addResolved(name, name)`。
+
+**驗收測試**：`TestListModelsDoesNotShowAliasDeniedByInternalModel` — alias `company-main-model` → `llama-3.1-70b`，
+key `DeniedModels=[llama-3.1-70b]` 後，`/v1/models` 不再出現 `company-main-model`。
+
+### P2-3 `--healthcheck` 觀察 LLMGATEWAY_LISTEN
+
+**問題**：`*healthcheck` 在 env override **之前**就 `os.Exit(runHealthCheck(cfg))`，
+所以 runtime 用 `LLMGATEWAY_LISTEN=127.0.0.1:9090` 時，healthcheck 仍打 YAML 內的 8080。
+
+**修法**：`cmd/gateway/main.go`：
+- 把 env override 抽成 `applyEnvOverrides(cfg)`，main 在 `flag.Parse()` 後馬上呼叫，
+  之後才檢查 `*healthcheck`，再之後才 build server。
+- healthcheck 與 server bind 都看同一份 `cfg.Server.Host:Port`。
+
+**驗收測試**：`TestHealthCheckUsesListenEnvOverride`。
+
+### P2-4 SMTP_PASSWORD 從 env 讀取
+
+**問題**：`config/gateway.yaml` 註解寫「SMTP_PASSWORD should be supplied via env」，但程式不讀任何環境變數。
+
+**修法**：`applyEnvOverrides` 同時讀 `LLMGATEWAY_SMTP_PASSWORD`（優先）與 `SMTP_PASSWORD`（向後相容）。
+config 註解也更新為「Supply via LLMGATEWAY_SMTP_PASSWORD env var (SMTP_PASSWORD also accepted)」。
+
+**驗收測試**：`TestSMTPPasswordCanBeLoadedFromEnv`（兩條路徑都驗證）。
+
+### P2-5 Admin audit 使用同一套 trusted proxy policy
+
+**問題**：admin package 自己的 `clientIP()` 直接信任 XFF 第一個值，與 request log 用的 `netutil.Extractor` 不一致，
+可被 spoof。
+
+**修法**：
+- `internal/admin/admin.go:Server` 新增 `extractor *netutil.Extractor` 與 `WithClientIPExtractor()`。
+- `clientIP(r)` 改為 method，使用 extractor。沒有 extractor 時 fallback 到 `RemoteAddr`（仍不信任 XFF）。
+- `cmd/gateway/main.go` 在 admin 建立時注入同一個 ipExtractor。
+
+**驗收測試**：
+- `TestAdminAuditIgnoresUntrustedXForwardedFor` — `trusted_proxies=[]` 時，攻擊者送 XFF，audit IP 必須是 RemoteAddr。
+- `TestAdminAuditUsesTrustedProxyClientIP` — 已信任 proxy 時，audit IP 取 untrusted XFF entry。
 
 ---
 
-## 二、本來就不需修正（review.md 提到、但理由屬於三類之一）
+## 二、本輪不修正的項目（理由）
 
-### P2-1 `/readyz` 把 unknown backend 視為 ready — **合理 default**
-K8s readiness probe 標準作法本來就要 startup grace。若 unknown 不算 ready，第一次部署或 rolling update 時 LB 會在 health probe 完成前就拒絕導流。
+### P1-5 PostgreSQL metadata persistence —— 此輪維持 logstore-only，未實作 metadata CRUD
 
-### P2-2 multipart / audio 不是 byte-perfect passthrough — **超出 transparent passthrough 必要範圍**
-規格 transparent passthrough 的核心是 JSON 內 unknown vendor fields 完整轉發。multipart 是有名欄位的 form，re-emit 已保留所有 client 可觀察的語意（field name、filename、body bytes、per-part content-type）。boundary 變動是 multipart 協議定義內可變的部分。
+**review 原文**：「如果此階段只打算做 logstore，請在 README/report 裡明確標註『metadata persistence 尚未完成』」
 
-### P2-3 config bool 預設值改成 default true — **不合理**
-對 API key / backend / model 這類授權與路由控制資源，「預設不啟用」才是安全 default。把 enabled 改成 default true 是 UX 看似好但安全退步。
+**判定**：暫不實作，明確標註。
+
+**理由（企業用情境）**：
+
+1. **企業部署慣例是 config-as-code**：backends / models / api_keys 屬於 SRE / Platform 團隊管理的「環境設定」，
+   慣例上會放在 GitOps 倉庫（Helm values / Kustomize / Terraform），透過 PR review + CI / CD 部署，
+   而不是 dashboard 點點點就能改動的 runtime 狀態。multi-replica 同步、版本控制、回滾、稽核，
+   全部由 GitOps 機制提供，比自建一套 metadata DB 更可靠也更符合企業 change management 要求。
+
+2. **Logstore + Audit Log 是真正的合規剛需**：請求記錄、稽核軌跡、client IP 統計這些在 Postgres
+   是合規 / 法遵剛需（GDPR、SOC2、ISO 27001 對 access log 都有保存期限要求），
+   本輪已完整支援 SQLite + Postgres driver、保留期清除、`client_ip` 索引與 aggregation。
+   metadata 不放 DB 並不違規。
+
+3. **實作成本與風險**：把 metadata CRUD 全部入庫需要重寫 store interface、admin endpoint 全改 transactional、
+   啟動順序加 bootstrap seeding、處理 multi-replica 同步（cache invalidation / pub-sub），
+   並要設計 schema migration。對「企業 MVP」收益其實是低的 —— 大多企業不會用 Dashboard 改 metadata，
+   會嚇壞他們的 audit 團隊。
+
+**配套**：本輪在 README / config 標註「Admin runtime mutations 是 ephemeral；重啟後以 config YAML 為準」，
+並把 P1-5 列入 Roadmap：
+- 若客戶實際反饋需要 Dashboard CRUD 持久化，再做完整 metadata store。
+- 過渡方案：Admin API 寫入時 export 到 YAML diff 並 hint operator commit；不入庫但符合操作習慣。
+
+> 註：若 reviewer 認為這仍要做，可在後續 sprint 補 `internal/store/postgres_store.go` + migration；
+> 本輪先把所有「修了就直接生效、不修就有安全漏洞」的項目處理完。
+
+### 不變的、上一輪 report 已經說明的「不修正」項目
+
+以下三項上一輪 report 已論證，本輪 review 未重新質疑，維持判定：
+
+- **`/readyz` 把 unknown 視為 ready**：K8s rolling update 必須有 startup grace，否則第一次部署 LB 永遠沒流量進來。
+- **multipart / audio 不是 byte-perfect passthrough**：multipart 是有命名欄位的 form，re-emit 保留所有 client 可觀察語意；
+  boundary 變動是 multipart 協議內可變的部分。
+- **config bool default 不改成 true**：API key / backend / model 的 enabled 預設 false 才是 secure default。
 
 ---
 
-## 三、必補測試清單對照
+## 三、必補測試清單對照（review.md「必補測試總表」）
 
 | 測試名稱 | 狀態 |
 |---|---|
-| TestDegradedBackendIsNotRoutable | 已加 |
-| TestAliasCannotBypassDeniedInternalModel | 已加 |
-| TestDisabledRegistryModelCannotBeForwarded | 已加 |
-| TestAPIKeyAllowedClientIPs | 已加 |
-| TestAPIKeyDeniedClientIPsTakePrecedence | 已加 |
-| TestClientIPExtractorDoesNotTrustSpoofedXForwardedFor | 已加 |
-| TestRequestLogsIncludeClientIP | 已加 |
-| TestStatsAggregateByClientIP | Admin `/admin/logs?client_ip=` 已支援；by_client_ip aggregation 透過 logs filter 達成（未再加獨立 group-by endpoint，因 Dashboard 直接用 filter） |
-| TestAuthorizationRequiresBearerPrefix | 已加 |
-| TestAPIKeyStatsIncrementWithoutUsage | 已加 |
-| TestRawRequestLogKeepsClientOriginalBodyWhenAliasRewrites | 已加 |
-| TestGatewayErrorsArePersistentlyLogged | 已加 |
-| TestStreamIdleTimeoutDoesNotInjectSSEBytes | 已加 |
-| TestAdminModelsGetPatchRoutes | 已加 |
-| TestAdminAliasPatchRoute | 已加 |
-| TestMetricsIncludeRoutingPolicyLabel | 已加（label 不存在時 metric 註冊會直接 panic） |
-| TestBackendUnhealthySendsEmailNotification | 已加 |
-| TestBackendNotificationCooldown | 已加 |
-| TestBackendRecoverySendsEmailNotification | 已加 |
-| TestDockerBuildUsesCompatibleGoVersion | go.mod 與 Dockerfile 都已對齊 1.25；CI shell check 屬 CI 設定範疇 |
+| TestHandlerTokensPerMinuteBlocksAfterUsage | ✅ 新增（`internal/handlers/review_test.go`） |
+| TestHandlerDailyTokenLimitBlocksAfterUsage | ✅ 新增 |
+| TestGatewayErrorsDoNotPersistRawRequestWhenDisabled | ✅ 新增 |
+| TestGatewayErrorsPersistRawRequestWhenEnabled | ✅ 新增 |
+| TestClientIPExtractorUsesRightmostUntrustedXFF | ✅ 新增（`internal/netutil/clientip_test.go`） |
+| TestClientIPExtractorIgnoresSpoofedLeftmostXFFBehindTrustedProxy | ✅ 新增 |
+| 多 hop trusted proxy 測試 | ✅ 上面兩個 + `TestClientIPExtractorAllTrustedFallsBack` 三條 case 覆蓋 |
+| TestAuthRejectedRequestsArePersistentlyLoggedWithClientIP | ✅ 新增 |
+| TestClientIPNotAllowedIsLoggedWithClientIP | ✅ 新增 |
+| TestStatsAggregateByClientIP | ✅ 新增（透過 memory store 驗證 `ByClientIP` 非空） |
+| TestAdminCreatedBackendGetsPeriodicHealthChecks | ✅ 新增（`internal/backend/health_test.go`） |
+| TestHealthCheckerDoesNotSpawnDuplicateLoopsForSameBackend | ✅ 新增 |
+| TestDeletedBackendStopsHealthLoop | ✅ 新增 |
+| TestSMTPSenderStartTLSRequiredFailsWhenUnsupported | ✅ 新增（`internal/notify/smtp_test.go` + fake SMTP server） |
+| TestSMTPSenderDoesNotAuthOverPlaintextByDefault | ✅ 新增 |
+| TestNotifyFailureDoesNotStartSuccessCooldown | ✅ 新增（`internal/notify/notify_test.go`） |
+| TestPostgresMetadataPersistsAPIKeyAcrossRestart | ⛔ 未實作（見「不修正」說明） |
+| TestPostgresMetadataPersistsBackendAcrossRestart | ⛔ 同上 |
+| TestUnknownBackendRequiresSuccessThreshold | ✅ 新增（`internal/store/store_test.go`） |
+| TestAdminModelPostRejectsInvalidCapabilityMode | ✅ 新增（`internal/admin/admin_routes_test.go`） |
+| TestAdminAliasPostRejectsInvalidForwardingMode | ✅ 新增 |
+| TestConfigRejectsInvalidCapabilityMode | ✅ 新增（`internal/config/config_test.go`） |
+| TestListModelsDoesNotShowAliasDeniedByInternalModel | ✅ 新增 |
+| TestHealthCheckUsesListenEnvOverride | ✅ 新增（`cmd/gateway/main_test.go`） |
+| TestSMTPPasswordCanBeLoadedFromEnv | ✅ 新增 |
+| TestAdminAuditIgnoresUntrustedXForwardedFor | ✅ 新增 |
+| TestAdminAuditUsesTrustedProxyClientIP | ✅ 新增 |
+
+合計：**24 條新增 / 修改測試** + **2 條未實作（P1-5 相關，見上文）**。
 
 ---
 
-## 四、新增的測試一覽
+## 四、驗收 Checklist 對照
 
-- `internal/capability/capability_test.go`：6 tests
-- `internal/handlers/review_test.go`：13 tests
-- `internal/admin/admin_routes_test.go`：3 tests
-- `internal/netutil/clientip_test.go`：4 tests
-- `internal/notify/notify_test.go`：5 tests
-- `internal/proxy/stream_idle_test.go`：1 test
+| 項目 | 結果 |
+|---|---|
+| `go test ./...` 通過 | ✅ |
+| `go test -race ./...` 通過 | ✅ |
+| `go vet ./...` 通過 | ✅ |
+| token rate limit / daily token quota 會在 usage 累積後阻擋下一次請求 | ✅ |
+| `log_raw_request=false` 時，成功與錯誤路徑都不保存 raw request | ✅ |
+| `log_raw_request=true` 時，成功與錯誤路徑保存 client 原始 body | ✅ |
+| trusted proxy 後 XFF spoof 不能繞過 API key IP allow/deny | ✅ |
+| `allowed_client_ips` / `denied_client_ips` deny 優先，IPv4/IPv6/CIDR | ✅ |
+| missing/invalid/disabled/expired key 與 `client_ip_not_allowed` 都進 persistent log | ✅ |
+| Admin stats / dashboard analytics 能依 client_ip 聚合 | ✅（`Stats.ByClientIP` + memory/sqlite/postgres 全部支援） |
+| Runtime 新增 backend 持續 health check | ✅ |
+| Runtime 刪除 backend 不再 health check，無 goroutine leak | ✅ |
+| backend status mail notification 觸發、cooldown 不壓失敗重試 | ✅ |
+| `start_tls=true` 不會降級 plaintext | ✅ |
+| Postgres 重啟後 admin-created backend/model/api_key 仍存在 | ⛔ 不在本輪範圍（見 P1-5） |
+| `/v1/models` 顯示結果與實際 request 權限一致 | ✅ |
+| Admin audit log IP 使用同一套 trusted proxy policy | ✅ |
 
 ---
 
-## 五、後續未實作（在 README Roadmap）
+## 五、後續 Roadmap（未實作）
 
+- **P1-5 Postgres metadata persistence**（理由見「不修正」說明）
 - OIDC / SSO Dashboard 認證
 - ClickHouse log store driver
-- Completion-style health probe（lightweight `/v1/chat/completions` 探測，目前 schema 已預留 method/body 欄位）
-- Streaming raw-response capture 進 persistent log
+- Completion-style health probe（schema 已預留 method/body）
+- Streaming raw-response capture 寫入 persistent log
 - Per-tenant analytics with retention tiers
-
-這些都是「未來功能擴增」而不是 review.md 點出的「目前實作有缺口」。

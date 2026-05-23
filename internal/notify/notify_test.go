@@ -122,6 +122,28 @@ func TestNotifyFailureDoesNotPanicAndIsLogged(t *testing.T) {
 	}
 }
 
+// P1-4 (review): a failed first attempt must not start the cooldown.
+// The next attempt for the same (backend, kind) must actually be sent.
+func TestNotifyFailureDoesNotStartSuccessCooldown(t *testing.T) {
+	n, f := makeNotifier(t, 30_000) // long cooldown
+	f.failNext.Store(true)         // fail the first send
+	evt := Event{BackendID: "b1", Prev: store.StatusHealthy, Next: store.StatusUnhealthy}
+	n.Notify(evt)
+	// Wait for the failure to be processed.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		_, e := n.LastResult()
+		if e != "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Retry: must actually be attempted since the failure did not
+	// arm the cooldown.
+	n.Notify(evt)
+	waitFor(t, func() bool { return len(f.snapshot()) == 1 })
+}
+
 func waitFor(t *testing.T, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)

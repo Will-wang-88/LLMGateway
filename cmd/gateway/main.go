@@ -40,27 +40,17 @@ import (
 )
 
 const (
-	envConfigPath  = "LLMGATEWAY_CONFIG"
-	envHashSecret  = "LLMGATEWAY_HASH_SECRET"
-	envAdminToken  = "LLMGATEWAY_ADMIN_TOKEN"
-	envListenAddr  = "LLMGATEWAY_LISTEN"
+	envConfigPath   = "LLMGATEWAY_CONFIG"
+	envHashSecret   = "LLMGATEWAY_HASH_SECRET"
+	envAdminToken   = "LLMGATEWAY_ADMIN_TOKEN"
+	envListenAddr   = "LLMGATEWAY_LISTEN"
+	envSMTPPassword = "LLMGATEWAY_SMTP_PASSWORD"
 )
 
-func main() {
-	configPath := flag.String("config", envOr(envConfigPath, "config/gateway.yaml"), "Path to YAML config file")
-	healthcheck := flag.Bool("healthcheck", false, "Probe /healthz on the configured listener and exit 0/1 (for Docker HEALTHCHECK)")
-	flag.Parse()
-
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
-		os.Exit(1)
-	}
-
-	if *healthcheck {
-		os.Exit(runHealthCheck(cfg))
-	}
-
+// applyEnvOverrides mutates cfg in-place from well-known env vars. It is
+// called before --healthcheck so the probe and the server agree on
+// host:port and any other env-driven settings.
+func applyEnvOverrides(cfg *config.Config) {
 	if v := os.Getenv(envHashSecret); v != "" {
 		cfg.Auth.HashSecret = v
 	}
@@ -72,6 +62,34 @@ func main() {
 			cfg.Server.Host = host
 			cfg.Server.Port = port
 		}
+	}
+	// SMTP password is sensitive; we strongly prefer env over the YAML.
+	// Both LLMGATEWAY_SMTP_PASSWORD and SMTP_PASSWORD are accepted so
+	// existing operator playbooks keep working.
+	if v := os.Getenv(envSMTPPassword); v != "" {
+		cfg.Notifications.Email.Password = v
+	} else if v := os.Getenv("SMTP_PASSWORD"); v != "" {
+		cfg.Notifications.Email.Password = v
+	}
+}
+
+func main() {
+	configPath := flag.String("config", envOr(envConfigPath, "config/gateway.yaml"), "Path to YAML config file")
+	healthcheck := flag.Bool("healthcheck", false, "Probe /healthz on the configured listener and exit 0/1 (for Docker HEALTHCHECK)")
+	flag.Parse()
+
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+	// Env overrides must run before --healthcheck so the probe targets
+	// the same port the running gateway is bound to (LLMGATEWAY_LISTEN
+	// can change host/port at runtime).
+	applyEnvOverrides(cfg)
+
+	if *healthcheck {
+		os.Exit(runHealthCheck(cfg))
 	}
 
 	logger := logging.New(os.Stdout, cfg.Logging.Level)
@@ -201,7 +219,12 @@ func main() {
 		WithQuota(qm).
 		WithQueue(qq).
 		WithTracer(tr)
-	adminSrv := admin.NewServer(cfg, s, hc, logger).WithLogStore(ls).WithQuota(qm).WithNotifier(notifier)
+	ipExtractor := netutil.NewExtractor(cfg.Server.TrustedProxies)
+	adminSrv := admin.NewServer(cfg, s, hc, logger).
+		WithLogStore(ls).
+		WithQuota(qm).
+		WithNotifier(notifier).
+		WithClientIPExtractor(ipExtractor)
 	adminSrv.Users().LoadFromConfig(cfg.AdminUsers)
 
 	mux := http.NewServeMux()
@@ -235,9 +258,9 @@ func main() {
 	}
 
 	// Build /v1/* handlers wrapped with API-key auth.
-	ipExtractor := netutil.NewExtractor(cfg.Server.TrustedProxies)
 	authn := auth.New(s, cfg.Auth.APIKeyHeader, cfg.Auth.APIKeyPrefix).
-		WithClientIPExtractor(ipExtractor)
+		WithClientIPExtractor(ipExtractor).
+		WithLogStore(ls)
 	v1Auth := authn.Middleware(func(r *http.Request) bool {
 		return strings.HasPrefix(r.URL.Path, "/v1/")
 	})

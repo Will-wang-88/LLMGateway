@@ -214,9 +214,10 @@ func (s *SQLite) QueryRequests(ctx context.Context, q LogQuery) ([]*RequestLog, 
 func (s *SQLite) StatsSince(ctx context.Context, since time.Time) (*Stats, error) {
 	sinceMS := since.UTC().UnixMilli()
 	stats := &Stats{
-		ByModel:   make(map[string]ModelStat),
-		ByBackend: make(map[string]BackendStat),
-		ByAPIKey:  make(map[string]KeyStat),
+		ByModel:    make(map[string]ModelStat),
+		ByBackend:  make(map[string]BackendStat),
+		ByAPIKey:   make(map[string]KeyStat),
+		ByClientIP: make(map[string]ClientIPStat),
 	}
 
 	row := s.db.QueryRowContext(ctx, `SELECT
@@ -259,6 +260,17 @@ func (s *SQLite) StatsSince(ctx context.Context, since time.Time) (*Stats, error
 		FROM request_logs WHERE created_at >= ? GROUP BY api_key_id`, sinceMS,
 		func(key string, reqs, errs, tokens int64) {
 			stats.ByAPIKey[key] = KeyStat{Requests: reqs, Errors: errs, Tokens: tokens}
+		}); err != nil {
+		return nil, err
+	}
+	if err := s.aggregate(ctx, `SELECT COALESCE(client_ip,''),
+		COUNT(*),
+		SUM(CASE WHEN status_code >= 400 OR status_code = 0 THEN 1 ELSE 0 END),
+		COALESCE(SUM(total_tokens),0)
+		FROM request_logs WHERE created_at >= ? AND client_ip IS NOT NULL AND client_ip <> ''
+		GROUP BY client_ip`, sinceMS,
+		func(key string, reqs, errs, tokens int64) {
+			stats.ByClientIP[key] = ClientIPStat{Requests: reqs, Errors: errs, Tokens: tokens}
 		}); err != nil {
 		return nil, err
 	}

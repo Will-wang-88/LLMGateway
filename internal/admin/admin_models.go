@@ -56,18 +56,14 @@ func (s *Server) patchModel(w http.ResponseWriter, r *http.Request) {
 		m.ContextLength = *body.ContextLength
 	}
 	if body.CapabilityMode != nil {
-		// Validate: only known modes accepted. This stops UI/API from
-		// silently accepting unimplemented values.
-		switch *body.CapabilityMode {
-		case "passthrough", "declared", "strict":
-			m.CapabilityMode = *body.CapabilityMode
-		default:
+		if !validCapabilityMode(*body.CapabilityMode) {
 			proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest(
 				"capability_mode must be one of passthrough/declared/strict",
 				"invalid_capability_mode",
 			))
 			return
 		}
+		m.CapabilityMode = *body.CapabilityMode
 	}
 	if body.Capabilities != nil {
 		m.Capabilities = *body.Capabilities
@@ -105,16 +101,14 @@ func (s *Server) patchAlias(w http.ResponseWriter, r *http.Request) {
 		a.InternalModel = *body.InternalModel
 	}
 	if body.ForwardingMode != nil {
-		switch *body.ForwardingMode {
-		case "use_internal", "keep_external":
-			a.ForwardingMode = *body.ForwardingMode
-		default:
+		if !validForwardingMode(*body.ForwardingMode) {
 			proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest(
 				"forwarding_mode must be use_internal or keep_external",
 				"invalid_forwarding_mode",
 			))
 			return
 		}
+		a.ForwardingMode = *body.ForwardingMode
 	}
 	if body.Enabled != nil {
 		a.Enabled = *body.Enabled
@@ -294,6 +288,25 @@ func totalActiveRequests(s *store.Store) int64 {
 		n += a
 	}
 	return n
+}
+
+// validCapabilityMode is the single source of truth for the allowed
+// values across POST / PATCH / config-load paths.
+func validCapabilityMode(s string) bool {
+	switch s {
+	case "passthrough", "declared", "strict":
+		return true
+	}
+	return false
+}
+
+// validForwardingMode mirrors validCapabilityMode for model aliases.
+func validForwardingMode(s string) bool {
+	switch s {
+	case "use_internal", "keep_external":
+		return true
+	}
+	return false
 }
 
 // Force compile-time use of logstore types so go-vet stays happy when
