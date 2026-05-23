@@ -15,6 +15,7 @@ import (
 
 	"github.com/will-wang-88/llmgateway/internal/auth"
 	"github.com/will-wang-88/llmgateway/internal/balancer"
+	"github.com/will-wang-88/llmgateway/internal/capability"
 	"github.com/will-wang-88/llmgateway/internal/config"
 	"github.com/will-wang-88/llmgateway/internal/logging"
 	"github.com/will-wang-88/llmgateway/internal/logstore"
@@ -24,6 +25,7 @@ import (
 	"github.com/will-wang-88/llmgateway/internal/quota"
 	"github.com/will-wang-88/llmgateway/internal/ratelimit"
 	"github.com/will-wang-88/llmgateway/internal/store"
+	"github.com/will-wang-88/llmgateway/internal/tracing"
 )
 
 type Handler struct {
@@ -31,13 +33,14 @@ type Handler struct {
 	store       *store.Store
 	proxy       *proxy.Proxy
 	balancer    *balancer.Balancer
-	limiter     *ratelimit.Limiter
+	limiter     ratelimit.Backend
 	concurrency *ratelimit.Concurrency
 	logger      *logging.Logger
 	metrics     *metrics.Metrics
 	logstore    logstore.Store
 	quota       *quota.Manager
 	queue       *queue.Manager
+	tracer      *tracing.Tracer
 }
 
 func New(
@@ -45,7 +48,7 @@ func New(
 	s *store.Store,
 	p *proxy.Proxy,
 	b *balancer.Balancer,
-	l *ratelimit.Limiter,
+	l ratelimit.Backend,
 	c *ratelimit.Concurrency,
 	log *logging.Logger,
 	m *metrics.Metrics,
@@ -70,6 +73,10 @@ func (h *Handler) WithQuota(q *quota.Manager) *Handler { h.quota = q; return h }
 
 // WithQueue attaches a request queue for backpressure.
 func (h *Handler) WithQueue(q *queue.Manager) *Handler { h.queue = q; return h }
+
+// WithTracer attaches an OpenTelemetry tracer used to emit a span per
+// request.
+func (h *Handler) WithTracer(t *tracing.Tracer) *Handler { h.tracer = t; return h }
 
 // ListModels implements GET /v1/models.
 // It returns the union of every model declared by an enabled backend, plus any
@@ -158,7 +165,18 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 		w.Header().Set("X-Request-ID", requestID)
 		started := time.Now()
 
+		var span *tracing.Span
+		ctx := r.Context()
+		if h.tracer != nil {
+			ctx, span = h.tracer.Start(ctx, "gateway.forward")
+			span.Attributes["request_id"] = requestID
+			span.Attributes["endpoint"] = upstreamPath
+			r = r.WithContext(ctx)
+			defer h.tracer.End(span)
+		}
+
 		apiKey, _ := auth.FromContext(r.Context())
+		clientIP := auth.ClientIPFromContext(r.Context())
 		bodyLimit := int64(h.cfg.Server.RequestBodyLimitMB) * 1024 * 1024
 		if bodyLimit <= 0 {
 			bodyLimit = 50 * 1024 * 1024
@@ -167,6 +185,13 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 		raw, err := io.ReadAll(r.Body)
 		if err != nil {
 			var maxErr *http.MaxBytesError
+			code := "invalid_body"
+			status := http.StatusBadRequest
+			if errors.As(err, &maxErr) {
+				code = "payload_too_large"
+				status = http.StatusRequestEntityTooLarge
+			}
+			h.recordLog(r.Context(), requestID, apiKey, clientIP, "", "", "", upstreamPath, false, status, code, nil, time.Since(started).Milliseconds(), 0, nil, nil)
 			if errors.As(err, &maxErr) {
 				proxy.WriteError(w, http.StatusRequestEntityTooLarge, proxy.APIError{
 					Message: "Request body too large",
@@ -182,6 +207,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 			return
 		}
 		if len(raw) == 0 {
+			h.recordLog(r.Context(), requestID, apiKey, clientIP, "", "", "", upstreamPath, false, http.StatusBadRequest, "invalid_body", nil, time.Since(started).Milliseconds(), 0, nil, nil)
 			proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest("Empty request body", "invalid_body"))
 			return
 		}
@@ -192,6 +218,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 			Stream *bool  `json:"stream"`
 		}
 		if err := json.Unmarshal(raw, &peek); err != nil {
+			h.recordLog(r.Context(), requestID, apiKey, clientIP, "", "", "", upstreamPath, false, http.StatusBadRequest, "invalid_json", nil, time.Since(started).Milliseconds(), 0, raw, nil)
 			proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest(
 				"Invalid JSON: "+err.Error(),
 				"invalid_json",
@@ -199,6 +226,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 			return
 		}
 		if peek.Model == "" {
+			h.recordLog(r.Context(), requestID, apiKey, clientIP, "", "", "", upstreamPath, false, http.StatusBadRequest, "missing_model", nil, time.Since(started).Milliseconds(), 0, raw, nil)
 			proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest(
 				"Missing required field: model",
 				"missing_model",
@@ -214,6 +242,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 		// resolved internal model are checked so an alias cannot bypass
 		// DeniedModels.
 		if apiKey != nil && !apiKey.ModelAllowedResolved(peek.Model, internalModel) {
+			h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusForbidden, "model_not_allowed", nil, time.Since(started).Milliseconds(), 0, raw, nil)
 			proxy.WriteError(w, http.StatusForbidden, proxy.PermissionError(
 				fmt.Sprintf("The API key is not allowed to use model: %s", peek.Model),
 				"model_not_allowed",
@@ -225,17 +254,29 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 		// registry entry with enabled=false, reject before backend
 		// selection. This makes Admin disable a real kill-switch instead
 		// of only hiding the model from /v1/models.
-		if m, ok := h.store.Model(internalModel); ok && !m.Enabled {
-			proxy.WriteError(w, http.StatusNotFound, proxy.NotFound(
-				fmt.Sprintf("Model is disabled: %s", peek.Model),
-				"model_not_found",
-			))
-			return
+		if m, ok := h.store.Model(internalModel); ok {
+			if !m.Enabled {
+				h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusNotFound, "model_not_found", nil, time.Since(started).Milliseconds(), 0, raw, nil)
+				proxy.WriteError(w, http.StatusNotFound, proxy.NotFound(
+					fmt.Sprintf("Model is disabled: %s", peek.Model),
+					"model_not_found",
+				))
+				return
+			}
+			if reason := capability.Check(m.CapabilityMode, m.Capabilities, raw); reason != "" {
+				h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusBadRequest, reason, nil, time.Since(started).Milliseconds(), 0, raw, nil)
+				proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest(
+					fmt.Sprintf("Model %s does not support this capability: %s", peek.Model, reason),
+					reason,
+				))
+				return
+			}
 		}
 
 		// Look up backends supporting this model.
 		candidates := h.store.BackendsForModel(internalModel)
 		if len(candidates) == 0 {
+			h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusNotFound, "model_not_found", nil, time.Since(started).Milliseconds(), 0, raw, nil)
 			proxy.WriteError(w, http.StatusNotFound, proxy.NotFound(
 				fmt.Sprintf("Unknown model: %s", peek.Model),
 				"model_not_found",
@@ -243,11 +284,12 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 			return
 		}
 
-		clientIP := auth.ClientIPFromContext(r.Context())
-
 		// Apply rate-limit / quota / concurrency / queue admission.
 		release, code, status := h.admit(r.Context(), apiKey, internalModel)
 		if code != "" {
+			if isQuotaCode(code) {
+				h.metrics.QuotaHits.WithLabelValues(apiKeyID(apiKey), code).Inc()
+			}
 			h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, status, code, nil, time.Since(started).Milliseconds(), 0, raw, nil)
 			proxy.WriteError(w, status, proxy.RateLimit("Rejected: "+code, code))
 			return
@@ -257,6 +299,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 		// Filter for healthy + within-capacity, then pick one.
 		ready := filterRoutable(candidates, h.cfg.Routing.AllowDegradedBackends)
 		if len(ready) == 0 {
+			h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusServiceUnavailable, "no_healthy_backend", nil, time.Since(started).Milliseconds(), 0, raw, nil)
 			proxy.WriteError(w, http.StatusServiceUnavailable, proxy.BackendUnavailable(
 				fmt.Sprintf("No healthy backend available for model: %s", peek.Model),
 				"no_healthy_backend",
@@ -266,6 +309,10 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 		policy := balancer.Policy(h.cfg.Routing.DefaultPolicy)
 		if m, ok := h.store.Model(internalModel); ok && m.RoutingPolicy != "" {
 			policy = balancer.Policy(m.RoutingPolicy)
+		}
+		policyLabel := string(policy)
+		if policyLabel == "" {
+			policyLabel = "unknown"
 		}
 		hint := balancer.Hint{APIKeyID: apiKeyID(apiKey)}
 		picked := h.balancer.Choose(internalModel, policy, ready, hint)
@@ -305,6 +352,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 
 		var ttftMS int64
 		var capturedUsage proxy.Usage
+		usageSeen := false
 		var rawResp []byte
 		captureRawResp := h.shouldLog(apiKey, "log_raw_response")
 		captureStreamChunks := h.shouldLog(apiKey, "log_stream_chunks")
@@ -329,12 +377,14 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 			OnUsage: func(u *proxy.Usage) {
 				if u != nil {
 					capturedUsage = *u
+					usageSeen = true
 				}
 				h.recordUsage(u, internalModel, picked.ID, apiKeyLabel, apiKey)
 			},
 			OnStreamUsage: func(u *proxy.Usage) {
 				if u != nil {
 					capturedUsage = *u
+					usageSeen = true
 				}
 				h.recordUsage(u, internalModel, picked.ID, apiKeyLabel, apiKey)
 			},
@@ -350,11 +400,38 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 			}
 		}
 
+		if span != nil {
+			span.Attributes["model"] = peek.Model
+			span.Attributes["internal_model"] = internalModel
+			span.Attributes["backend_id"] = picked.ID
+			span.Attributes["stream"] = isStream
+			span.Attributes["routing_policy"] = policyLabel
+		}
 		statusCode, ferr := h.proxy.Forward(r.Context(), w, r, opts)
 		success := ferr == nil && statusCode >= 200 && statusCode < 400
 		picked.ReleaseSlot(success)
+		if span != nil {
+			span.Attributes["status_code"] = statusCode
+			span.Attributes["latency_ms"] = time.Since(started).Milliseconds()
+			if ttftMS > 0 {
+				span.Attributes["ttft_ms"] = ttftMS
+			}
+			if success {
+				span.Status = "ok"
+			} else {
+				span.Status = "error"
+				if ferr != nil {
+					span.Attributes["error"] = ferr.Error()
+				}
+			}
+		}
 		if !success {
 			h.metrics.BackendErrors.WithLabelValues(picked.ID, statusCodeLabel(statusCode)).Inc()
+		}
+		if statusCode == http.StatusGatewayTimeout {
+			h.metrics.Timeouts.WithLabelValues(picked.ID, "backend").Inc()
+		} else if ferr != nil && ferr.Error() == "stream idle timeout" {
+			h.metrics.Timeouts.WithLabelValues(picked.ID, "stream_idle").Inc()
 		}
 		// API-key request stats must be updated regardless of whether the
 		// backend returned a usage block (or any body at all). Token totals
@@ -362,11 +439,20 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 		if apiKey != nil {
 			apiKey.TouchRequest()
 		}
+		// If the backend didn't return a usage block on a successful
+		// response, fall back to a conservative estimate so token-based
+		// quotas/limits don't permanently silently bypass.
+		if success && !usageSeen && apiKey != nil {
+			est := estimateTokens(raw, extractMaxTokens(raw))
+			estUsage := proxy.Usage{TotalTokens: est}
+			capturedUsage = estUsage
+			h.recordUsage(&estUsage, internalModel, picked.ID, apiKeyLabel, apiKey)
+		}
 		h.metrics.Requests.WithLabelValues(
-			upstreamPath, internalModel, picked.ID, apiKeyLabel, statusCodeLabel(statusCode), boolLabel(isStream),
+			upstreamPath, internalModel, picked.ID, apiKeyLabel, statusCodeLabel(statusCode), boolLabel(isStream), policyLabel,
 		).Inc()
 		h.metrics.RequestLatency.WithLabelValues(
-			upstreamPath, internalModel, picked.ID, boolLabel(isStream),
+			upstreamPath, internalModel, picked.ID, boolLabel(isStream), policyLabel,
 		).Observe(time.Since(started).Seconds())
 
 		latencyMS := time.Since(started).Milliseconds()
@@ -489,6 +575,42 @@ func apiKeyID(k *store.APIKey) string {
 	return k.ID
 }
 
+// estimateTokens produces a conservative token estimate from the
+// inbound request body. It is used as a fallback when the backend does
+// not return a usage block so that token quotas and per-minute token
+// limits still receive a signal. The estimate is intentionally simple
+// (1 token per ~4 bytes of body) — overestimating is the safe failure
+// mode for a quota system.
+func estimateTokens(rawReq []byte, maxTokensFromBody int64) int64 {
+	approx := int64(len(rawReq)) / 4
+	if approx < 1 {
+		approx = 1
+	}
+	if maxTokensFromBody > 0 {
+		approx += maxTokensFromBody
+	} else {
+		approx += 256 // assume a small completion
+	}
+	return approx
+}
+
+func extractMaxTokens(raw []byte) int64 {
+	var peek struct {
+		MaxTokens           *int64 `json:"max_tokens"`
+		MaxCompletionTokens *int64 `json:"max_completion_tokens"`
+	}
+	if err := json.Unmarshal(raw, &peek); err != nil {
+		return 0
+	}
+	if peek.MaxCompletionTokens != nil && *peek.MaxCompletionTokens > 0 {
+		return *peek.MaxCompletionTokens
+	}
+	if peek.MaxTokens != nil && *peek.MaxTokens > 0 {
+		return *peek.MaxTokens
+	}
+	return 0
+}
+
 func (h *Handler) recordUsage(u *proxy.Usage, model, backendID, apiKeyLabel string, apiKey *store.APIKey) {
 	if u == nil {
 		return
@@ -558,7 +680,11 @@ func (h *Handler) admit(ctx context.Context, k *store.APIKey, internalModel stri
 			}
 		}
 		if reject := h.limiter.CheckAndReserve("key:"+k.ID, rpm, tpm, dayReq, dayTok); reject != "" {
-			h.metrics.RateLimitHits.WithLabelValues(k.ID, reject).Inc()
+			if isQuotaCode(reject) {
+				h.metrics.QuotaHits.WithLabelValues(k.ID, reject).Inc()
+			} else {
+				h.metrics.RateLimitHits.WithLabelValues(k.ID, reject).Inc()
+			}
 			doRelease()
 			return noop, reject, http.StatusTooManyRequests
 		}
@@ -567,7 +693,7 @@ func (h *Handler) admit(ctx context.Context, k *store.APIKey, internalModel stri
 		// can't be reused for monthly accumulation).
 		if h.quota != nil && k.Quota != nil {
 			if reject := h.quota.Check(k.ID, 0, 0, k.Quota.MonthlyRequests, k.Quota.MonthlyTokens); reject != "" {
-				h.metrics.RateLimitHits.WithLabelValues(k.ID, reject).Inc()
+				h.metrics.QuotaHits.WithLabelValues(k.ID, reject).Inc()
 				doRelease()
 				return noop, reject, http.StatusTooManyRequests
 			}
@@ -723,5 +849,18 @@ func boolLabel(b bool) string {
 		return "true"
 	}
 	return "false"
+}
+
+// isQuotaCode reports whether a rejection code came from the daily /
+// monthly quota path (vs. per-minute rate limit or concurrency cap).
+// Used to feed the separate quota counter for accurate dashboarding.
+func isQuotaCode(code string) bool {
+	switch code {
+	case "daily_request_limit_exceeded", "daily_token_limit_exceeded",
+		"daily_request_quota_exceeded", "daily_token_quota_exceeded",
+		"monthly_request_quota_exceeded", "monthly_token_quota_exceeded":
+		return true
+	}
+	return false
 }
 

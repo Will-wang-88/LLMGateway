@@ -9,24 +9,43 @@ import (
 )
 
 type Config struct {
-	Server      ServerConfig      `yaml:"server"`
-	Auth        AuthConfig        `yaml:"auth"`
-	Routing     RoutingConfig     `yaml:"routing"`
-	HealthCheck HealthCheckConfig `yaml:"health_check"`
-	RateLimit   RateLimitConfig   `yaml:"rate_limit"`
-	Logging     LoggingConfig     `yaml:"logging"`
-	Metrics     MetricsConfig     `yaml:"metrics"`
-	Admin       AdminConfig       `yaml:"admin"`
-	Storage     StorageConfig     `yaml:"storage"`
-	Queue       QueueConfig       `yaml:"queue"`
-	Tracing     TracingConfig     `yaml:"tracing"`
-	Dashboard   DashboardConfig   `yaml:"dashboard"`
+	Server        ServerConfig        `yaml:"server"`
+	Auth          AuthConfig          `yaml:"auth"`
+	Routing       RoutingConfig       `yaml:"routing"`
+	HealthCheck   HealthCheckConfig   `yaml:"health_check"`
+	RateLimit     RateLimitConfig     `yaml:"rate_limit"`
+	Logging       LoggingConfig       `yaml:"logging"`
+	Metrics       MetricsConfig       `yaml:"metrics"`
+	Admin         AdminConfig         `yaml:"admin"`
+	Storage       StorageConfig       `yaml:"storage"`
+	Queue         QueueConfig         `yaml:"queue"`
+	Tracing       TracingConfig       `yaml:"tracing"`
+	Dashboard     DashboardConfig     `yaml:"dashboard"`
+	Notifications NotificationsConfig `yaml:"notifications"`
 
 	Backends     []BackendConfig    `yaml:"backends"`
 	Models       []ModelConfig      `yaml:"models"`
 	ModelAliases []ModelAliasConfig `yaml:"model_aliases"`
 	APIKeys      []APIKeyConfig     `yaml:"api_keys"`
 	AdminUsers   []AdminUserConfig  `yaml:"admin_users"`
+}
+
+type NotificationsConfig struct {
+	Email EmailNotifierConfig `yaml:"email" json:"email"`
+}
+
+type EmailNotifierConfig struct {
+	Enabled    bool     `yaml:"enabled" json:"enabled"`
+	SMTPHost   string   `yaml:"smtp_host" json:"smtp_host"`
+	SMTPPort   int      `yaml:"smtp_port" json:"smtp_port"`
+	Username   string   `yaml:"username" json:"username"`
+	Password   string   `yaml:"password" json:"-"`
+	From       string   `yaml:"from" json:"from"`
+	To         []string `yaml:"to" json:"to"`
+	UseTLS     bool     `yaml:"use_tls" json:"use_tls"`
+	StartTLS   bool     `yaml:"start_tls" json:"start_tls"`
+	CooldownMS int      `yaml:"cooldown_ms" json:"cooldown_ms"`
+	NotifyOn   []string `yaml:"notify_on" json:"notify_on"`
 }
 
 type ServerConfig struct {
@@ -63,17 +82,32 @@ type RoutingConfig struct {
 }
 
 type HealthCheckConfig struct {
+	// Enabled lets operators turn off probing for a specific backend
+	// without removing it from the catalog. nil = use the default.
+	Enabled *bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	// Type selects the probe transport. Supported: "http" (default),
+	// "tcp". The "completion" probe is reserved for a future change.
+	Type             string `yaml:"type,omitempty" json:"type,omitempty"`
 	IntervalMS       int    `yaml:"interval_ms" json:"interval_ms"`
 	TimeoutMS        int    `yaml:"timeout_ms" json:"timeout_ms"`
 	FailureThreshold int    `yaml:"failure_threshold" json:"failure_threshold"`
 	SuccessThreshold int    `yaml:"success_threshold" json:"success_threshold"`
 	Path             string `yaml:"path" json:"path"`
+	// Method is the HTTP verb used by the http probe (default GET).
+	Method string `yaml:"method,omitempty" json:"method,omitempty"`
+	// Body is an optional request body for completion-style probes.
+	Body string `yaml:"body,omitempty" json:"body,omitempty"`
 }
 
 type RateLimitConfig struct {
 	Backend                  string `yaml:"backend"`
 	DefaultRequestsPerMinute int    `yaml:"default_requests_per_minute"`
 	DefaultConcurrentReq     int    `yaml:"default_concurrent_requests"`
+	// RedisURL is consumed when Backend = "redis". Example:
+	// "redis://:password@redis:6379/0". Multi-replica deployments
+	// require this to keep limits consistent across pods.
+	RedisURL   string `yaml:"redis_url"`
+	RedisPrefix string `yaml:"redis_prefix"`
 }
 
 type LoggingConfig struct {

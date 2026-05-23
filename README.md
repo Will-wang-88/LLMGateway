@@ -131,6 +131,8 @@ Admin (Bearer `admin.bind_token` or HTTP basic auth):
 
 | Method | Path                                       |
 |--------|--------------------------------------------|
+| POST   | `/admin/auth/login`                        |
+| POST   | `/admin/auth/logout`                       |
 | GET    | `/admin/backends`                          |
 | POST   | `/admin/backends`                          |
 | GET    | `/admin/backends/{id}`                     |
@@ -139,16 +141,39 @@ Admin (Bearer `admin.bind_token` or HTTP basic auth):
 | POST   | `/admin/backends/{id}/enable`              |
 | POST   | `/admin/backends/{id}/disable`             |
 | POST   | `/admin/backends/{id}/health-check`        |
+| POST   | `/admin/backends/{id}/maintenance`         |
 | GET    | `/admin/models`                            |
 | POST   | `/admin/models`                            |
+| GET    | `/admin/models/{name}`                     |
+| PATCH  | `/admin/models/{name}`                     |
 | DELETE | `/admin/models/{name}`                     |
 | GET    | `/admin/model-aliases`                     |
 | POST   | `/admin/model-aliases`                     |
+| PATCH  | `/admin/model-aliases/{alias}`             |
 | DELETE | `/admin/model-aliases/{alias}`             |
 | GET    | `/admin/api-keys`                          |
 | POST   | `/admin/api-keys`                          |
+| GET    | `/admin/api-keys/{id}`                     |
+| PATCH  | `/admin/api-keys/{id}`                     |
 | DELETE | `/admin/api-keys/{id}`                     |
+| POST   | `/admin/api-keys/{id}/enable`              |
+| POST   | `/admin/api-keys/{id}/disable`             |
+| POST   | `/admin/api-keys/{id}/rotate`              |
+| GET    | `/admin/api-keys/{id}/usage`               |
 | GET    | `/admin/stats/overview`                    |
+| GET    | `/admin/stats/range`                       |
+| GET    | `/admin/stats/models`                      |
+| GET    | `/admin/stats/backends`                    |
+| GET    | `/admin/stats/api-keys`                    |
+| GET    | `/admin/metrics`                           |
+| GET    | `/admin/logs`                              |
+| GET    | `/admin/audit`                             |
+| GET    | `/admin/users`                             |
+| POST   | `/admin/users`                             |
+| DELETE | `/admin/users/{username}`                  |
+| GET    | `/admin/notifications/status`              |
+| GET    | `/admin/me`                                |
+| GET    | `/admin/settings`                          |
 
 ## Error contract
 
@@ -236,8 +261,24 @@ auth against `admin_users` (SHA-256 hashed in memory).
 |----------|------------------------------------------------------------------|
 | memory   | bounded ring buffer (default, no persistence)                    |
 | sqlite   | local file via pure-Go `modernc.org/sqlite` (WAL mode, no CGO)   |
+| postgres | shared store via `pgx`; required for multi-replica deployments   |
 
-Older records are purged after `storage.log_retention_days`.
+Older records are purged after `storage.log_retention_days`. The Postgres
+DSN can come from `storage.dsn` or the `LLMGATEWAY_PG_DSN` env var.
+
+## Rate-limit / quota backend
+
+`rate_limit.backend` selects where per-key counters live:
+
+| backend | notes                                                              |
+|---------|--------------------------------------------------------------------|
+| memory  | process-local (default). Each replica enforces its own counters.   |
+| redis   | shared via `rate_limit.redis_url`. Required for multi-replica HA.  |
+
+> **Multi-replica deployments must use `storage.driver=postgres` AND
+> `rate_limit.backend=redis`**. Otherwise each replica will have its own
+> rate-limit counters and its own logs. Helm `values.yaml` defaults to
+> `replicaCount: 1` for this reason.
 
 ## Quota and request queue
 
@@ -288,8 +329,22 @@ re-emits the multipart body to the chosen backend.
 
 When `tracing.enabled: true` and an OTLP HTTP collector is configured, the
 gateway emits span batches every 5 seconds to `tracing.endpoint + /v1/traces`.
-Spans carry `service.name`, the model, backend, latency, and status. The
-exporter is best-effort - failures are logged and dropped.
+A span named `gateway.forward` is created per `/v1/*` request with
+`model`, `internal_model`, `backend_id`, `stream`, `routing_policy`,
+`status_code`, `latency_ms`, `ttft_ms`, and `error` attributes (when
+applicable). The exporter is best-effort: send failures are logged and
+dropped without affecting request handling.
+
+## Backend status notifications
+
+When `notifications.email.enabled: true`, backend status transitions are
+delivered via SMTP. Configure the recipient list with
+`notifications.email.to` and choose which transitions to alert on with
+`notify_on` (default: `backend_degraded`, `backend_unhealthy`,
+`backend_recovered`). A per-backend, per-event cooldown
+(`notifications.email.cooldown_ms`, default 5 min) prevents flapping
+backends from flooding inboxes. Sends never block the health-check loop
+and recent send results are exposed at `GET /admin/notifications/status`.
 
 ## Helm chart
 
@@ -308,12 +363,35 @@ helm install llmgateway ./deploy/helm/llmgateway \
   --set image.tag=latest
 ```
 
+## Implementation status
+
+| Area | Status |
+|---|---|
+| OpenAI-compatible passthrough (JSON, SSE, audio multipart) | implemented |
+| Health-aware routing (degraded backends excluded by default) | implemented |
+| API-key auth with Bearer prefix enforcement | implemented |
+| API-key allow/deny model lists honoring alias resolution | implemented |
+| API-key allow/deny client IP lists (IPv4/IPv6/CIDR) + trusted-proxy XFF | implemented |
+| Disabled-model registry as routing kill switch | implemented |
+| Declared / strict capability mode (vision / tool_call / thinking) | implemented |
+| Per-minute + per-day request / token rate limits, monthly quota | implemented |
+| Token-quota fallback when backend omits `usage` | implemented (conservative estimate) |
+| Persistent request_logs / audit_logs with `client_ip` | implemented (memory / sqlite / postgres) |
+| Redis-backed rate limit / quota for multi-replica HA | implemented |
+| Per-backend health probe scheduler with http/tcp probe types + method/body | implemented |
+| SMTP notifications for backend status transitions with cooldown/dedupe | implemented |
+| Admin API: backends / models / aliases / api-keys / stats / metrics / logs / audit | implemented |
+| RBAC, audit log, session token login (no password caching) | implemented |
+| Prometheus metrics with `routing_policy`, separate timeout/quota counters | implemented |
+| OpenTelemetry spans per request (`gateway.forward`) | implemented |
+| Docker (Go 1.25), `--healthcheck` flag, compose healthcheck via /healthz | implemented |
+| Web dashboard: backends / models / api-keys (CRUD + rotate + IP lists) / logs filters / analytics / audit / users / settings | implemented |
+| Helm chart with PVC + ServiceMonitor + HPA | implemented (replicaCount=1 unless postgres+redis) |
+
 ## Roadmap
 
-Future improvements (interfaces are in place for these):
-
-- PostgreSQL / ClickHouse log store implementations
-- Redis-backed rate limiter and concurrency counters (for true horizontal scaling)
 - OIDC / SSO for the dashboard
+- ClickHouse log store implementation
 - Streaming raw-response capture into the persistent log
 - Per-tenant analytics with retention tiers
+- Completion-style health probe (lightweight `/v1/chat/completions` test)

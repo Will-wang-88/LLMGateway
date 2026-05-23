@@ -6,38 +6,46 @@
   const storage = window.sessionStorage;
 
   // ---- auth -----------------------------------------------------------------
+  // The dashboard never caches a password. After a successful exchange
+  // it stores only a short-lived bearer token from /admin/auth/login.
   function authHeader() {
     const t = storage.getItem('admin_token');
     if (t) return 'Bearer ' + t;
-    const u = storage.getItem('admin_user');
-    const p = storage.getItem('admin_pass');
-    if (u !== null && p !== null) return 'Basic ' + btoa(u + ':' + p);
     return '';
   }
 
   async function login() {
-    const choice = prompt('Authenticate with admin token? Enter bearer token, or leave blank to use username/password:');
+    const choice = prompt('Paste an admin bearer token, or leave blank to log in with username/password:');
     if (choice === null) return false;
     if (choice !== '') {
       storage.setItem('admin_token', choice);
-      storage.removeItem('admin_user');
-      storage.removeItem('admin_pass');
-    } else {
-      const u = prompt('Username:');
-      if (u === null) return false;
-      const p = prompt('Password:');
-      if (p === null) return false;
-      storage.setItem('admin_user', u);
-      storage.setItem('admin_pass', p);
-      storage.removeItem('admin_token');
+      return true;
     }
+    const u = prompt('Username:');
+    if (u === null) return false;
+    const p = prompt('Password:');
+    if (p === null) return false;
+    const resp = await fetch(ADMIN + '/auth/login', {
+      method: 'POST',
+      headers: { 'Authorization': 'Basic ' + btoa(u + ':' + p) },
+    });
+    if (!resp.ok) {
+      alert('Login failed: HTTP ' + resp.status);
+      return false;
+    }
+    const data = await resp.json();
+    storage.setItem('admin_token', data.token);
     return true;
   }
 
-  function logout() {
+  async function logout() {
+    try {
+      await fetch(ADMIN + '/auth/logout', {
+        method: 'POST',
+        headers: { 'Authorization': authHeader() },
+      });
+    } catch (e) { /* ignore */ }
     storage.removeItem('admin_token');
-    storage.removeItem('admin_user');
-    storage.removeItem('admin_pass');
     location.reload();
   }
 
@@ -329,6 +337,10 @@
       <td>${fmt(k.total_tokens)}</td>
       <td class="actions-cell">
         <button class="ghost" data-usage="${escapeHTML(k.id)}">Usage</button>
+        ${k.enabled
+          ? `<button class="ghost" data-disable="${escapeHTML(k.id)}">Disable</button>`
+          : `<button class="ghost" data-enable="${escapeHTML(k.id)}">Enable</button>`}
+        <button class="ghost" data-rotate="${escapeHTML(k.id)}">Rotate</button>
         <button class="danger" data-delete="${escapeHTML(k.id)}">Delete</button>
       </td>
     </tr>`).join('');
@@ -343,15 +355,33 @@
       const u = await api('/api-keys/' + encodeURIComponent(b.dataset.usage) + '/usage');
       alert('Today: ' + u.day_requests + ' reqs / ' + u.day_tokens + ' tokens\nThis month: ' + u.month_requests + ' reqs / ' + u.month_tokens + ' tokens');
     });
+    document.querySelectorAll('#keys-table [data-disable]').forEach(b => b.onclick = async () => {
+      await api('/api-keys/' + encodeURIComponent(b.dataset.disable) + '/disable', { method: 'POST' });
+      toast('Disabled');
+      loadKeys();
+    });
+    document.querySelectorAll('#keys-table [data-enable]').forEach(b => b.onclick = async () => {
+      await api('/api-keys/' + encodeURIComponent(b.dataset.enable) + '/enable', { method: 'POST' });
+      toast('Enabled');
+      loadKeys();
+    });
+    document.querySelectorAll('#keys-table [data-rotate]').forEach(b => b.onclick = async () => {
+      if (!confirm('Rotate API key ' + b.dataset.rotate + '? The previous key stops working immediately.')) return;
+      const out = await api('/api-keys/' + encodeURIComponent(b.dataset.rotate) + '/rotate', { method: 'POST', body: {} });
+      alert('New key (shown once):\n\n' + out.key);
+      loadKeys();
+    });
   }
 
   document.getElementById('key-add').onclick = () => {
     openModal('Create API key', `
       <div class="form-row"><label>ID (optional)</label><input name="id"></div>
       <div class="form-row"><label>Name</label><input name="name" placeholder="Team A"></div>
-      <div class="form-row"><label>Key (will be hashed and shown once)</label><input name="key" placeholder="sk-prod-..."></div>
+      <div class="form-row"><label>Key (leave blank to auto-generate)</label><input name="key" placeholder="auto-generated if blank"></div>
       <div class="form-row"><label>Allowed models (comma-separated, supports wildcards)</label><input name="allowed_models" value="*"></div>
       <div class="form-row"><label>Denied models</label><input name="denied_models"></div>
+      <div class="form-row"><label>Allowed client IPs (comma-separated, exact or CIDR; blank = any)</label><input name="allowed_client_ips"></div>
+      <div class="form-row"><label>Denied client IPs (comma-separated)</label><input name="denied_client_ips"></div>
       <div class="form-row"><label>Requests / min</label><input name="rpm" type="number" value="600"></div>
       <div class="form-row"><label>Concurrent limit</label><input name="conc" type="number" value="20"></div>
       <div class="form-row"><label>Tokens / min</label><input name="tpm" type="number" value="0"></div>
@@ -364,6 +394,8 @@
         id: f('id'), name: f('name'), key: f('key'),
         allowed_models: f('allowed_models').split(',').map(s => s.trim()).filter(Boolean),
         denied_models: f('denied_models').split(',').map(s => s.trim()).filter(Boolean),
+        allowed_client_ips: f('allowed_client_ips').split(',').map(s => s.trim()).filter(Boolean),
+        denied_client_ips: f('denied_client_ips').split(',').map(s => s.trim()).filter(Boolean),
         rate_limit: {
           enabled: true,
           requests_per_minute: parseInt(f('rpm') || '0', 10),
@@ -377,7 +409,6 @@
         delay_ms: parseInt(f('delay_ms') || '0', 10),
         enabled: true,
       };
-      if (!data.key) throw new Error('key required');
       const out = await api('/api-keys', { method: 'POST', body: data });
       toast('Saved');
       alert('Key created. Save this value now - it will not be shown again:\n\n' + out.key);
@@ -401,6 +432,7 @@
       <td class="mono">${escapeHTML(l.model || '')}</td>
       <td class="mono small">${escapeHTML(l.backend_id || '')}</td>
       <td class="mono small">${escapeHTML(l.api_key_id || '')}</td>
+      <td class="mono small">${escapeHTML(l.client_ip || '')}</td>
       <td>${statusBadge(l.status_code)}</td>
       <td>${l.stream ? '<span class="badge stream">stream</span>' : ''}</td>
       <td>${fmt(l.total_tokens)}</td>
@@ -408,7 +440,7 @@
       <td>${l.ttft_ms || 0}ms</td>
       <td class="mono small">${escapeHTML(l.request_id || '')}</td>
     </tr>`).join('');
-    document.querySelector('#logs-table tbody').innerHTML = rows || '<tr><td colspan="11" class="small">No logs match.</td></tr>';
+    document.querySelector('#logs-table tbody').innerHTML = rows || '<tr><td colspan="12" class="small">No logs match.</td></tr>';
   }
   function statusBadge(c) {
     if (!c) return '<span class="badge unknown">?</span>';

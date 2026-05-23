@@ -45,9 +45,15 @@ health_check:
   path: /models
 
 rate_limit:
+  # memory: process-local. NOT safe for replicaCount > 1.
+  # redis: shared state across replicas. Required for multi-replica HA.
   backend: memory
   default_requests_per_minute: 600
   default_concurrent_requests: 20
+  # redis_url: required when backend=redis. Format:
+  #   redis://[user:password@]host:port/db
+  redis_url: ""
+  redis_prefix: llmgw
 
 logging:
   level: info
@@ -71,7 +77,12 @@ admin:
 # Driver "memory" (default) keeps the last 50k records in process.
 # Driver "sqlite" persists to a local file (pure-Go, no CGO).
 storage:
-  driver: sqlite             # memory | sqlite
+  # memory: in-process ring buffer, lost on restart.
+  # sqlite: local file, single-node only.
+  # postgres: shared store, required for multi-replica HA.
+  #   DSN format: postgres://user:pass@host:5432/dbname?sslmode=disable
+  #   (or set LLMGATEWAY_PG_DSN to override at runtime).
+  driver: sqlite
   dsn: data/llmgateway.db
   log_retention_days: 30
 
@@ -94,16 +105,35 @@ tracing:
 dashboard:
   enabled: true
 
+# Notifications when a backend changes status. Disabled by default.
+# SMTP_PASSWORD should be supplied via env, not inline.
+notifications:
+  email:
+    enabled: false
+    smtp_host: smtp.example.com
+    smtp_port: 587
+    username: alerts@example.com
+    password: ""
+    from: llmgateway@example.com
+    to: []
+    use_tls: false
+    start_tls: true
+    cooldown_ms: 300000
+    notify_on:
+      - backend_degraded
+      - backend_unhealthy
+      - backend_recovered
+
 # Multi-user RBAC. Roles: super_admin, admin, operator, viewer, auditor.
-# Passwords are SHA-256 hashed at load time.
+# Passwords are SHA-256 hashed at load time. For production, prefer
+# password_hash (pre-computed) over inline password so the config file
+# never carries plaintext.
 admin_users:
   - username: alice
-    password: "change-me-alice"
+    # password_hash is SHA-256 hex of the plaintext.
+    password_hash: ""
     email: alice@example.com
     role: super_admin
-  - username: bob
-    password: "change-me-bob"
-    role: viewer
 
 backends:
   - id: gpu-01

@@ -158,11 +158,15 @@ func (h *Handler) ForwardMultipart(upstreamPath string) http.HandlerFunc {
 		if !success {
 			h.metrics.BackendErrors.WithLabelValues(picked.ID, statusCodeLabel(statusCode)).Inc()
 		}
+		policyLabel := h.cfg.Routing.DefaultPolicy
+		if policyLabel == "" {
+			policyLabel = "unknown"
+		}
 		h.metrics.Requests.WithLabelValues(
-			upstreamPath, internalModel, picked.ID, apiKeyLabel, statusCodeLabel(statusCode), "false",
+			upstreamPath, internalModel, picked.ID, apiKeyLabel, statusCodeLabel(statusCode), "false", policyLabel,
 		).Inc()
 		h.metrics.RequestLatency.WithLabelValues(
-			upstreamPath, internalModel, picked.ID, "false",
+			upstreamPath, internalModel, picked.ID, "false", policyLabel,
 		).Observe(time.Since(started).Seconds())
 
 		latencyMS := time.Since(started).Milliseconds()

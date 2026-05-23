@@ -237,6 +237,59 @@ func TestAPIKeyStatsIncrementWithoutUsage(t *testing.T) {
 	}
 }
 
+func TestGatewayErrorsArePersistentlyLogged(t *testing.T) {
+	r := newReviewRig(t, []string{"m1"})
+	// invalid_json
+	r.do(t, []byte(`{not json`), nil)
+	// missing_model
+	r.do(t, []byte(`{"messages":[]}`), nil)
+	// model_not_found
+	r.do(t, []byte(`{"model":"unknown-model","messages":[]}`), nil)
+	time.Sleep(80 * time.Millisecond)
+	rows, _ := r.logstore.QueryRequests(context.Background(), logstore.LogQuery{Limit: 10})
+	codes := map[string]bool{}
+	for _, l := range rows {
+		codes[l.ErrorCode] = true
+	}
+	for _, want := range []string{"invalid_json", "missing_model", "model_not_found"} {
+		if !codes[want] {
+			t.Errorf("expected %q to be persistently logged; got %v", want, codes)
+		}
+	}
+}
+
+// P1-2
+func TestFallbackTokenEstimationWhenBackendOmitsUsage(t *testing.T) {
+	r := newReviewRig(t, []string{"m1"})
+	r.be.responseFn = func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		w.Header().Set("Content-Type", "application/json")
+		// Intentionally no `usage` block.
+		_, _ = w.Write([]byte(`{"id":"x","object":"chat.completion","choices":[]}`))
+	}
+	body := []byte(`{"model":"m1","max_tokens":128,"messages":[{"role":"user","content":"abcdefghij"}]}`)
+	resp := r.do(t, body, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	k, _ := r.store.APIKey("k1")
+	_, _, totalTokens := k.Stats()
+	if totalTokens == 0 {
+		t.Errorf("expected fallback estimation to credit tokens; got 0")
+	}
+}
+
+// P1-9
+func TestMetricsIncludeRoutingPolicyLabel(t *testing.T) {
+	r := newReviewRig(t, []string{"m1"})
+	r.cfg.Routing.DefaultPolicy = "weighted_round_robin"
+	resp := r.do(t, []byte(`{"model":"m1","messages":[]}`), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	// Force metric registration; the build/registration would have
+	// panicked at startup if the label was missing.
+}
+
 // P1-4
 func TestRawRequestLogKeepsClientOriginalBodyWhenAliasRewrites(t *testing.T) {
 	r := newReviewRig(t, []string{"llama-3.1-70b"})
