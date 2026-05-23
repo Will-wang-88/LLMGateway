@@ -636,17 +636,19 @@ func (s *Server) deleteAlias(w http.ResponseWriter, r *http.Request) {
 }
 
 type apiKeyBody struct {
-	ID            string                  `json:"id"`
-	Name          string                  `json:"name"`
-	Key           string                  `json:"key"`
-	Enabled       *bool                   `json:"enabled"`
-	AllowedModels []string                `json:"allowed_models"`
-	DeniedModels  []string                `json:"denied_models"`
-	RateLimit     *config.APIKeyRateLimit `json:"rate_limit,omitempty"`
-	Quota         *config.APIKeyQuota     `json:"quota,omitempty"`
-	DelayMS       int                     `json:"delay_ms"`
-	Logging       *config.APIKeyLogging   `json:"logging,omitempty"`
-	ExpiresAt     string                  `json:"expires_at"`
+	ID               string                  `json:"id"`
+	Name             string                  `json:"name"`
+	Key              string                  `json:"key"`
+	Enabled          *bool                   `json:"enabled"`
+	AllowedModels    []string                `json:"allowed_models"`
+	DeniedModels     []string                `json:"denied_models"`
+	AllowedClientIPs []string                `json:"allowed_client_ips"`
+	DeniedClientIPs  []string                `json:"denied_client_ips"`
+	RateLimit        *config.APIKeyRateLimit `json:"rate_limit,omitempty"`
+	Quota            *config.APIKeyQuota     `json:"quota,omitempty"`
+	DelayMS          int                     `json:"delay_ms"`
+	Logging          *config.APIKeyLogging   `json:"logging,omitempty"`
+	ExpiresAt        string                  `json:"expires_at"`
 }
 
 func (s *Server) listAPIKeys(w http.ResponseWriter, _ *http.Request) {
@@ -654,18 +656,20 @@ func (s *Server) listAPIKeys(w http.ResponseWriter, _ *http.Request) {
 	for _, k := range s.store.APIKeys() {
 		last, totalReqs, totalToks := k.Stats()
 		entry := map[string]any{
-			"id":             k.ID,
-			"name":           k.Name,
-			"key_prefix":     k.KeyPrefix,
-			"enabled":        k.Enabled,
-			"allowed_models": k.AllowedModels,
-			"denied_models":  k.DeniedModels,
-			"rate_limit":     k.RateLimit,
-			"quota":          k.Quota,
-			"delay_ms":       k.DelayMS,
-			"logging":        k.Logging,
-			"total_requests": totalReqs,
-			"total_tokens":   totalToks,
+			"id":                 k.ID,
+			"name":               k.Name,
+			"key_prefix":         k.KeyPrefix,
+			"enabled":            k.Enabled,
+			"allowed_models":     k.AllowedModels,
+			"denied_models":      k.DeniedModels,
+			"allowed_client_ips": k.AllowedClientIPs,
+			"denied_client_ips":  k.DeniedClientIPs,
+			"rate_limit":         k.RateLimit,
+			"quota":              k.Quota,
+			"delay_ms":           k.DelayMS,
+			"logging":            k.Logging,
+			"total_requests":     totalReqs,
+			"total_tokens":       totalToks,
 		}
 		if !last.IsZero() {
 			entry["last_used_at"] = last.UTC().Format(time.RFC3339)
@@ -696,15 +700,17 @@ func (s *Server) createAPIKey(w http.ResponseWriter, r *http.Request) {
 		enabled = *b.Enabled
 	}
 	k := &store.APIKey{
-		ID:            b.ID,
-		Name:          b.Name,
-		Enabled:       enabled,
-		AllowedModels: b.AllowedModels,
-		DeniedModels:  b.DeniedModels,
-		RateLimit:     b.RateLimit,
-		Quota:         b.Quota,
-		DelayMS:       b.DelayMS,
-		Logging:       b.Logging,
+		ID:               b.ID,
+		Name:             b.Name,
+		Enabled:          enabled,
+		AllowedModels:    b.AllowedModels,
+		DeniedModels:     b.DeniedModels,
+		AllowedClientIPs: b.AllowedClientIPs,
+		DeniedClientIPs:  b.DeniedClientIPs,
+		RateLimit:        b.RateLimit,
+		Quota:            b.Quota,
+		DelayMS:          b.DelayMS,
+		Logging:          b.Logging,
 	}
 	if b.ExpiresAt != "" {
 		if t, err := time.Parse(time.RFC3339, b.ExpiresAt); err == nil {

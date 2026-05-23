@@ -30,13 +30,18 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Host                 string `yaml:"host"`
-	Port                 int    `yaml:"port"`
-	RequestBodyLimitMB   int    `yaml:"request_body_limit_mb"`
-	DefaultTimeoutMS     int    `yaml:"default_timeout_ms"`
-	StreamIdleTimeoutMS  int    `yaml:"stream_idle_timeout_ms"`
-	ReadHeaderTimeoutMS  int    `yaml:"read_header_timeout_ms"`
-	ShutdownTimeoutMS    int    `yaml:"shutdown_timeout_ms"`
+	Host                 string   `yaml:"host"`
+	Port                 int      `yaml:"port"`
+	RequestBodyLimitMB   int      `yaml:"request_body_limit_mb"`
+	DefaultTimeoutMS     int      `yaml:"default_timeout_ms"`
+	StreamIdleTimeoutMS  int      `yaml:"stream_idle_timeout_ms"`
+	ReadHeaderTimeoutMS  int      `yaml:"read_header_timeout_ms"`
+	ShutdownTimeoutMS    int      `yaml:"shutdown_timeout_ms"`
+	// TrustedProxies lists IPs / CIDRs that are allowed to set
+	// X-Forwarded-For / X-Real-IP. Headers from any other peer are
+	// ignored when resolving the client IP. Empty (default) means: never
+	// trust forwarded headers.
+	TrustedProxies       []string `yaml:"trusted_proxies"`
 }
 
 type AuthConfig struct {
@@ -50,6 +55,11 @@ type RoutingConfig struct {
 	DefaultPolicy      string `yaml:"default_policy" json:"default_policy"`
 	ModelAliasEnabled  bool   `yaml:"model_alias_enabled" json:"model_alias_enabled"`
 	UnknownFieldPolicy string `yaml:"unknown_field_policy" json:"unknown_field_policy"`
+	// AllowDegradedBackends, when true, lets routing pick backends in the
+	// "degraded" state (e.g. health probe returned 4xx). Default false:
+	// degraded backends are excluded from routing because the gateway
+	// has already observed an unrecoverable error from them.
+	AllowDegradedBackends bool `yaml:"allow_degraded_backends" json:"allow_degraded_backends"`
 }
 
 type HealthCheckConfig struct {
@@ -154,19 +164,21 @@ type ModelAliasConfig struct {
 }
 
 type APIKeyConfig struct {
-	ID             string                 `yaml:"id"`
-	Name           string                 `yaml:"name"`
-	Key            string                 `yaml:"key"`
-	KeyPrefix      string                 `yaml:"key_prefix"`
-	KeyHash        string                 `yaml:"key_hash"`
-	Enabled        bool                   `yaml:"enabled"`
-	AllowedModels  []string               `yaml:"allowed_models"`
-	DeniedModels   []string               `yaml:"denied_models"`
-	RateLimit      *APIKeyRateLimit       `yaml:"rate_limit,omitempty"`
-	Quota          *APIKeyQuota           `yaml:"quota,omitempty"`
-	DelayMS        int                    `yaml:"delay_ms"`
-	Logging        *APIKeyLogging         `yaml:"logging,omitempty"`
-	ExpiresAt      string                 `yaml:"expires_at"`
+	ID                string                 `yaml:"id"`
+	Name              string                 `yaml:"name"`
+	Key               string                 `yaml:"key"`
+	KeyPrefix         string                 `yaml:"key_prefix"`
+	KeyHash           string                 `yaml:"key_hash"`
+	Enabled           bool                   `yaml:"enabled"`
+	AllowedModels     []string               `yaml:"allowed_models"`
+	DeniedModels      []string               `yaml:"denied_models"`
+	AllowedClientIPs  []string               `yaml:"allowed_client_ips"`
+	DeniedClientIPs   []string               `yaml:"denied_client_ips"`
+	RateLimit         *APIKeyRateLimit       `yaml:"rate_limit,omitempty"`
+	Quota             *APIKeyQuota           `yaml:"quota,omitempty"`
+	DelayMS           int                    `yaml:"delay_ms"`
+	Logging           *APIKeyLogging         `yaml:"logging,omitempty"`
+	ExpiresAt         string                 `yaml:"expires_at"`
 }
 
 type APIKeyRateLimit struct {

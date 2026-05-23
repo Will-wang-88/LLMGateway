@@ -24,6 +24,7 @@ import (
 	"github.com/will-wang-88/llmgateway/internal/logging"
 	"github.com/will-wang-88/llmgateway/internal/logstore"
 	"github.com/will-wang-88/llmgateway/internal/metrics"
+	"github.com/will-wang-88/llmgateway/internal/netutil"
 	"github.com/will-wang-88/llmgateway/internal/proxy"
 	"github.com/will-wang-88/llmgateway/internal/queue"
 	"github.com/will-wang-88/llmgateway/internal/quota"
@@ -42,12 +43,17 @@ const (
 
 func main() {
 	configPath := flag.String("config", envOr(envConfigPath, "config/gateway.yaml"), "Path to YAML config file")
+	healthcheck := flag.Bool("healthcheck", false, "Probe /healthz on the configured listener and exit 0/1 (for Docker HEALTHCHECK)")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 		os.Exit(1)
+	}
+
+	if *healthcheck {
+		os.Exit(runHealthCheck(cfg))
 	}
 
 	if v := os.Getenv(envHashSecret); v != "" {
@@ -170,7 +176,9 @@ func main() {
 	}
 
 	// Build /v1/* handlers wrapped with API-key auth.
-	authn := auth.New(s, cfg.Auth.APIKeyHeader, cfg.Auth.APIKeyPrefix)
+	ipExtractor := netutil.NewExtractor(cfg.Server.TrustedProxies)
+	authn := auth.New(s, cfg.Auth.APIKeyHeader, cfg.Auth.APIKeyPrefix).
+		WithClientIPExtractor(ipExtractor)
 	v1Auth := authn.Middleware(func(r *http.Request) bool {
 		return strings.HasPrefix(r.URL.Path, "/v1/")
 	})
@@ -224,6 +232,30 @@ func main() {
 		logger.Error("shutdown error", logging.F("error", err.Error()))
 	}
 	logger.Info("shutdown complete", nil)
+}
+
+// runHealthCheck performs a lightweight HTTP GET against /healthz on the
+// listener address the gateway would itself bind to. It's invoked via
+// `llmgateway --healthcheck` so docker-compose / k8s probes can verify
+// liveness without a shell.
+func runHealthCheck(cfg *config.Config) int {
+	host := cfg.Server.Host
+	if host == "0.0.0.0" || host == "" {
+		host = "127.0.0.1"
+	}
+	url := fmt.Sprintf("http://%s:%d/healthz", host, cfg.Server.Port)
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "healthcheck: %v\n", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "healthcheck: status %d\n", resp.StatusCode)
+		return 1
+	}
+	return 0
 }
 
 func envOr(key, fallback string) string {

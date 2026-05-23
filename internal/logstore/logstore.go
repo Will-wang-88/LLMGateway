@@ -12,6 +12,7 @@ type RequestLog struct {
 	RequestID        string            `json:"request_id"`
 	APIKeyID         string            `json:"api_key_id"`
 	APIKeyName       string            `json:"api_key_name,omitempty"`
+	ClientIP         string            `json:"client_ip,omitempty"`
 	Model            string            `json:"model"`
 	InternalModel    string            `json:"internal_model,omitempty"`
 	BackendID        string            `json:"backend_id"`
@@ -49,6 +50,7 @@ type AuditEvent struct {
 type LogQuery struct {
 	RequestID  string
 	APIKeyID   string
+	ClientIP   string
 	Model      string
 	BackendID  string
 	Endpoint   string
@@ -291,6 +293,9 @@ func matchLog(r *RequestLog, q LogQuery) bool {
 		return false
 	}
 	if q.APIKeyID != "" && r.APIKeyID != q.APIKeyID {
+		return false
+	}
+	if q.ClientIP != "" && r.ClientIP != q.ClientIP {
 		return false
 	}
 	if q.Model != "" && r.Model != q.Model {

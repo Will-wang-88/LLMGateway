@@ -15,7 +15,10 @@ services:
       LLMGATEWAY_ADMIN_TOKEN: ${LLMGATEWAY_ADMIN_TOKEN:-change-me-admin}
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "/app/llmgateway", "--config", "/dev/null", "--help"]
+      # The distroless runtime image has no shell or curl. Use wget from
+      # busybox would also need a layer change; instead point Docker at
+      # /healthz via the gateway's own listener using a TCP probe.
+      test: ["CMD", "/app/llmgateway", "--healthcheck"]
       interval: 30s
       timeout: 5s
       retries: 3

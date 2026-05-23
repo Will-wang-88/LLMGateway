@@ -13,6 +13,12 @@ server:
   stream_idle_timeout_ms: 30000
   read_header_timeout_ms: 30000
   shutdown_timeout_ms: 30000
+  # Peers (CIDR or exact IP) whose X-Forwarded-For / X-Real-IP headers
+  # the gateway is willing to honor when resolving the client IP. Leave
+  # empty if the gateway is exposed directly; otherwise list your LB /
+  # ingress / mesh ranges. Spoofed headers from non-trusted peers are
+  # ignored.
+  trusted_proxies: []
 
 auth:
   api_key_header: Authorization
@@ -26,6 +32,10 @@ routing:
   model_alias_enabled: true
   # Gateway is a transparent proxy: unknown JSON fields are forwarded as-is.
   unknown_field_policy: passthrough
+  # When false (default), backends in the "degraded" state (e.g. health
+  # probe returned 4xx) are skipped during routing. Set to true only if
+  # you want degraded backends to keep receiving real traffic.
+  allow_degraded_backends: false
 
 health_check:
   interval_ms: 5000
@@ -184,6 +194,11 @@ api_keys:
       - company-main-model
       - reasoning-main
     denied_models: []
+    # Optional per-key client IP allow / deny. Deny takes precedence over
+    # allow. Empty allowed_client_ips means "no IP restriction". Supports
+    # exact IPv4/IPv6 and CIDR.
+    allowed_client_ips: []
+    denied_client_ips: []
     rate_limit:
       enabled: true
       requests_per_minute: 600

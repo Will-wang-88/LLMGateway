@@ -17,10 +17,9 @@ import (
 //   - bytes from the backend are written to the client unmodified.
 //   - lines larger than the read buffer are reassembled before being parsed
 //     for usage (still forwarded byte-for-byte to the client).
-//   - on idle timeout, the stream is closed silently (we emit an SSE comment
-//     `: stream-idle-timeout` rather than fabricating a JSON error frame,
-//     because per the spec the gateway must not inject content into the
-//     stream).
+//   - on idle timeout, the stream is closed silently. Nothing is written
+//     to the client beyond what the backend already produced; the spec
+//     requires zero gateway-injected bytes in the stream.
 //
 // Goroutine lifecycle: the read goroutine sends to a buffered channel and
 // also selects on stopRead. When streamResponse returns, defer closes
@@ -98,11 +97,11 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, resp *http.Response, start
 		case <-clientCtx.Done():
 			return resp.StatusCode, nil
 		case <-idleTimer.C:
-			// Per spec: the gateway must not inject content into the stream.
-			// We emit a benign SSE comment (lines starting with ':' are
-			// ignored by SSE clients) and close. Clients will see EOF.
-			_, _ = io.WriteString(w, ": stream-idle-timeout\n\n")
-			flusher.Flush()
+			// Per spec the gateway must not inject content into the
+			// stream. Close upstream and return; the client sees EOF.
+			p.logger.Warn("stream idle timeout", map[string]any{
+				"backend": backendIDOf(opts),
+			})
 			return resp.StatusCode, errors.New("stream idle timeout")
 		case res, ok := <-chunkCh:
 			if !ok {
@@ -208,6 +207,13 @@ func parseChunkUsage(line []byte) *Usage {
 		return nil
 	}
 	return envelope.Usage
+}
+
+func backendIDOf(opts ForwardOptions) string {
+	if opts.Backend != nil {
+		return opts.Backend.ID
+	}
+	return ""
 }
 
 // WriteSSEError emits an OpenAI-style error frame as a single SSE event.

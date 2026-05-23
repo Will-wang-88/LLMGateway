@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -209,11 +210,25 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 		// Resolve alias -> internal model. Both names are recorded for metrics labels.
 		internalModel, forwardName := h.store.ResolveAlias(peek.Model)
 
-		// API key model permission.
-		if apiKey != nil && !apiKey.ModelAllowed(peek.Model) {
+		// API key model permission. Both the requested (alias) and the
+		// resolved internal model are checked so an alias cannot bypass
+		// DeniedModels.
+		if apiKey != nil && !apiKey.ModelAllowedResolved(peek.Model, internalModel) {
 			proxy.WriteError(w, http.StatusForbidden, proxy.PermissionError(
 				fmt.Sprintf("The API key is not allowed to use model: %s", peek.Model),
 				"model_not_allowed",
+			))
+			return
+		}
+
+		// Explicit model registry: if the resolved internal model has a
+		// registry entry with enabled=false, reject before backend
+		// selection. This makes Admin disable a real kill-switch instead
+		// of only hiding the model from /v1/models.
+		if m, ok := h.store.Model(internalModel); ok && !m.Enabled {
+			proxy.WriteError(w, http.StatusNotFound, proxy.NotFound(
+				fmt.Sprintf("Model is disabled: %s", peek.Model),
+				"model_not_found",
 			))
 			return
 		}
@@ -228,17 +243,19 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 			return
 		}
 
+		clientIP := auth.ClientIPFromContext(r.Context())
+
 		// Apply rate-limit / quota / concurrency / queue admission.
 		release, code, status := h.admit(r.Context(), apiKey, internalModel)
 		if code != "" {
-			h.recordLog(r.Context(), requestID, apiKey, peek.Model, internalModel, "", upstreamPath, isStream, status, code, nil, time.Since(started).Milliseconds(), 0, raw, nil)
+			h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, status, code, nil, time.Since(started).Milliseconds(), 0, raw, nil)
 			proxy.WriteError(w, status, proxy.RateLimit("Rejected: "+code, code))
 			return
 		}
 		defer release()
 
 		// Filter for healthy + within-capacity, then pick one.
-		ready := filterRoutable(candidates)
+		ready := filterRoutable(candidates, h.cfg.Routing.AllowDegradedBackends)
 		if len(ready) == 0 {
 			proxy.WriteError(w, http.StatusServiceUnavailable, proxy.BackendUnavailable(
 				fmt.Sprintf("No healthy backend available for model: %s", peek.Model),
@@ -261,7 +278,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 		}
 		if !picked.AcquireSlot() {
 			// Lost the race to another request; pick again from remaining.
-			ready = filterRoutable(candidates)
+			ready = filterRoutable(candidates, h.cfg.Routing.AllowDegradedBackends)
 			picked = h.balancer.Choose(internalModel, policy, ready, hint)
 			if picked == nil || !picked.AcquireSlot() {
 				proxy.WriteError(w, http.StatusServiceUnavailable, proxy.BackendUnavailable(
@@ -339,6 +356,12 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 		if !success {
 			h.metrics.BackendErrors.WithLabelValues(picked.ID, statusCodeLabel(statusCode)).Inc()
 		}
+		// API-key request stats must be updated regardless of whether the
+		// backend returned a usage block (or any body at all). Token totals
+		// are still attributed via recordUsage.
+		if apiKey != nil {
+			apiKey.TouchRequest()
+		}
 		h.metrics.Requests.WithLabelValues(
 			upstreamPath, internalModel, picked.ID, apiKeyLabel, statusCodeLabel(statusCode), boolLabel(isStream),
 		).Inc()
@@ -361,7 +384,15 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 				"api_key_id", apiKeyLabel,
 			)
 			if h.shouldLog(apiKey, "log_raw_request") {
-				fields["raw_request"] = json.RawMessage(forwardBody)
+				// Persist the client-original body so alias rewrites don't
+				// obscure what the caller actually sent.
+				fields["raw_request"] = json.RawMessage(raw)
+				if !bytes.Equal(raw, forwardBody) {
+					fields["forwarded_request"] = json.RawMessage(forwardBody)
+				}
+			}
+			if clientIP != "" {
+				fields["client_ip"] = clientIP
 			}
 			if ferr != nil {
 				fields["error"] = ferr.Error()
@@ -375,7 +406,9 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 		if h.logstore != nil {
 			var rawReqForLog []byte
 			if h.shouldLog(apiKey, "log_raw_request") {
-				rawReqForLog = forwardBody
+				// Persist what the client actually sent, not the
+				// alias-rewritten body the backend received.
+				rawReqForLog = raw
 			}
 			var rawRespForLog []byte
 			if isStream && captureStreamChunks {
@@ -383,7 +416,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 			} else if !isStream && captureRawResp {
 				rawRespForLog = rawResp
 			}
-			h.recordLog(r.Context(), requestID, apiKey, peek.Model, internalModel, picked.ID,
+			h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, picked.ID,
 				upstreamPath, isStream, statusCode, errorCodeFromForward(ferr, statusCode),
 				&capturedUsage, latencyMS, ttftMS, rawReqForLog, rawRespForLog)
 		}
@@ -402,7 +435,7 @@ func errorCodeFromForward(err error, statusCode int) string {
 
 // recordLog writes a single request-log entry to the persistent log store.
 func (h *Handler) recordLog(ctx context.Context, requestID string, k *store.APIKey,
-	model, internalModel, backendID, endpoint string, stream bool, statusCode int,
+	clientIP, model, internalModel, backendID, endpoint string, stream bool, statusCode int,
 	errorCode string, usage *proxy.Usage, latencyMS, ttftMS int64,
 	rawReq, rawResp []byte) {
 	if h.logstore == nil {
@@ -411,6 +444,7 @@ func (h *Handler) recordLog(ctx context.Context, requestID string, k *store.APIK
 	rec := &logstore.RequestLog{
 		ID:            uuid.New().String(),
 		RequestID:     requestID,
+		ClientIP:      clientIP,
 		Model:         model,
 		InternalModel: internalModel,
 		BackendID:     backendID,
@@ -472,7 +506,9 @@ func (h *Handler) recordUsage(u *proxy.Usage, model, backendID, apiKeyLabel stri
 		h.metrics.ReasoningTokens.WithLabelValues(model, backendID, apiKeyLabel).Add(float64(u.ReasoningTokens))
 	}
 	if apiKey != nil {
-		apiKey.Touch(u.TotalTokens)
+		// Request counter is incremented unconditionally elsewhere
+		// (see Forward); attribute the token total only.
+		apiKey.AddTokens(u.TotalTokens)
 		if apiKey.RateLimit != nil && apiKey.RateLimit.TokensPerMinute > 0 {
 			h.limiter.AddTokens("tok:"+apiKey.ID, u.TotalTokens)
 		}
@@ -621,20 +657,26 @@ func (h *Handler) shouldLog(k *store.APIKey, field string) bool {
 
 // filterRoutable returns backends that are admissible for routing.
 //
-// Routable states: healthy, unknown (just-started), degraded (responsive but
-// reporting some failure - still worth trying, with a warning logged).
+// Routable states: healthy, unknown (just-started). Degraded is routable
+// only when allowDegraded is true (off by default), because the health
+// probe has already observed a 4xx from the backend - sending real
+// traffic to it would surface the same failure to the client.
 // Excluded states: disabled, unhealthy, maintenance.
 // Excluded: backends at max concurrency.
 // Excluded: backends with weight 0 (drain mode).
-func filterRoutable(in []*store.Backend) []*store.Backend {
+func filterRoutable(in []*store.Backend, allowDegraded bool) []*store.Backend {
 	out := make([]*store.Backend, 0, len(in))
 	for _, b := range in {
 		if !b.Enabled {
 			continue
 		}
 		switch b.Status() {
-		case store.StatusHealthy, store.StatusUnknown, store.StatusDegraded:
+		case store.StatusHealthy, store.StatusUnknown:
 			// admissible
+		case store.StatusDegraded:
+			if !allowDegraded {
+				continue
+			}
 		default:
 			continue
 		}

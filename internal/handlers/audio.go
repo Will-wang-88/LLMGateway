@@ -68,14 +68,24 @@ func (h *Handler) ForwardMultipart(upstreamPath string) http.HandlerFunc {
 			return
 		}
 
-		if apiKey != nil && !apiKey.ModelAllowed(model) {
+		internalModel, _ := h.store.ResolveAlias(model)
+
+		if apiKey != nil && !apiKey.ModelAllowedResolved(model, internalModel) {
 			proxy.WriteError(w, http.StatusForbidden, proxy.PermissionError(
 				fmt.Sprintf("The API key is not allowed to use model: %s", model),
 				"model_not_allowed",
 			))
 			return
 		}
-		internalModel, _ := h.store.ResolveAlias(model)
+
+		// Honor model registry enabled=false as a routing kill switch.
+		if m, ok := h.store.Model(internalModel); ok && !m.Enabled {
+			proxy.WriteError(w, http.StatusNotFound, proxy.NotFound(
+				fmt.Sprintf("Model is disabled: %s", model),
+				"model_not_found",
+			))
+			return
+		}
 
 		candidates := h.store.BackendsForModel(internalModel)
 		if len(candidates) == 0 {
@@ -94,7 +104,7 @@ func (h *Handler) ForwardMultipart(upstreamPath string) http.HandlerFunc {
 		}
 		defer releaseAdmit()
 
-		ready := filterRoutable(candidates)
+		ready := filterRoutable(candidates, h.cfg.Routing.AllowDegradedBackends)
 		if len(ready) == 0 {
 			proxy.WriteError(w, http.StatusServiceUnavailable, proxy.BackendUnavailable(
 				fmt.Sprintf("No healthy backend available for model: %s", model),
@@ -156,7 +166,10 @@ func (h *Handler) ForwardMultipart(upstreamPath string) http.HandlerFunc {
 		).Observe(time.Since(started).Seconds())
 
 		latencyMS := time.Since(started).Milliseconds()
-		h.recordLog(r.Context(), requestID, apiKey, model, internalModel, picked.ID,
+		if apiKey != nil {
+			apiKey.TouchRequest()
+		}
+		h.recordLog(r.Context(), requestID, apiKey, auth.ClientIPFromContext(r.Context()), model, internalModel, picked.ID,
 			upstreamPath, false, statusCode, errorCodeFromForward(ferr, statusCode),
 			nil, latencyMS, 0, nil, nil)
 	}
