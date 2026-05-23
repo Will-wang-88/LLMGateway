@@ -1,29 +1,36 @@
-# Transparent Enterprise LLM Gateway 程式碼 Review
+# Transparent Enterprise LLM Gateway 二次 Review
 
 Review 日期：2026-05-23
 
-Review 範圍：依照使用者提供的「企業級 OpenAI-Compatible LLM Gateway 規格書」檢查目前 repo 全部程式碼、設定、測試、Docker/Helm 與 dashboard。
+Review 範圍：
 
-重要限制：本次只做 review 與驗收建議，未修改任何功能程式。唯一新增檔案是本 `review.md`。
+- 已先閱讀 `report.md`。
+- 再 review `report.md` 宣稱修正後的目前程式碼。
+- 本文件只列「目前修改後仍需要修正」的項目，避免重複處理已修項目。
+
+重要限制：
+
+- 本次只做 review 與驗收建議。
+- 不修改 gateway 功能程式。
+- Claude Code 請依本文件修正程式與補測試。
 
 ## 總結判定
 
-目前專案已具備「Go HTTP gateway、OpenAI-compatible JSON 轉發、SSE streaming 轉發、basic API key、basic load balancing、basic health check、basic admin/dashboard、basic metrics/logging」的雛形。
+`report.md` 宣稱多數前一版 review 已修完，且 `go test ./...`、`go test -race ./...`、`go vet ./...` 全部通過。靜態 review 後確認有不少項目已改善，例如 degraded backend routing、alias deny、disabled model、dashboard token login、Postgres logstore、Redis limiter、mail notifier 等。
 
-但尚未達到規格書定義的企業級 MVP 驗收標準。最需要先修的是 routing/auth 正確性與安全邊界：
+但目前仍不能驗收通過，主要原因是：
 
-1. degraded backend 仍會被送流量，可能把已知會失敗的 backend 放回服務路徑。
-2. alias 權限檢查只檢查外部 model 名稱，可能繞過 internal model 的 denied_models。
-3. model registry 的 `enabled=false` 只影響 `/v1/models` 顯示，不阻擋實際 `/v1/chat/completions` 轉發。
-4. rate limit / quota / request stats / logging 與規格仍有明顯缺口。
-5. Admin API、Dashboard、Storage、Redis/PostgreSQL、Metrics、Tracing 距離企業級要求仍不足。
-6. 所有 logs / stats 尚未完整記錄 client IP，API key 也尚未支援限制可連線的 client IP。
-7. Backend 異常尚未支援 Mail 通知。
-8. 本地無 Go toolchain，`go test ./...` 無法執行；Dockerfile 也使用 `golang:1.24-alpine`，但 `go.mod` 宣告 `go 1.25.0`，部署建置有風險。
+1. token rate limit / daily token quota 的 limiter key 不一致，實際不會生效。
+2. 多個 gateway error path 無視 logging policy，會記錄 raw request。
+3. trusted proxy 後的 client IP 解析仍可被 `X-Forwarded-For` spoof。
+4. client IP 的 log/stat 覆蓋不完整，auth middleware 直接拒絕的請求不進 persistent log。
+5. Admin runtime 新增 backend 後沒有週期 health check，mail notification 也會漏。
+6. SMTP STARTTLS 可默默降級成 plaintext。
+7. Postgres 目前只存 logs/audit，不存 backends/models/api_keys metadata。
 
 ## 測試狀態
 
-已嘗試執行：
+本機嘗試執行：
 
 ```bash
 go test ./...
@@ -35,823 +42,619 @@ go test ./...
 zsh:1: command not found: go
 ```
 
-本機目前沒有 Go，因此本 review 是靜態程式碼 review 加測試檔覆蓋檢查，尚未完成實際測試驗收。Claude 修完後必須在有 Go 1.25+ 的環境執行：
+目前環境沒有 Go toolchain，因此本次是靜態 review，無法在本機驗證 `report.md` 所述測試結果。Claude Code 修完後必須在有 Go 1.25+ 的環境執行：
 
 ```bash
 go test ./...
 go test -race ./...
+go vet ./...
 docker build -f docker/Dockerfile -t llmgateway:review .
 ```
 
-## P0 必修：會影響安全、routing 正確性或核心驗收
+另外已確認：
 
-### P0-1 degraded backend 仍被 routing 使用
+```bash
+git diff --check f544eb8..HEAD
+```
+
+沒有 whitespace error。
+
+## P0 必修：會影響安全、限流或核心驗收
+
+### P0-1 token rate limit / daily token quota 實際不會生效
 
 位置：
 
-- `internal/backend/health.go:116-128`
-- `internal/handlers/handlers.go:622-650`
+- `internal/handlers/handlers.go:634-635`
+- `internal/handlers/handlers.go:682`
+- `internal/ratelimit/ratelimit.go:102-137`
+- `internal/ratelimit/redis.go:72-106`
 
 問題：
 
-Health check 對 401/403/其他 4xx 會標記 backend 為 `degraded`。註解明確寫著 401/403 代表 backend up 但 credential 被拒絕，「不應 blindly route real traffic」。可是 `filterRoutable` 又把 `store.StatusDegraded` 列為可用狀態：
+`admit()` 檢查 limiter 時使用：
 
 ```go
-case store.StatusHealthy, store.StatusUnknown, store.StatusDegraded:
+h.limiter.CheckAndReserve("key:"+k.ID, rpm, tpm, dayReq, dayTok)
 ```
 
-這會造成已知 auth probe 失敗或版本不相容的 backend 仍接到正式請求，違反規格的 health aware routing。
-
-修改要求：
-
-- 預設 routing 只允許 `healthy`，可選擇短暫允許 `unknown` 作為啟動寬限，但不得允許 `degraded`。
-- 如果要支援 degraded routing，必須做成明確 config，例如 `routing.allow_degraded_backends=false`，預設 false。
-- 401/403 health check 應直接視為 unroutable；可維持狀態為 `degraded` 供 dashboard 顯示，但 routing 層要排除。
-
-驗收測試：
-
-- 新增測試：backend health check 回 401/403 後，該 backend 不會被 `Forward` 選中。
-- 同 model 有 healthy + degraded backend 時，請求只打到 healthy backend。
-- 只有 degraded backend 時，回 `503 no_healthy_backend`。
-
-### P0-2 model alias 可繞過 internal model deny list
-
-位置：
-
-- `internal/handlers/handlers.go:209-219`
-- `internal/store/store.go:234-249`
-
-問題：
-
-目前轉發流程先 resolve alias：
+但 `recordUsage()` 累積 token 時使用：
 
 ```go
-internalModel, forwardName := h.store.ResolveAlias(peek.Model)
+h.limiter.AddTokens("tok:"+apiKey.ID, u.TotalTokens)
 ```
 
-但 API key 權限只檢查 client 傳入的外部名稱：
+兩邊 key 不一致，導致 `TokensPerMinute`、`TokensPerDay`、`Quota.DailyTokens` 經由 limiter 檢查時永遠看不到 token 累積。結果是 token rate limit / daily token quota 幾乎等於失效。
+
+修改要求：
+
+- `CheckAndReserve()` 與 `AddTokens()` 必須使用同一個 bucket key。
+- 建議統一使用 `"key:"+apiKey.ID`。
+- memory limiter 與 Redis limiter 都要一致。
+- 補測試覆蓋 handler 層，不只測 limiter 單元。
+
+驗收測試：
+
+- 新增 `TestHandlerTokensPerMinuteBlocksAfterUsage`：
+  - 設定 API key `tokens_per_minute` 很小。
+  - 第一次 backend 回 usage 讓 token 累積超過限制。
+  - 第二次請求必須回 `429 token_rate_limit_exceeded`。
+- 新增 `TestHandlerDailyTokenLimitBlocksAfterUsage`：
+  - 設定 `quota.daily_tokens` 或 `rate_limit.tokens_per_day`。
+  - 使用 backend usage 或 fallback estimate 超過後，下一次請求必須被擋。
+- Redis limiter 也需有等價測試或 integration test。
+
+### P0-2 gateway error path 會無視 logging policy 記錄 raw request
+
+位置：
+
+- `internal/handlers/handlers.go:220-229`
+- `internal/handlers/handlers.go:244-267`
+- `internal/handlers/handlers.go:278-294`
+- `internal/handlers/handlers.go:301-303`
+- `internal/handlers/handlers.go:522-560`
+
+問題：
+
+成功路徑有依 `log_raw_request` 決定是否寫 `raw_request`：
 
 ```go
-if apiKey != nil && !apiKey.ModelAllowed(peek.Model)
+if h.shouldLog(apiKey, "log_raw_request") {
+    rawReqForLog = raw
+}
 ```
 
-若 key 設定：
-
-```yaml
-allowed_models: ["*"]
-denied_models: ["llama-3.1-70b"]
-```
-
-同時 alias：
-
-```yaml
-company-main-model -> llama-3.1-70b
-```
-
-client 呼叫 `company-main-model` 會通過外部名稱檢查，最後 route 到被 denied 的 `llama-3.1-70b`。這違反「Deny List 優先」與 API key model permission。
-
-修改要求：
-
-- 權限檢查必須同時考慮 `requestedModel` 與 `internalModel`。
-- Deny 規則應對兩者任一命中即拒絕。
-- Allow 規則建議允許任一名稱命中即可通過，但 deny 永遠優先。
-- `/v1/models` 顯示 alias 時，也應確保該 key 對 alias 和 internal model 的權限語意一致，避免顯示可用但實際不可用。
-
-建議 API：
+但多個錯誤路徑直接呼叫：
 
 ```go
-func (k *APIKey) ModelAllowedResolved(requested, internal string) bool
+h.recordLog(..., raw, nil)
 ```
 
-驗收測試：
-
-- `allowed_models=["*"]`、`denied_models=["llama-3.1-70b"]`、alias `company-main-model -> llama-3.1-70b`，呼叫 alias 必須 403。
-- `allowed_models=["company-main-model"]`、internal 不在 allow list，呼叫 alias 應依產品設計通過，但測試要明確固定語意。
-- denied 同時命中 alias 和 internal 任一方時，永遠 403。
-
-### P0-3 disabled model registry 沒有阻擋實際 routing
-
-位置：
-
-- `/v1/models` 有過濾：`internal/handlers/handlers.go:110-140`
-- `/v1/chat/completions` 沒有過濾：`internal/handlers/handlers.go:221-229`
-- store lookup：`internal/store/store.go:486-490`
-
-問題：
-
-`ListModels` 會把 registry 中 `enabled=false` 的 model 隱藏，但 `Forward` 只查 `BackendsForModel(internalModel)`，沒有檢查 model registry 的 `Enabled`。只要 backend 宣告支援該 model，client 仍能直接呼叫被停用的 model。
-
-這會讓 Admin 停用 model 只影響 catalog，不影響實際權限與 routing。
-
-修改要求：
-
-- 在 alias resolve 後、backend lookup 前，檢查 explicit model registry：
-  - 若 model registry 存在且 `enabled=false`，回 `404 model_not_found` 或 `403 model_disabled`。建議依 OpenAI-compatible catalog 語意用 `404 model_not_found`，但需在規格中固定。
-  - alias 指向 disabled internal model 也必須被拒絕。
-- Admin disable / delete model 的行為要有測試。
-
-驗收測試：
-
-- registry model disabled，backend 仍宣告該 model，直接呼叫應失敗。
-- alias 指到 disabled model，呼叫 alias 應失敗。
-- `/v1/models` 與實際 routing 結果一致。
-
-### P0-4 缺少 client IP 稽核、統計與 API key IP 存取限制
-
-位置：
-
-- request path：`internal/handlers/handlers.go`
-- auth middleware：`internal/auth/middleware.go`
-- request log schema：`internal/logstore/logstore.go`
-- SQLite schema：`internal/logstore/sqlite.go`
-- metrics/stats：`internal/metrics/metrics.go`, `internal/admin/admin.go`, `internal/admin/admin_extra.go`
-- config/API key schema：`internal/config/config.go`, `internal/store/store.go`
-
-問題：
-
-新增企業要求：
-
-- 所有 logs 與統計必須記錄 client IP。
-- 每個 API key 可以定義允許連線的 client IP。
-
-目前程式只在一般 HTTP debug log 或 admin audit 中偶爾使用 `RemoteAddr` / `X-Forwarded-For`，核心 request log、API key stats、admin stats、dashboard analytics、rate/quota records 都沒有穩定的 `client_ip` 欄位。API key struct/config 也沒有 `allowed_client_ips` / `denied_client_ips` 或 CIDR 檢查，因此無法限制特定 key 只能從指定來源 IP 呼叫。
-
-修改要求：
-
-- 建立單一可信 client IP extractor，例如 `internal/netutil/clientip.go`：
-  - 預設使用 `r.RemoteAddr`。
-  - 只有當 `RemoteAddr` 屬於 `server.trusted_proxies` / `server.trusted_proxy_cidrs` 時，才信任 `X-Forwarded-For` / `X-Real-IP`。
-  - 支援 IPv4、IPv6、CIDR、反向代理多層 XFF。
-  - 不可盲目信任任意 client 傳入的 `X-Forwarded-For`。
-- API key schema 增加：
-  - `allowed_client_ips: []string`
-  - `denied_client_ips: []string`
-  - 支援 exact IP 與 CIDR，例如 `203.0.113.10`, `10.0.0.0/8`, `2001:db8::/32`。
-  - deny 優先於 allow。
-  - allow 空陣列代表不限來源；deny 仍生效。
-- 在 API key authentication 後、model/routing 前執行 IP policy：
-  - 不符合來源 IP 時回 `403 permission_error`，code 建議 `client_ip_not_allowed`。
-  - 記錄 request log，包含 `client_ip` 與 rejected reason。
-- 所有 request logs 必須新增 `client_ip`：
-  - `logstore.RequestLog.ClientIP`
-  - SQLite `request_logs.client_ip`
-  - Admin `/admin/logs` filter 支援 `client_ip`。
-  - Dashboard Logs 顯示 client IP 並可搜尋。
-- 所有統計必須支援 client IP 維度：
-  - Admin stats 增加 by_client_ip aggregation。
-  - Dashboard Analytics 顯示 top client IPs。
-  - API key usage drilldown 可依 client IP 分組。
-- Prometheus 注意事項：
-  - raw client IP 作為 Prometheus label 會有高 cardinality 風險。
-  - 若產品要求 Prometheus 也必須帶 `client_ip`，請做成 config，例如 `metrics.client_ip_label_enabled=false` 預設關閉；但 persistent stats / admin analytics 必須記錄 client IP。
-- 所有 Gateway 主動錯誤、backend error passthrough、streaming/non-streaming 成功請求都要帶 client IP。
-
-驗收測試：
-
-- `allowed_client_ips=["127.0.0.1/32"]` 時，非該 IP 呼叫回 403 `client_ip_not_allowed`。
-- `denied_client_ips` 命中時，即使 allowed 也必須拒絕。
-- IPv6/CIDR 匹配正確。
-- 未設定 trusted proxy 時，偽造 `X-Forwarded-For` 不可繞過 IP 限制。
-- trusted proxy 設定後，正確從 XFF 取最終 client IP。
-- request log、admin stats、dashboard logs/analytics 都可看到 client IP。
-
-## P1 必修：MVP 驗收缺口
-
-### P1-1 Authorization header 接受非 Bearer 格式
-
-位置：
-
-- `internal/auth/middleware.go:78-87`
-
-問題：
-
-規格要求 client 使用：
-
-```http
-Authorization: Bearer sk-company-xxxx
-```
-
-但目前若 header 不符合 `Bearer ` prefix，`extractKey` 仍直接回傳整個 header：
+而 `recordLog()` 只要 `rawReq` 非空就寫入：
 
 ```go
-return strings.TrimSpace(raw)
+if len(rawReq) > 0 {
+    rec.RawRequest = string(rawReq)
+}
 ```
 
-這會接受 `Authorization: sk-xxx` 或其他非 Bearer 格式，與規格不符。
+這會讓以下錯誤在 `log_raw_request=false` 時仍記錄 client 原始 body：
+
+- `invalid_json`
+- `missing_model`
+- `model_not_allowed`
+- `model_not_found`
+- capability reject
+- rate limit / quota reject
+- `no_healthy_backend`
+
+這違反規格的 privacy default：預設不記 input/output，raw logging 必須明確開啟。
 
 修改要求：
 
-- 若 `api_key_prefix` 非空，header 必須以 prefix 開頭，否則回 `401 invalid_api_key`。
-- 若要支援 legacy raw key，請增加顯式 config，例如 `auth.allow_raw_authorization=false`，預設 false。
+- 所有呼叫 `recordLog()` 的錯誤路徑都必須先通過 logging policy。
+- 可新增 helper：
+
+```go
+func (h *Handler) rawRequestForLog(k *store.APIKey, raw []byte) []byte
+```
+
+只有 `log_raw_request=true` 才回傳 raw，否則回 nil。
+
+- `recordLog()` 本身也可加防呆，避免呼叫端忘記 policy。
+- 測試要覆蓋錯誤路徑，而不只成功 alias rewrite 路徑。
 
 驗收測試：
 
-- `Authorization: sk-test` 必須 401。
-- `Authorization: Bearer sk-test` 正常。
-- 缺 header 仍 401。
+- 新增 `TestGatewayErrorsDoNotPersistRawRequestWhenDisabled`。
+- 新增 `TestGatewayErrorsPersistRawRequestWhenEnabled`。
+- 分別覆蓋 `invalid_json`、`missing_model`、`model_not_allowed`、`no_healthy_backend` 至少其中幾種。
 
-### P1-2 token rate limit / token quota 不是嚴格限制
-
-位置：
-
-- admission check：`internal/handlers/handlers.go:497-537`
-- usage accounting：`internal/handlers/handlers.go:458-482`
-- limiter：`internal/ratelimit/ratelimit.go`
-- quota：`internal/quota/quota.go`
-
-問題：
-
-目前 token limit 檢查只看之前累積的 tokens，實際 tokens 是 backend 回來後才透過 `usage` 加上去。這會導致單次大請求可大幅超過 `tokens_per_minute` / daily token quota / monthly token quota。
-
-另外，如果 backend 沒有回 `usage`，token limit 和 quota 完全不會更新。
-
-修改要求：
-
-- MVP 至少要明確實作一種策略並文件化：
-  1. preflight token estimation：從 messages/input/max_tokens 做估算並先 reserve；
-  2. postpaid soft-limit：允許本次超出，但下一次阻擋，並在 dashboard/metrics 標示為 soft limit；
-  3. strict backend usage required：若 key 有 token limit 但 backend 不回 usage，採保守估算或記錄警告。
-- 規格要求 quota control，建議採「估算 reserve + 回應後 reconcile」。
-
-驗收測試：
-
-- 一次請求預估 token 超過 limit 時應 429。
-- backend 無 usage 時不應讓 token quota 永久失效。
-- streaming final usage 被正確計入。
-
-### P1-3 API key usage stats 只在 backend 回 usage 時更新
+### P0-3 trusted proxy 後 client IP 仍可被 X-Forwarded-For spoof
 
 位置：
 
-- `internal/handlers/handlers.go:458-482`
-- `internal/store/store.go:220-231`
-- Admin key list：`internal/admin/admin.go:652-678`
+- `internal/netutil/clientip.go:54-67`
+- `internal/netutil/clientip.go:137-155`
+- `internal/auth/middleware.go:97-112`
 
 問題：
 
-`apiKey.Touch()` 只在 `recordUsage()` 內呼叫，而 `recordUsage()` 遇到 `u == nil` 直接 return。這代表：
+目前只要 immediate peer 是 trusted proxy，就直接取 `X-Forwarded-For` 第一個 IP：
 
-- backend 不回 usage 的成功請求不會更新 API key `last_used_at` / `total_requests`。
-- backend error 也不會更新 API key 使用統計。
-- Dashboard/API key request count 會嚴重低估。
+```go
+if ip := parseFirstForwardedFor(r.Header.Get("X-Forwarded-For")); ip != "" {
+    return ip
+}
+```
 
-修改要求：
-
-- 在 request admission 成功或 request completion 時，無論 backend 是否回 usage，都應更新 key 的 `last_used_at` 與 request count。
-- token count 仍由 usage 或估算值更新。
-- quota request counters 與 API key stats 要語意一致。
-
-驗收測試：
-
-- backend 回應沒有 `usage`，API key `total_requests` 仍 +1。
-- backend 500 passthrough，API key `last_used_at` 仍更新。
-- streaming 無 usage final chunk，request count 仍更新。
-
-### P1-4 logging policy 實作不完整，且 raw request 記錄的是改寫後 body
-
-位置：
-
-- `internal/handlers/handlers.go:363-388`
-- `internal/handlers/handlers.go:586-620`
-- `internal/logstore/logstore.go`
-
-問題：
-
-規格要求每個 API key 可設定：
-
-- log_metadata
-- log_input
-- log_output
-- log_raw_request
-- log_raw_response
-- log_stream_chunks
-
-目前問題：
-
-1. `log_input` / `log_output` 有 config 與 `shouldLog`，但沒有任何實作。
-2. `log_raw_request` 記錄的是 `forwardBody`，如果 alias mode 是 `use_internal`，raw log 會變成改寫後的 model，不是 client 傳入 Gateway 的原始 body。
-3. 許多 Gateway 主動錯誤沒有寫 persistent request log，例如 invalid JSON、missing model、model_not_found、no_healthy_backend、backend_at_capacity。
-4. backend error body 有 passthrough，但 request log 的 `error_code` 只存 HTTP status 字串，沒有嘗試保留 backend error code。
-
-修改要求：
-
-- `raw_request` 必須記錄 client 原始 `raw`，不是 alias rewrite 後的 `forwardBody`。
-- 如需記錄 forwarded body，另加 `forwarded_request` 或 metadata 欄位。
-- 實作 `log_input` / `log_output`：
-  - log_input：可記錄 messages/input 相關欄位。
-  - log_output：可記錄 assistant output 或合併後 stream output。
-  - 保持預設 false。
-- Gateway 所有主動錯誤都要進 request log metadata。
-- backend error passthrough 時，若 body 是 OpenAI error envelope，解析 `error.code` 存進 request log，但不得改 response body。
-
-驗收測試：
-
-- alias use_internal + log_raw_request=true，request log 中 raw_request 仍是 client 原始 alias。
-- invalid JSON 會產生 request log。
-- log_input/log_output=false 時不記內容；true 時有內容。
-- backend error `{error:{code:"invalid_thinking_budget"}}` passthrough 且 log error_code 保留。
-
-### P1-5 streaming idle timeout 會注入額外 SSE comment
-
-位置：
-
-- `internal/proxy/stream.go:100-106`
-
-問題：
-
-規格要求 streaming chunk 原樣轉發，不改寫、不注入。現在 idle timeout 時會寫：
+在很多 proxy 預設行為中，proxy 會 append 而不是 overwrite `X-Forwarded-For`。惡意 client 可以先送：
 
 ```text
-: stream-idle-timeout
+X-Forwarded-For: 10.0.0.5
 ```
 
-雖然這是 SSE comment，仍然是 Gateway 新增的 chunk，不是 backend 原樣輸出。
+trusted proxy append 後變成：
+
+```text
+X-Forwarded-For: 10.0.0.5, 203.0.113.9
+```
+
+Gateway 目前會取 `10.0.0.5`，造成 API key `allowed_client_ips` 可被繞過。
 
 修改要求：
 
-- idle timeout 時關閉 upstream/client stream 並記錄 log/metrics，不要寫入任何額外 SSE bytes。
-- 若產品想讓 client 看到 timeout event，必須做成明確 opt-in config，預設關閉。
+- client IP extraction 必須使用 trusted proxy chain algorithm。
+- 建議邏輯：
+  - immediate `RemoteAddr` 必須是 trusted proxy，否則完全忽略 XFF。
+  - 把 XFF 切成 IP list。
+  - 從右往左掃描，跳過 trusted proxies。
+  - 遇到第一個 untrusted IP，即為真實 client IP。
+  - 若全部都是 trusted，取最左邊或 remote peer，但要有明確測試。
+- `X-Real-IP` 也只能在 trusted proxy 情況下使用，且優先級需明確。
 
 驗收測試：
 
-- backend idle timeout 時，client 收到的 bytes 必須完全等於 backend 已輸出的 bytes，不包含 Gateway 自己的 comment。
+- 新增 `TestClientIPExtractorUsesRightmostUntrustedXFF`。
+- 新增 `TestClientIPExtractorIgnoresSpoofedLeftmostXFFBehindTrustedProxy`。
+- 新增 multi-hop trusted proxy 測試。
+- API key allowed/denied IP 測試要用 trusted proxy + spoofed XFF 驗證不能繞過。
 
-### P1-6 Health check schema 與行為缺少規格欄位
+## P1 必修：企業級驗收缺口
+
+### P1-1 client_ip log / stats 覆蓋不完整
 
 位置：
 
-- `internal/config/config.go:55-61`
-- `internal/backend/health.go:47-88`
+- `internal/auth/middleware.go:60-112`
+- `internal/handlers/handlers.go:162-179`
+- `internal/logstore/logstore.go:78-89`
+- `internal/logstore/sqlite.go:214-265`
+- `internal/logstore/postgres.go:193-255`
 
 問題：
 
-規格要求 health check 支援：
+使用者新增需求是：
 
-- `enabled`
-- `type`: http / tcp / lightweight completion probe
-- `path`
-- `interval_ms`
-- `timeout_ms`
-- failure/success thresholds
+> 所有的 log 與統計要記錄 CLIENT IP，API KEY 可以定義限制可以連線的 CLIENT IP。
 
-目前 config 只有 interval/timeout/threshold/path，且：
+目前成功請求與部分 handler 內 gateway error 會記 `client_ip`，但 auth middleware 直接拒絕的請求不會進 handler，也不會進 persistent request log，包括：
 
-- per-backend `IntervalMS` 在 `checkOne` 讀了，但實際 scheduler 只使用全域 ticker，per-backend interval 不生效。
-- 無 `enabled`，無法對單一 backend 關閉 health check。
-- 無 `type`，不支援 TCP 或 completion probe。
-- 401/403 degraded 的 routing 行為如 P0-1。
+- missing Authorization
+- Authorization prefix 錯誤
+- invalid API key
+- disabled API key
+- expired API key
+- `client_ip_not_allowed`
 
-修改要求：
+另外 `Stats` 目前只有：
 
-- 擴充 `HealthCheckConfig` 欄位：`enabled`, `type`, `path`, `method`, optional probe body。
-- 實作 per-backend scheduler 或至少明確不支援 per-backend interval，移除無效欄位。
-- MVP 可只實作 http/tcp，但 config schema 要與規格一致，completion probe 預設 off。
+```go
+ByModel
+ByBackend
+ByAPIKey
+```
 
-驗收測試：
-
-- per-backend health_check.enabled=false 不會被 probe，也不影響 status。
-- per-backend interval 生效或 config 不再宣稱支援。
-- TCP check 可檢測端口可連線。
-
-### P1-7 Admin API 缺少規格要求的 endpoint
-
-位置：
-
-- routes：`internal/admin/admin.go:50-92`
-
-規格要求但目前缺少或不完整：
-
-- `GET /admin/models/{name}`
-- `PATCH /admin/models/{name}`
-- `PATCH /admin/model-aliases/{alias}`
-- `GET /admin/metrics`
-- `GET /admin/stats/models`
-- `GET /admin/stats/backends`
-- `GET /admin/stats/api-keys`
-
-目前 model / alias 只有 list、POST upsert、DELETE。stats 只有 overview/range。
+沒有 `ByClientIP`。`report.md` 說用 `/admin/logs?client_ip=` filter 代替 aggregation，但這不等於統計記錄 client IP。
 
 修改要求：
 
-- 補齊規格列出的 Admin API。
-- PATCH 應只更新明確傳入欄位，不應要求完整覆蓋。
-- 所有 mutating endpoint 都要寫 audit log。
-- 補 OpenAPI 或 README API 表格同步更新。
+- auth middleware 直接拒絕的 API request 也要能寫 persistent request log，至少要包含：
+  - request_id
+  - client_ip
+  - endpoint
+  - status_code
+  - error_code
+  - api_key_id 若已解析
+- `logstore.Stats` 新增 `ByClientIP`。
+- memory/sqlite/postgres `StatsSince()` 都要 group by `client_ip`。
+- Admin `/admin/stats/range` 回傳 `by_client_ip`。
+- Dashboard analytics 顯示 top client IPs 或至少能查詢。
 
 驗收測試：
 
-- 每個規格 endpoint 都有 route test。
-- RBAC 對每個 endpoint 生效。
-- PATCH model/alias 只改指定欄位。
+- 新增 `TestAuthRejectedRequestsArePersistentlyLoggedWithClientIP`。
+- 新增 `TestClientIPNotAllowedIsLoggedWithClientIP`。
+- 新增 `TestStatsAggregateByClientIP`，要求 `StatsSince().ByClientIP` 有資料。
+- sqlite / postgres schema migration 都要包含 client_ip index 與 aggregation。
 
-### P1-8 Dashboard 未達規格頁面資訊密度與操作要求
-
-位置：
-
-- `web/static/index.html`
-- `web/static/app.js`
-- `web/static/app.css`
-
-主要缺口：
-
-- Overview 缺 QPS/RPM、success rate、error rate、avg/p95/p99 latency、TTFT、queued requests、token throughput。
-- Models 缺 backend count、healthy backend count、active/queued requests、avg/p95 latency、tokens/sec、error rate。
-- Backends 缺 p95 latency、enable/disable 有但缺 maintenance、last health check detail 顯示不足。
-- API Keys 缺 denied_models、quota usage、logging setting、last used time 詳細欄位；只能 create/delete，沒有 patch/disable/rotate UI。
-- Logs filter 缺 time range、latency range、error code；不能檢視 raw request/response。
-- Analytics 沒有趨勢圖、top errors、capacity planning。
-- Settings 是 read-only，規格要求 Admin Settings 管理 backends/model/alias/API keys/rate/logging/dashboard users/RBAC/system config。
-
-修改要求：
-
-- 先補 Dashboard 對應 Admin API 的功能缺口，不必急著換 Next.js。
-- 增加 charts 可以用 lightweight chart lib 或後續 Next.js + Recharts/ECharts。
-- UI auth 不要長期把密碼放 sessionStorage；至少改成 token/session 模式或短期記憶體。
-
-驗收測試：
-
-- Dashboard 可新增/修改/停用 Backend。
-- Dashboard 可新增/修改/停用/rotate API Key。
-- Dashboard 可依規格條件查 logs。
-- Overview/Models/Backends/API Keys/Analytics 欄位符合規格。
-
-### P1-9 Metrics 不完整，labels 與統計維度不符合規格
+### P1-2 Admin 新增 backend 後不會被週期 health check 接管
 
 位置：
 
-- `internal/metrics/metrics.go:8-86`
-- 使用位置：`internal/handlers/handlers.go:286-347`
-
-目前有基本 counter/histogram/gauge，但規格要求的下列項目不足：
-
-- qps/rpm 需由 Prometheus query 推導，目前 Admin/Dashboard 沒提供。
-- queued_requests 只有 `QueueDepth`，且只在 acquire 後 set，沒有完整 queue state。
-- latency_p50/p95/p99、ttft_p50/p95 需 histogram query，Admin API 未提供。
-- tokens_per_second 沒有。
-- timeout_count 沒有。
-- quota_exceeded_count 沒有獨立 metric。
-- labels 缺 `routing_policy`。
-- 可選 labels `organization/user/tenant/tool_call/vision/thinking` 沒有任何判定或設計。
-
-修改要求：
-
-- 補齊 Prometheus metrics 與 Admin stats endpoint。
-- Request metrics labels 至少包含：api_key_id、model、backend_id、endpoint、status_code、stream、routing_policy。
-- timeout/rate/quota/backend error 分開 counter。
-- Dashboard 從 Admin stats 或 Prometheus query 顯示 p95/p99/TTFT。
-
-驗收測試：
-
-- `/metrics` 包含規格要求核心 metrics。
-- 同一請求能在 metrics 中帶 routing_policy label。
-- timeout / quota / rate limit 分別增加不同 counter。
-
-### P1-10 Storage/Redis/PostgreSQL 缺失，無法水平擴展
-
-位置：
-
-- config：`internal/config/config.go:99-103`
-- main storage switch：`cmd/gateway/main.go:93-119`
-- in-memory limiter/concurrency/queue/quota：`internal/ratelimit`, `internal/queue`, `internal/quota`
-- Docker Compose：`docker-compose.yml`
+- `internal/backend/health.go:72-82`
+- `internal/backend/health.go:275-278`
+- `internal/admin/admin.go:405-407`
+- `internal/admin/admin.go:493-500`
 
 問題：
 
-目前 metadata/config 主要來自 YAML + in-memory store；request/audit log 只有 memory/sqlite。Admin 變更不會寫回 YAML 或 DB，restart 後消失。rate limit/concurrency/queue/quota 都是 process-local，Helm 預設 `replicaCount: 2` 時會直接失去全域限制語意。
+`HealthChecker.Start()` 啟動時只對當下 store 裡的 backends spawn goroutine：
 
-規格要求：
+```go
+for _, b := range h.store.Backends() {
+    h.spawn(b)
+}
+```
 
-- PostgreSQL 儲存 config/metadata。
-- Redis 做 rate limit/concurrency/queue。
-- Prometheus 做 metrics。
-- 水平擴展共享狀態。
+註解寫「Backends added after start are picked up by Rescan()」，但程式沒有 `Rescan()`。Admin create backend 只呼叫一次：
+
+```go
+s.health.CheckOnce(bk)
+```
+
+因此 runtime 新增的 backend 只會被檢查一次，之後不會持續 health check。這會造成：
+
+- dashboard health 狀態不更新。
+- unhealthy backend 可能長期維持舊狀態。
+- backend 異常 mail notification 可能漏發。
 
 修改要求：
 
-- MVP 若先不做 PostgreSQL/Redis，README 與 values.yaml 必須明確標註「不支援多 replica 嚴格限流」。
-- 企業級驗收前必須新增：
-  - Postgres-backed store：api_keys/backends/models/model_aliases/request_logs/audit_logs。
-  - Redis-backed rate limiter/concurrency/quota/queue。
-  - runtime admin mutations 持久化。
-- Helm 在沒有 Redis/Postgres 前預設 replicaCount 應為 1，避免假 HA。
+- 實作 `HealthChecker.Rescan()` 或 `WatchStore()`。
+- Admin `createBackend` 後要啟動該 backend 的週期 health loop。
+- Admin `deleteBackend` 後要停止對該 backend 的 loop，避免 goroutine leak。
+- Admin patch health_check interval/enabled/type 時，scheduler 要能更新，至少重啟該 backend loop。
+- 避免同一 backend 被 spawn 多個 goroutine。
 
 驗收測試：
 
-- Admin 新增 API key 後 restart 仍存在。
-- 兩個 gateway replica 共享 concurrent_requests 限制。
-- 兩個 replica 共享 rate limit / quota。
+- 新增 `TestAdminCreatedBackendGetsPeriodicHealthChecks`。
+- 新增 `TestHealthCheckerDoesNotSpawnDuplicateLoopsForSameBackend`。
+- 新增 `TestDeletedBackendStopsHealthLoop` 或用 fake probe counter 驗證。
 
-### P1-11 Docker 建置與 compose 不符合規格
-
-位置：
-
-- `go.mod:3`
-- `docker/Dockerfile:1`
-- `docker-compose.yml:1-21`
-
-問題：
-
-- `go.mod` 宣告 `go 1.25.0`，但 Dockerfile 使用 `golang:1.24-alpine`。
-- Compose 沒有 PostgreSQL / Redis，與規格範例不符。
-- Compose healthcheck 執行 `/app/llmgateway --config /dev/null --help`，不是打 `/healthz` 或 `/readyz`，無法驗證服務真實健康狀態。
-
-修改要求：
-
-- Dockerfile build image 改成 Go 1.25+，或把 go.mod 降到實際可用版本。
-- Compose 加 postgres/redis/prometheus optional services，或明確標記目前是 single-node demo。
-- healthcheck 改為 HTTP 檢查 `/healthz`。
-
-驗收測試：
-
-- `docker compose up --build` 可成功啟動。
-- `docker inspect` health status 能反映 gateway HTTP health。
-
-### P1-12 declared/strict capability mode 沒有實作
+### P1-3 SMTP STARTTLS 不可默默降級 plaintext
 
 位置：
 
-- config fields：`internal/config/config.go:139-147`
-- admin UI exposes modes：`web/static/app.js`
-- forwarding path：`internal/handlers/handlers.go`
+- `internal/notify/notify.go:237-263`
+- `internal/notify/notify.go:266-285`
 
 問題：
 
-規格定義 `passthrough` / `declared` / `strict`。目前欄位存在，但 forwarding path 沒有任何 capability 檢查。Dashboard 甚至允許選 `declared` 或 `strict`，但系統行為仍是 passthrough。
-
-修改要求：
-
-- MVP 可保持預設 passthrough，但若 UI/API 接受 `declared` / `strict`，就必須實作。
-- 或先限制只允許 `passthrough`，並在 README 註明 declared/strict 是後續功能。
-
-驗收測試：
-
-- declared mode 下，vision=false 的 model 收到 image_url request 應按規格拒絕。
-- passthrough mode 下，同 request 應完整轉發。
-- strict mode 未實作前不可在 UI/API 被設定。
-
-### P1-13 Backend 異常缺少 Mail 通知
-
-位置：
-
-- health checker：`internal/backend/health.go`
-- config：`internal/config/config.go`
-- main wiring：`cmd/gateway/main.go`
-- admin/dashboard：`internal/admin`, `web/static/app.js`
-
-問題：
-
-新增企業要求：Backend 異常時可以發送 Mail 通知。
-
-目前 HealthChecker 只更新 backend status、Prometheus gauge 與 logger，沒有 notification subsystem。當 backend 從 healthy 變成 degraded/unhealthy、持續 flapping、或恢復 healthy 時，系統無法主動通知維運人員。
-
-修改要求：
-
-- 新增 notification config，例如：
+當 config 設定：
 
 ```yaml
-notifications:
-  email:
-    enabled: true
-    smtp_host: smtp.example.com
-    smtp_port: 587
-    username: alerts@example.com
-    password: ${SMTP_PASSWORD}
-    from: llmgateway@example.com
-    to:
-      - ops@example.com
-    use_tls: true
-    start_tls: true
-    cooldown_ms: 300000
-    notify_on:
-      - backend_degraded
-      - backend_unhealthy
-      - backend_recovered
+start_tls: true
 ```
 
-- backend status transition 時觸發 Mail：
-  - `healthy -> degraded`
-  - `healthy/degraded/unknown -> unhealthy`
-  - `unhealthy/degraded -> healthy` recovery
-  - 可選：maintenance 不通知，或單獨配置。
-- 通知要非阻塞：
-  - 不可阻塞 health check loop。
-  - 發送失敗要記 log/metric。
-  - 要有 cooldown / dedupe，避免 backend flapping 時洗信。
-- Mail 內容至少包含：
-  - backend id/name/base_url
-  - old status / new status
-  - last error
-  - latency
-  - affected models
-  - timestamp
-  - gateway instance id / hostname
-- Admin API / Dashboard 要可查看 notification 狀態與最近發送結果。
-- Secret 不可明文出現在 dashboard 或 logs；SMTP password 應支援 env/secret 注入。
+但 SMTP server 沒有 advertise `STARTTLS` 時，目前程式會略過 TLS upgrade，繼續做 AUTH / MAIL / DATA。這會讓 SMTP 帳密與告警內容可能以 plaintext 傳送。
+
+修改要求：
+
+- `start_tls=true` 時，若 server 不支援 STARTTLS，必須 return error。
+- 若 `auth != nil` 且沒有 TLS，應拒絕或至少要有明確 config 允許 insecure auth，預設拒絕。
+- error 應進 notifier `LastResult()` 與 structured log。
 
 驗收測試：
 
-- fake SMTP server 收到 backend unhealthy notification。
-- 同一 backend 在 cooldown 內重複失敗只發一次。
-- backend recovery 會發 recovery mail。
-- SMTP 發送失敗不影響 health check 與 routing。
-- Mail 內容不包含 API key 明文或 backend API key。
+- 新增 `TestSMTPSenderStartTLSRequiredFailsWhenUnsupported`。
+- 新增 `TestSMTPSenderDoesNotAuthOverPlaintextByDefault`。
 
-## P2 建議修正：企業級完整度與一致性
-
-### P2-1 `/readyz` 把 unknown backend 視為 ready
+### P1-4 notification cooldown 目前會壓掉失敗重試
 
 位置：
 
-- `cmd/gateway/main.go:149-161`
+- `internal/notify/notify.go:157-183`
 
 問題：
 
-readiness 目前接受 `StatusUnknown`。這對冷啟動友善，但在 health check 尚未完成或長時間 unknown 時，LB 會提早導流。
+`dispatch()` 在真正 send 之前就寫入 `lastSent`：
 
-建議：
+```go
+n.lastSent[dedupeKey] = time.Now()
+```
 
-- readiness 預設只接受 healthy。
-- 可用 config 設定 startup grace，例如 `ready_allow_unknown_for_ms`。
+如果 SMTP send 失敗，接下來 cooldown 期間相同 backend/kind 的事件都會被 suppress。也就是第一次告警發送失敗後，真正的 backend 異常可能在 cooldown 內完全不再通知。
 
-### P2-2 multipart/audio 不是原樣 passthrough
+修改要求：
+
+- 只有 send 成功後才更新 `lastSent`。
+- 或拆成 `lastAttempt` / `lastSuccess`，失敗重試用較短 cooldown。
+- `LastResult()` 要能區分 last attempt 與 last success。
+
+驗收測試：
+
+- 新增 `TestNotifyFailureDoesNotStartSuccessCooldown`。
+- 新增失敗後下一次事件會再嘗試送信的測試。
+
+### P1-5 PostgreSQL 目前只存 logs/audit，不存 config metadata
 
 位置：
 
-- `internal/handlers/audio.go`
+- `cmd/gateway/main.go:120-172`
+- `internal/store/store.go:381-470`
+- `internal/admin/admin.go:374-410`
+- `internal/admin/admin.go:440-500`
+- `internal/admin/admin.go:741-788`
 
 問題：
 
-`ForwardMultipart` 會 parse multipart 並 rebuild body，會改 boundary、part ordering、部分 headers。這不符合最嚴格的 transparent passthrough。
+規格要求 PostgreSQL 儲存 config / metadata，例如：
 
-建議：
+- api_keys
+- backends
+- models
+- model_aliases
+- audit_logs
+- request_logs
 
-- 若只需讀 model，可以 streaming parse 同時 tee 原始 body，或先 buffer raw bytes 再用 multipart reader 解析 model，最後 forwarding raw bytes。
-- 保留原始 Content-Type boundary。
+目前 `storage.driver=postgres` 只切換 request_logs / audit_logs 的 logstore。核心 config metadata 仍然是：
 
-### P2-3 config bool 預設值容易因 YAML 省略變成 false
+```go
+s := store.New(...)
+s.LoadFromConfig(cfg)
+```
+
+Admin API 對 backend/model/alias/api_key 的修改只更新 in-memory store，Gateway 重啟後全部消失。
+
+如果此階段只打算做 logstore，請在 README/report 裡明確標註「metadata persistence 尚未完成」。如果要符合 enterprise MVP，則必須補 metadata store。
+
+修改要求：
+
+- 定義 metadata Store interface，至少支援：
+  - backends CRUD
+  - models CRUD
+  - model_aliases CRUD
+  - api_keys CRUD
+- Postgres driver 實作對應 schema/migration。
+- 啟動時從 Postgres 載入 metadata，config yaml 可作 bootstrap seed。
+- Admin API mutation 必須 persist 到 Postgres。
+- 多 replica 時 config mutation 要有同步策略，最少要靠 DB 查詢或 cache invalidation。
+
+驗收測試：
+
+- 新增 `TestPostgresMetadataPersistsAPIKeyAcrossRestart`。
+- 新增 `TestPostgresMetadataPersistsBackendAcrossRestart`。
+- 新增 Admin API create/patch/delete 後重建 store 仍能讀到資料的 integration test。
+
+### P1-6 health check `success_threshold` 對 unknown 狀態被繞過
 
 位置：
 
-- `internal/config/config.go:124-170`
-- `internal/store/store.go:335-420`
+- `internal/store/store.go:98-123`
+- `internal/store/store_test.go:96-117`
 
 問題：
 
-Backends/Models/Aliases/APIKeys 的 `enabled bool` 若 YAML 省略會是 false。這容易讓使用者新增項目後意外 disabled。
+`RecordHealthCheck()` 成功時先依 `success_threshold` 判斷，但接著對 `unknown` 直接設為 healthy：
 
-建議：
+```go
+if prev == "" || prev == StatusUnknown {
+    b.status = StatusHealthy
+}
+```
 
-- 對 config struct 使用 `*bool` 或 load normalize：省略時 default true。
-- sample YAML 可以保留 explicit true，但程式不應依賴使用者每次填。
+因此從 unknown 開始時，第一次成功就 healthy，`success_threshold` 沒有被遵守。測試註解說「3 successes」，但實際 expected 是 2 successes，且程式第一下就會變 healthy。
 
-### P2-4 Admin auth 與 secrets 管理仍偏 demo
+修改要求：
+
+- 明確定義 unknown -> healthy 是否要遵守 success_threshold。
+- 若規格要求 threshold，就移除 unknown 特例。
+- 若想保留 startup fast-ready，應新增 config，並在 report/README 說明。
+
+驗收測試：
+
+- 新增 `TestUnknownBackendRequiresSuccessThreshold` 或相反語意的測試，避免目前隱性繞過。
+
+## P2 建議修正：一致性、可維運性與測試完整度
+
+### P2-1 Admin POST model/alias 沒有驗證 mode
 
 位置：
 
-- `internal/admin/admin.go:152-194`
-- `web/static/app.js`
-- `config/gateway.yaml`
+- `internal/admin/admin.go:596-624`
+- `internal/admin/admin.go:657-681`
+- `internal/admin/admin_models.go:58-70`
+- `internal/admin/admin_models.go:107-117`
+- `internal/capability/capability.go:25-32`
 
 問題：
 
-- Dashboard 以 `prompt()` 收 token/username/password，並存 sessionStorage。
-- sample config 有 plaintext admin passwords / API keys / backend API keys。
-- API key create 要求使用者提供 key，沒有預設自動產生；rotate 才會產生。
+PATCH 已驗證：
 
-建議：
+- `capability_mode` must be `passthrough|declared|strict`
+- `forwarding_mode` must be `use_internal|keep_external`
 
-- Admin 改 JWT session 或 secure cookie。
-- Dashboard 避免儲存 password；token 也要有清楚過期語意。
-- API key create 若 body 沒 `key`，自動產生並只回傳一次。
-- Backend API key 若進 DB，必須 encrypted at rest。
+但 POST / upsert path 仍可寫入任意值。未知 `capability_mode` 進到 `capability.Check()` 會被當 passthrough，造成 UI/API 看起來設定成功但實際不生效。
 
-### P2-5 OpenTelemetry tracer 已建立但未接入 request path
+修改要求：
+
+- POST 與 PATCH 共用 validation helper。
+- invalid mode 回 400。
+- 既有 config load 也建議 validate mode。
+
+驗收測試：
+
+- `TestAdminModelPostRejectsInvalidCapabilityMode`
+- `TestAdminAliasPostRejectsInvalidForwardingMode`
+- `TestConfigRejectsInvalidCapabilityMode`
+
+### P2-2 `/v1/models` alias permission 顯示與實際 request 權限可能不一致
 
 位置：
 
-- `cmd/gateway/main.go:122-195`
-- `internal/tracing/tracing.go`
+- `internal/handlers/handlers.go:82-149`
+- `internal/store/store.go:560-585`
 
 問題：
 
-main 建立 tracer 後只有 `_ = tr`，註解寫 future pass。README 卻描述可 emit spans。這是文件與實作不一致。
+`/v1/models` 對 alias 顯示只檢查 alias 名稱：
 
-建議：
+```go
+if apiKey == nil || apiKey.ModelAllowed(name) {
+    ids[name] = true
+}
+```
 
-- 要嘛移除/降級 README 的 tracing 描述。
-- 要嘛在 middleware/handler/proxy 內建立 spans，加入 model/backend/status/latency/ttft/error attrs。
+但實際 request path 使用 `ModelAllowedResolved(requested, internal)`。如果 alias allowed 但 internal denied，`/v1/models` 可能顯示可用，實際呼叫卻 403。
 
-### P2-6 README 宣稱內容比實作更完整
+修改要求：
+
+- `/v1/models` 顯示 alias 時也使用 alias resolved 後的權限語意。
+- Denied internal model 必須讓 alias 從 `/v1/models` 中消失。
+
+驗收測試：
+
+- `TestListModelsDoesNotShowAliasDeniedByInternalModel`
+
+### P2-3 healthcheck subcommand 沒吃 `LLMGATEWAY_LISTEN`
 
 位置：
 
-- `README.md`
+- `cmd/gateway/main.go:54-75`
+- `cmd/gateway/main.go:298-315`
 
 問題：
 
-README 說測試涵蓋 transparency、no fallback、permissions、load balancing 等；部分確實有測試，但企業級項目如 Redis/Postgres、tracing、完整 dashboard/admin stats 尚未實作。容易誤導驗收。
+`--healthcheck` 在 env override 前就執行：
 
-建議：
+```go
+cfg, err := config.Load(...)
+if *healthcheck {
+    os.Exit(runHealthCheck(cfg))
+}
+```
 
-- README 分清楚「已實作」「部分實作」「roadmap」。
-- 在企業級完成前，避免宣稱 production HA / Redis-backed / OTEL wired。
+如果 runtime 用 `LLMGATEWAY_LISTEN` 改 port，healthcheck 仍會打 yaml 裡的 port。
 
-## Claude Code 修改順序建議
+修改要求：
 
-請 Claude Code 依以下順序處理，避免大改時把 passthrough 特性弄壞。
+- env override 必須在 `runHealthCheck(cfg)` 前套用。
+- 建議把 env override 抽成 `applyEnvOverrides(cfg)`，main 與 healthcheck 共用。
 
-1. 先修 P0 routing/auth：
-   - degraded backend 不可 route。
-   - alias/internal model 權限檢查。
-   - disabled model registry 實際阻擋 routing。
-   - client IP extractor、API key client IP allow/deny、request log/stats client IP。
-   - 補對應 regression tests。
+驗收測試：
 
-2. 修核心 MVP 行為：
-   - Bearer prefix 嚴格檢查。
-   - API key request stats 不依賴 usage。
-   - raw_request 記錄 client 原始 body。
-   - Gateway 主動錯誤都寫 request log。
-   - streaming idle timeout 不注入 chunk。
+- `TestHealthCheckUsesListenEnvOverride`
 
-3. 補 Admin API 與 Dashboard 最低驗收：
-   - 補 GET/PATCH model、PATCH alias、stats endpoints。
-   - Dashboard 補 patch/disable/rotate key、patch backend/model/alias、logs filters。
+### P2-4 SMTP config 說建議用 SMTP_PASSWORD，但程式沒有讀
 
-4. 補 metrics/stats：
-   - labels 加 routing_policy。
-   - logs/stats 全面納入 client_ip，Admin/Dashboard 可依 client IP 查詢與分組。
-   - timeout/quota/rate/backend error 分開 counter。
-   - Admin stats 提供 p95/p99/TTFT/queued/token throughput。
+位置：
 
-5. 補 notification：
-   - backend status transition 觸發 Email alert。
-   - cooldown/dedupe、SMTP secret、安全 log。
+- `config/gateway.yaml:108-117`
+- `internal/config/config.go:307-322`
+- `cmd/gateway/main.go:64-75`
 
-6. 處理部署與測試：
-   - Dockerfile Go 版本修正。
-   - Compose healthcheck 改 HTTP。
-   - 執行 `go test ./...`、`go test -race ./...`、Docker build。
+問題：
 
-7. 企業級 phase：
-   - PostgreSQL store。
-   - Redis limiter/concurrency/queue/quota。
-   - runtime admin mutation 持久化。
-   - 真正水平擴展驗收。
-   - OTEL tracing 接入。
+sample config 註解寫：
 
-## 必補測試清單
+```yaml
+# SMTP_PASSWORD should be supplied via env, not inline.
+```
 
-請至少新增以下測試：
+但程式沒有讀 `SMTP_PASSWORD` 或 `LLMGATEWAY_SMTP_PASSWORD`，也沒有 `os.ExpandEnv()`。使用者若照註解設定 env，實際 password 仍是空字串。
 
-- `TestDegradedBackendIsNotRoutable`
-- `TestAliasCannotBypassDeniedInternalModel`
-- `TestDisabledRegistryModelCannotBeForwarded`
-- `TestAPIKeyAllowedClientIPs`
-- `TestAPIKeyDeniedClientIPsTakePrecedence`
-- `TestClientIPExtractorDoesNotTrustSpoofedXForwardedFor`
-- `TestRequestLogsIncludeClientIP`
+修改要求：
+
+- 支援 `LLMGATEWAY_SMTP_PASSWORD` override。
+- 或支援 config value `${SMTP_PASSWORD}` 展開。
+- README / config 註解要與實作一致。
+
+驗收測試：
+
+- `TestSMTPPasswordCanBeLoadedFromEnv`
+
+### P2-5 Admin audit client IP 沒有使用同一套 trusted proxy policy
+
+位置：
+
+- `internal/admin/admin.go:267-306`
+- `internal/netutil/clientip.go`
+
+問題：
+
+request log / auth 使用 `netutil.Extractor`，但 audit log 使用 admin package 自己的 `clientIP()`，而且直接信任 XFF 第一個值：
+
+```go
+if v := r.Header.Get("X-Forwarded-For"); v != "" {
+    return strings.TrimSpace(v[:idx])
+}
+```
+
+這會讓 audit log 的 admin IP 與 request log policy 不一致，也可被 spoof。
+
+修改要求：
+
+- Admin server 也注入同一個 `netutil.Extractor`。
+- audit log IP 必須使用 trusted proxy policy。
+- 未信任 proxy 時忽略 XFF。
+
+驗收測試：
+
+- `TestAdminAuditIgnoresUntrustedXForwardedFor`
+- `TestAdminAuditUsesTrustedProxyClientIP`
+
+## 必補測試總表
+
+Claude Code 請至少新增或修正以下測試：
+
+- `TestHandlerTokensPerMinuteBlocksAfterUsage`
+- `TestHandlerDailyTokenLimitBlocksAfterUsage`
+- `TestGatewayErrorsDoNotPersistRawRequestWhenDisabled`
+- `TestGatewayErrorsPersistRawRequestWhenEnabled`
+- `TestClientIPExtractorUsesRightmostUntrustedXFF`
+- `TestClientIPExtractorIgnoresSpoofedLeftmostXFFBehindTrustedProxy`
+- `TestAuthRejectedRequestsArePersistentlyLoggedWithClientIP`
+- `TestClientIPNotAllowedIsLoggedWithClientIP`
 - `TestStatsAggregateByClientIP`
-- `TestAuthorizationRequiresBearerPrefix`
-- `TestAPIKeyStatsIncrementWithoutUsage`
-- `TestRawRequestLogKeepsClientOriginalBodyWhenAliasRewrites`
-- `TestGatewayErrorsArePersistentlyLogged`
-- `TestStreamIdleTimeoutDoesNotInjectSSEBytes`
-- `TestAdminModelsGetPatchRoutes`
-- `TestAdminAliasPatchRoute`
-- `TestMetricsIncludeRoutingPolicyLabel`
-- `TestBackendUnhealthySendsEmailNotification`
-- `TestBackendNotificationCooldown`
-- `TestBackendRecoverySendsEmailNotification`
-- `TestDockerBuildUsesCompatibleGoVersion` 或 CI shell check
+- `TestAdminCreatedBackendGetsPeriodicHealthChecks`
+- `TestHealthCheckerDoesNotSpawnDuplicateLoopsForSameBackend`
+- `TestDeletedBackendStopsHealthLoop`
+- `TestSMTPSenderStartTLSRequiredFailsWhenUnsupported`
+- `TestSMTPSenderDoesNotAuthOverPlaintextByDefault`
+- `TestNotifyFailureDoesNotStartSuccessCooldown`
+- `TestPostgresMetadataPersistsAPIKeyAcrossRestart`
+- `TestPostgresMetadataPersistsBackendAcrossRestart`
+- `TestUnknownBackendRequiresSuccessThreshold` 或明確相反語意測試
+- `TestAdminModelPostRejectsInvalidCapabilityMode`
+- `TestAdminAliasPostRejectsInvalidForwardingMode`
+- `TestConfigRejectsInvalidCapabilityMode`
+- `TestListModelsDoesNotShowAliasDeniedByInternalModel`
+- `TestHealthCheckUsesListenEnvOverride`
+- `TestSMTPPasswordCanBeLoadedFromEnv`
+- `TestAdminAuditIgnoresUntrustedXForwardedFor`
+- `TestAdminAuditUsesTrustedProxyClientIP`
 
 ## 驗收 Checklist
 
-Claude Code 修改後，請用下列 checklist 驗收：
+修正後請逐項驗收：
 
-- OpenAI SDK 可用 Gateway base_url 呼叫 `/v1/chat/completions`。
-- `/v1/models` 只顯示 key 有權限且 enabled 的 model/alias。
-- unknown request fields 完整轉發。
-- `reasoning_effort` / `thinking_budget` / `enable_thinking` / `extra_body` 不被拒絕、不被移除。
-- backend response 的 `reasoning_content` / `reasoning_tokens` / vendor fields 完整保留。
-- streaming SSE chunk byte-level passthrough，不改寫 reasoning delta/tool call delta。
-- client disconnect 會取消 backend request。
-- no healthy backend 回 `503 no_healthy_backend`，不做 model fallback。
-- 同 model 多 healthy backend 有 weighted load balancing。
-- unhealthy/degraded/disabled/maintenance backend 不收流量。
-- backend max_concurrent_requests 生效。
-- API key missing/invalid/disabled/expired 都拒絕。
-- API key allowed/denied models 對 alias/internal model 語意正確。
-- API key 可設定 allowed_client_ips / denied_client_ips，deny 優先，支援 IPv4/IPv6/CIDR。
-- 所有 request log、error log、admin stats、dashboard analytics 都記錄並可查詢 client IP。
-- request rate limit、concurrent limit、delay_ms 生效。
-- token quota/token rate limit 語意明確且可測。
-- logging policy 預設不記 input/output；開啟後才記。
-- raw request log 是 client 原始 body。
-- backend error status/body 原樣 passthrough。
-- Admin API 規格 endpoint 全存在且 RBAC/audit 生效。
-- Dashboard 可完成規格要求的查看與管理操作。
-- `/metrics` 與 Admin stats 能支援 dashboard 所需核心指標。
-- Backend degraded/unhealthy/recovered 可依設定發送 Mail 通知，且有 cooldown/dedupe。
-- Docker build、docker compose、Helm chart 都可啟動並通過 health/readiness。
-- 多 replica 場景下，若宣稱企業級，rate/concurrency/quota/queue 必須共享狀態。
+- `go test ./...` 通過。
+- `go test -race ./...` 通過。
+- `go vet ./...` 通過。
+- Docker build 通過。
+- token rate limit / daily token quota 會在 usage 累積後阻擋下一次請求。
+- `log_raw_request=false` 時，成功與錯誤路徑都不保存 raw request。
+- `log_raw_request=true` 時，成功與錯誤路徑保存 client 原始 body。
+- trusted proxy 後 XFF spoof 不能繞過 API key IP allow/deny。
+- API key `allowed_client_ips` / `denied_client_ips` deny 優先，支援 IPv4/IPv6/CIDR。
+- missing/invalid/disabled/expired API key 與 `client_ip_not_allowed` 都會記 persistent request log，且包含 client_ip。
+- Admin stats / dashboard analytics 能依 client_ip 聚合。
+- Runtime 新增 backend 後會持續 health check。
+- Runtime 刪除 backend 後不再 health check，沒有 goroutine leak。
+- backend unhealthy/degraded/recovered mail notification 能觸發，且 cooldown 不會壓掉失敗重試。
+- `start_tls=true` 不會降級 plaintext。
+- Postgres 若宣稱 enterprise metadata storage，重啟後 admin-created backend/model/api_key 仍存在。
+- `/v1/models` 顯示結果與實際 request 權限一致。
+- Admin audit log 的 IP 使用與 API request 相同的 trusted proxy policy。
