@@ -85,6 +85,15 @@ func (h *Handler) ForwardMultipart(upstreamPath string) http.HandlerFunc {
 			))
 			return
 		}
+
+		// Apply rate-limit / quota / concurrency / queue admission.
+		releaseAdmit, code, status := h.admit(r.Context(), apiKey, internalModel)
+		if code != "" {
+			proxy.WriteError(w, status, proxy.RateLimit("Rejected: "+code, code))
+			return
+		}
+		defer releaseAdmit()
+
 		ready := filterRoutable(candidates)
 		if len(ready) == 0 {
 			proxy.WriteError(w, http.StatusServiceUnavailable, proxy.BackendUnavailable(
@@ -104,6 +113,10 @@ func (h *Handler) ForwardMultipart(upstreamPath string) http.HandlerFunc {
 		}
 
 		bodyBuf, ct, err := rebuildMultipart(r)
+		// Always release multipart temp files, even on error.
+		if r.MultipartForm != nil {
+			defer r.MultipartForm.RemoveAll()
+		}
 		if err != nil {
 			picked.ReleaseSlot(false)
 			proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest(

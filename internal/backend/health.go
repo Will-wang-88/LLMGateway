@@ -113,18 +113,37 @@ func (h *HealthChecker) checkOne(b *store.Backend) {
 		return
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 200 && resp.StatusCode < 500 {
-		// 2xx, 3xx and 4xx all mean the server is responsive enough to route to.
-		// 4xx still indicates the backend is alive (e.g. 401 if api_key not provided).
-		// Only 5xx and network errors mark it unhealthy.
-		if resp.StatusCode >= 400 {
-			h.record(b, true, latency, fmt.Sprintf("health probe returned %d (treated as alive)", resp.StatusCode))
-			return
-		}
+	// 2xx and 3xx => healthy.
+	// 401/403 => degraded: the backend is up but rejecting our credentials.
+	//   We must not blindly route real traffic to it because it will return
+	//   the same auth error to clients.
+	// Other 4xx => degraded: ambiguous (might be backend bug or version skew).
+	// 5xx and network errors => unhealthy.
+	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
 		h.record(b, true, latency, "")
 		return
 	}
+	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+		h.recordDegraded(b, latency, fmt.Sprintf("auth-probe returned %d", resp.StatusCode))
+		return
+	}
 	h.record(b, false, latency, fmt.Sprintf("status %d", resp.StatusCode))
+}
+
+// recordDegraded marks a backend as degraded (responsive but not usable).
+// We treat degraded as routable-with-warning by default; the routing layer
+// decides whether to skip it.
+func (h *HealthChecker) recordDegraded(b *store.Backend, latencyMS int64, errMsg string) {
+	prev := b.Status()
+	b.MarkDegraded(latencyMS, errMsg)
+	if prev != store.StatusDegraded && h.statusChange != nil {
+		h.statusChange(b, store.StatusDegraded)
+	}
+	if prev != store.StatusDegraded {
+		h.logger.Warn("backend degraded", logging.F(
+			"backend_id", b.ID, "latency_ms", latencyMS, "reason", errMsg,
+		))
+	}
 }
 
 func (h *HealthChecker) record(b *store.Backend, ok bool, latencyMS int64, errMsg string) {

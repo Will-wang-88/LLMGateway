@@ -136,12 +136,15 @@ func (m *Memory) AppendRequest(_ context.Context, rec *RequestLog) error {
 	defer m.mu.Unlock()
 	m.requests = append(m.requests, rec)
 	if len(m.requests) > m.maxRecs {
-		// drop oldest 10%
 		evict := m.maxRecs / 10
 		if evict < 1 {
 			evict = 1
 		}
-		m.requests = m.requests[evict:]
+		// Copy into a fresh slice so the old backing array (and the evicted
+		// records) become garbage-collectable. Reslicing alone retains them.
+		retained := make([]*RequestLog, len(m.requests)-evict)
+		copy(retained, m.requests[evict:])
+		m.requests = retained
 	}
 	return nil
 }
@@ -230,7 +233,13 @@ func (m *Memory) AppendAudit(_ context.Context, evt *AuditEvent) error {
 	defer m.mu.Unlock()
 	m.audit = append(m.audit, evt)
 	if len(m.audit) > m.maxRecs {
-		m.audit = m.audit[m.maxRecs/10:]
+		evict := m.maxRecs / 10
+		if evict < 1 {
+			evict = 1
+		}
+		retained := make([]*AuditEvent, len(m.audit)-evict)
+		copy(retained, m.audit[evict:])
+		m.audit = retained
 	}
 	return nil
 }

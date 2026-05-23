@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 
+	"golang.org/x/crypto/bcrypt"
+
 	"github.com/will-wang-88/llmgateway/internal/config"
 )
 
@@ -88,12 +90,28 @@ func (u *Users) Delete(username string) {
 	delete(u.byName, username)
 }
 
-// HashPassword returns the SHA256 hex digest of a password. Not BCrypt - for an
-// MVP without external crypto dependencies. Operators are expected to rotate
-// credentials regularly and protect the YAML / DB at rest.
+// HashPassword returns a bcrypt hash of the password (cost 12). The result
+// is the canonical bcrypt `$2a$...` string; verification uses VerifyPassword.
 func HashPassword(password string) string {
+	h, err := bcrypt.GenerateFromPassword([]byte(password), 12)
+	if err != nil {
+		// bcrypt only fails on cost out-of-range; with a hardcoded valid
+		// cost this can't happen.
+		panic(err)
+	}
+	return string(h)
+}
+
+// VerifyPassword returns true if password matches the stored hash. Supports
+// bcrypt hashes (the new format) and the legacy raw SHA-256 hex format
+// from older configs, so existing deployments don't immediately lose login.
+func VerifyPassword(password, stored string) bool {
+	if strings.HasPrefix(stored, "$2a$") || strings.HasPrefix(stored, "$2b$") || strings.HasPrefix(stored, "$2y$") {
+		return bcrypt.CompareHashAndPassword([]byte(stored), []byte(password)) == nil
+	}
+	// legacy sha256(hex) - kept for backwards compatibility, deprecated.
 	h := sha256.Sum256([]byte(password))
-	return hex.EncodeToString(h[:])
+	return hex.EncodeToString(h[:]) == stored
 }
 
 // HasPermission returns whether the role can perform an action.

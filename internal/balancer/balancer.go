@@ -145,10 +145,13 @@ func chooseLeast(cs []*store.Backend) *store.Backend {
 }
 
 func chooseWeightedRR(cs []*store.Backend, counter *uint64) *store.Backend {
+	// 0-weight is drain - filtered out earlier by filterRoutable - but be
+	// defensive here in case Choose is called directly. Treat <0 as 1 only;
+	// 0 means skip.
 	totalWeight := 0
 	for _, c := range cs {
 		w := c.Weight
-		if w <= 0 {
+		if w < 0 {
 			w = 1
 		}
 		totalWeight += w
@@ -160,8 +163,11 @@ func chooseWeightedRR(cs []*store.Backend, counter *uint64) *store.Backend {
 	target := int(idx % uint64(totalWeight))
 	for _, c := range cs {
 		w := c.Weight
-		if w <= 0 {
+		if w < 0 {
 			w = 1
+		}
+		if w == 0 {
+			continue
 		}
 		if target < w {
 			return c

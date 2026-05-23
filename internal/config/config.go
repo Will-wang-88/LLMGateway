@@ -47,17 +47,17 @@ type AuthConfig struct {
 }
 
 type RoutingConfig struct {
-	DefaultPolicy      string `yaml:"default_policy"`
-	ModelAliasEnabled  bool   `yaml:"model_alias_enabled"`
-	UnknownFieldPolicy string `yaml:"unknown_field_policy"`
+	DefaultPolicy      string `yaml:"default_policy" json:"default_policy"`
+	ModelAliasEnabled  bool   `yaml:"model_alias_enabled" json:"model_alias_enabled"`
+	UnknownFieldPolicy string `yaml:"unknown_field_policy" json:"unknown_field_policy"`
 }
 
 type HealthCheckConfig struct {
-	IntervalMS       int `yaml:"interval_ms"`
-	TimeoutMS        int `yaml:"timeout_ms"`
-	FailureThreshold int `yaml:"failure_threshold"`
-	SuccessThreshold int `yaml:"success_threshold"`
-	Path             string `yaml:"path"`
+	IntervalMS       int    `yaml:"interval_ms" json:"interval_ms"`
+	TimeoutMS        int    `yaml:"timeout_ms" json:"timeout_ms"`
+	FailureThreshold int    `yaml:"failure_threshold" json:"failure_threshold"`
+	SuccessThreshold int    `yaml:"success_threshold" json:"success_threshold"`
+	Path             string `yaml:"path" json:"path"`
 }
 
 type RateLimitConfig struct {
@@ -67,18 +67,18 @@ type RateLimitConfig struct {
 }
 
 type LoggingConfig struct {
-	Level                    string `yaml:"level"`
-	DefaultLogMetadata       bool   `yaml:"default_log_metadata"`
-	DefaultLogInput          bool   `yaml:"default_log_input"`
-	DefaultLogOutput         bool   `yaml:"default_log_output"`
-	DefaultLogRawRequest     bool   `yaml:"default_log_raw_request"`
-	DefaultLogRawResponse    bool   `yaml:"default_log_raw_response"`
-	DefaultLogStreamChunks   bool   `yaml:"default_log_stream_chunks"`
+	Level                  string `yaml:"level" json:"level"`
+	DefaultLogMetadata     bool   `yaml:"default_log_metadata" json:"default_log_metadata"`
+	DefaultLogInput        bool   `yaml:"default_log_input" json:"default_log_input"`
+	DefaultLogOutput       bool   `yaml:"default_log_output" json:"default_log_output"`
+	DefaultLogRawRequest   bool   `yaml:"default_log_raw_request" json:"default_log_raw_request"`
+	DefaultLogRawResponse  bool   `yaml:"default_log_raw_response" json:"default_log_raw_response"`
+	DefaultLogStreamChunks bool   `yaml:"default_log_stream_chunks" json:"default_log_stream_chunks"`
 }
 
 type MetricsConfig struct {
-	PrometheusEnabled bool   `yaml:"prometheus_enabled"`
-	PrometheusPath    string `yaml:"prometheus_path"`
+	PrometheusEnabled bool   `yaml:"prometheus_enabled" json:"prometheus_enabled"`
+	PrometheusPath    string `yaml:"prometheus_path" json:"prometheus_path"`
 }
 
 type AdminConfig struct {
@@ -103,22 +103,22 @@ type StorageConfig struct {
 }
 
 type QueueConfig struct {
-	Enabled        bool `yaml:"enabled"`
-	MaxQueueSize   int  `yaml:"max_queue_size"`
-	QueueTimeoutMS int  `yaml:"queue_timeout_ms"`
-	PerModelLimit  int  `yaml:"per_model_limit"`
+	Enabled        bool `yaml:"enabled" json:"enabled"`
+	MaxQueueSize   int  `yaml:"max_queue_size" json:"max_queue_size"`
+	QueueTimeoutMS int  `yaml:"queue_timeout_ms" json:"queue_timeout_ms"`
+	PerModelLimit  int  `yaml:"per_model_limit" json:"per_model_limit"`
 }
 
 type TracingConfig struct {
-	Enabled  bool   `yaml:"enabled"`
-	Endpoint string `yaml:"endpoint"`     // OTLP HTTP endpoint, e.g. http://otel-collector:4318
-	Service  string `yaml:"service_name"`
-	SampleRatio float64 `yaml:"sample_ratio"`
+	Enabled     bool    `yaml:"enabled" json:"enabled"`
+	Endpoint    string  `yaml:"endpoint" json:"endpoint"`
+	Service     string  `yaml:"service_name" json:"service_name"`
+	SampleRatio float64 `yaml:"sample_ratio" json:"sample_ratio"`
 }
 
 type DashboardConfig struct {
-	Enabled bool   `yaml:"enabled"`
-	BaseURL string `yaml:"base_url"` // optional reverse-proxy prefix
+	Enabled bool   `yaml:"enabled" json:"enabled"`
+	BaseURL string `yaml:"base_url" json:"base_url"`
 }
 
 type BackendConfig struct {
@@ -170,26 +170,28 @@ type APIKeyConfig struct {
 }
 
 type APIKeyRateLimit struct {
-	Enabled            bool `yaml:"enabled"`
-	RequestsPerMinute  int  `yaml:"requests_per_minute"`
-	TokensPerMinute    int  `yaml:"tokens_per_minute"`
-	ConcurrentRequests int  `yaml:"concurrent_requests"`
+	Enabled            bool  `yaml:"enabled" json:"enabled"`
+	RequestsPerMinute  int   `yaml:"requests_per_minute" json:"requests_per_minute"`
+	TokensPerMinute    int   `yaml:"tokens_per_minute" json:"tokens_per_minute"`
+	RequestsPerDay     int64 `yaml:"requests_per_day" json:"requests_per_day,omitempty"`
+	TokensPerDay       int64 `yaml:"tokens_per_day" json:"tokens_per_day,omitempty"`
+	ConcurrentRequests int   `yaml:"concurrent_requests" json:"concurrent_requests"`
 }
 
 type APIKeyQuota struct {
-	DailyRequests   int64 `yaml:"daily_requests"`
-	DailyTokens     int64 `yaml:"daily_tokens"`
-	MonthlyRequests int64 `yaml:"monthly_requests"`
-	MonthlyTokens   int64 `yaml:"monthly_tokens"`
+	DailyRequests   int64 `yaml:"daily_requests" json:"daily_requests,omitempty"`
+	DailyTokens     int64 `yaml:"daily_tokens" json:"daily_tokens,omitempty"`
+	MonthlyRequests int64 `yaml:"monthly_requests" json:"monthly_requests,omitempty"`
+	MonthlyTokens   int64 `yaml:"monthly_tokens" json:"monthly_tokens,omitempty"`
 }
 
 type APIKeyLogging struct {
-	LogMetadata      bool `yaml:"log_metadata"`
-	LogInput         bool `yaml:"log_input"`
-	LogOutput        bool `yaml:"log_output"`
-	LogRawRequest    bool `yaml:"log_raw_request"`
-	LogRawResponse   bool `yaml:"log_raw_response"`
-	LogStreamChunks  bool `yaml:"log_stream_chunks"`
+	LogMetadata     bool `yaml:"log_metadata" json:"log_metadata"`
+	LogInput        bool `yaml:"log_input" json:"log_input"`
+	LogOutput       bool `yaml:"log_output" json:"log_output"`
+	LogRawRequest   bool `yaml:"log_raw_request" json:"log_raw_request"`
+	LogRawResponse  bool `yaml:"log_raw_response" json:"log_raw_response"`
+	LogStreamChunks bool `yaml:"log_stream_chunks" json:"log_stream_chunks"`
 }
 
 func Default() *Config {

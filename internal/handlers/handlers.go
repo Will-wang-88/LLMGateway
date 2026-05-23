@@ -107,12 +107,22 @@ func (h *Handler) ListModels(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	// Build the explicit model registry first so we can honor model.enabled
+	// for entries that exist there. Models advertised only by a backend
+	// (without a registry entry) are included by default.
+	registry := make(map[string]*store.Model)
+	for _, m := range h.store.Models() {
+		registry[m.Name] = m
+	}
 	for _, b := range h.store.Backends() {
 		if !b.Enabled {
 			continue
 		}
-		for _, m := range b.Models {
-			add(m)
+		for _, mname := range b.Models {
+			if r, ok := registry[mname]; ok && !r.Enabled {
+				continue
+			}
+			add(mname)
 		}
 	}
 	for _, m := range h.store.Models() {
@@ -121,9 +131,13 @@ func (h *Handler) ListModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	for _, a := range h.store.ModelAliases() {
-		if a.Enabled {
-			add(a.Alias)
+		if !a.Enabled {
+			continue
 		}
+		if r, ok := registry[a.InternalModel]; ok && !r.Enabled {
+			continue
+		}
+		add(a.Alias)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 
@@ -214,72 +228,14 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 			return
 		}
 
-		// Rate limit + concurrency + quota for the API key.
-		if apiKey != nil {
-			rlCode := h.applyAPIKeyLimits(apiKey)
-			if rlCode != "" {
-				h.metrics.RateLimitHits.WithLabelValues(apiKey.ID, rlCode).Inc()
-				h.recordLog(r.Context(), requestID, apiKey, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusTooManyRequests, rlCode, nil, time.Since(started).Milliseconds(), 0, raw, nil)
-				proxy.WriteError(w, http.StatusTooManyRequests, proxy.RateLimit(
-					"Rate limit exceeded: "+rlCode,
-					rlCode,
-				))
-				return
-			}
-			if h.quota != nil && apiKey.Quota != nil {
-				if code := h.quota.Check(apiKey.ID,
-					apiKey.Quota.DailyRequests, apiKey.Quota.DailyTokens,
-					apiKey.Quota.MonthlyRequests, apiKey.Quota.MonthlyTokens); code != "" {
-					h.metrics.RateLimitHits.WithLabelValues(apiKey.ID, code).Inc()
-					h.recordLog(r.Context(), requestID, apiKey, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusTooManyRequests, code, nil, time.Since(started).Milliseconds(), 0, raw, nil)
-					proxy.WriteError(w, http.StatusTooManyRequests, proxy.RateLimit(
-						"Quota exceeded: "+code, code,
-					))
-					return
-				}
-			}
-			concurrencyLimit := 0
-			if apiKey.RateLimit != nil {
-				concurrencyLimit = apiKey.RateLimit.ConcurrentRequests
-			}
-			if !h.concurrency.Acquire("key:"+apiKey.ID, concurrencyLimit) {
-				h.metrics.RateLimitHits.WithLabelValues(apiKey.ID, "concurrent_limit").Inc()
-				h.recordLog(r.Context(), requestID, apiKey, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusTooManyRequests, "concurrent_limit", nil, time.Since(started).Milliseconds(), 0, raw, nil)
-				proxy.WriteError(w, http.StatusTooManyRequests, proxy.RateLimit(
-					"Concurrent request limit exceeded",
-					"concurrent_limit",
-				))
-				return
-			}
-			defer h.concurrency.Release("key:" + apiKey.ID)
+		// Apply rate-limit / quota / concurrency / queue admission.
+		release, code, status := h.admit(r.Context(), apiKey, internalModel)
+		if code != "" {
+			h.recordLog(r.Context(), requestID, apiKey, peek.Model, internalModel, "", upstreamPath, isStream, status, code, nil, time.Since(started).Milliseconds(), 0, raw, nil)
+			proxy.WriteError(w, status, proxy.RateLimit("Rejected: "+code, code))
+			return
 		}
-
-		// Request queue (backpressure). Optional; only used if enabled.
-		if h.queue != nil && h.cfg.Queue.Enabled {
-			release, err := h.queue.Acquire(r.Context(), "model:"+internalModel)
-			if err != nil {
-				code := "queue_timeout"
-				status := http.StatusTooManyRequests
-				if errors.Is(err, queue.ErrFull) {
-					code = "queue_full"
-				}
-				h.metrics.RateLimitHits.WithLabelValues(apiKeyID(apiKey), code).Inc()
-				h.recordLog(r.Context(), requestID, apiKey, peek.Model, internalModel, "", upstreamPath, isStream, status, code, nil, time.Since(started).Milliseconds(), 0, raw, nil)
-				proxy.WriteError(w, status, proxy.RateLimit("Queue: "+code, code))
-				return
-			}
-			defer release()
-			h.metrics.QueueDepth.WithLabelValues("model:" + internalModel).Set(float64(h.queue.Depth("model:" + internalModel)))
-		}
-
-		// API-key delay (QoS).
-		if apiKey != nil && apiKey.DelayMS > 0 {
-			select {
-			case <-time.After(time.Duration(apiKey.DelayMS) * time.Millisecond):
-			case <-r.Context().Done():
-				return
-			}
-		}
+		defer release()
 
 		// Filter for healthy + within-capacity, then pick one.
 		ready := filterRoutable(candidates)
@@ -329,9 +285,6 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 		}
 		h.metrics.ActiveRequests.WithLabelValues(internalModel, picked.ID).Inc()
 		defer h.metrics.ActiveRequests.WithLabelValues(internalModel, picked.ID).Dec()
-		if h.quota != nil {
-			h.quota.AddRequest(apiKeyLabel)
-		}
 
 		var ttftMS int64
 		var capturedUsage proxy.Usage
@@ -515,6 +468,9 @@ func (h *Handler) recordUsage(u *proxy.Usage, model, backendID, apiKeyLabel stri
 	if u.TotalTokens > 0 {
 		h.metrics.TotalTokens.WithLabelValues(model, backendID, apiKeyLabel).Add(float64(u.TotalTokens))
 	}
+	if u.ReasoningTokens > 0 {
+		h.metrics.ReasoningTokens.WithLabelValues(model, backendID, apiKeyLabel).Add(float64(u.ReasoningTokens))
+	}
 	if apiKey != nil {
 		apiKey.Touch(u.TotalTokens)
 		if apiKey.RateLimit != nil && apiKey.RateLimit.TokensPerMinute > 0 {
@@ -526,24 +482,105 @@ func (h *Handler) recordUsage(u *proxy.Usage, model, backendID, apiKeyLabel stri
 	}
 }
 
-// applyAPIKeyLimits enforces request-per-minute / token-per-minute limits.
-// Returns empty string if allowed, otherwise the rate-limit code.
-func (h *Handler) applyAPIKeyLimits(k *store.APIKey) string {
-	limit := h.cfg.RateLimit.DefaultRequestsPerMinute
-	tokenLimit := 0
-	if k.RateLimit != nil && k.RateLimit.Enabled {
-		if k.RateLimit.RequestsPerMinute > 0 {
-			limit = k.RateLimit.RequestsPerMinute
+// admit enforces all per-API-key admission policies atomically. Returns a
+// release func that the caller must defer; an error code if the request is
+// rejected; and the HTTP status to return.
+func (h *Handler) admit(ctx context.Context, k *store.APIKey, internalModel string) (release func(), code string, status int) {
+	releases := make([]func(), 0, 3)
+	doRelease := func() {
+		for i := len(releases) - 1; i >= 0; i-- {
+			releases[i]()
 		}
-		tokenLimit = k.RateLimit.TokensPerMinute
 	}
-	if !h.limiter.AllowRequest("req:"+k.ID, limit) {
-		return "rate_limit_exceeded"
+	noop := func() {}
+
+	if k != nil {
+		// 1. Combined per-minute + per-day check (single atomic call).
+		rpm := h.cfg.RateLimit.DefaultRequestsPerMinute
+		var tpm int64
+		var dayReq, dayTok int64
+		if k.RateLimit != nil && k.RateLimit.Enabled {
+			if k.RateLimit.RequestsPerMinute > 0 {
+				rpm = k.RateLimit.RequestsPerMinute
+			}
+			tpm = int64(k.RateLimit.TokensPerMinute)
+			if k.RateLimit.RequestsPerDay > 0 {
+				dayReq = k.RateLimit.RequestsPerDay
+			}
+			if k.RateLimit.TokensPerDay > 0 {
+				dayTok = k.RateLimit.TokensPerDay
+			}
+		}
+		if k.Quota != nil {
+			// Quota fields take precedence if both are set (quota is the
+			// "hard cap"; rate_limit.requests_per_day is the "soft rate").
+			if k.Quota.DailyRequests > 0 {
+				dayReq = k.Quota.DailyRequests
+			}
+			if k.Quota.DailyTokens > 0 {
+				dayTok = k.Quota.DailyTokens
+			}
+		}
+		if reject := h.limiter.CheckAndReserve("key:"+k.ID, rpm, tpm, dayReq, dayTok); reject != "" {
+			h.metrics.RateLimitHits.WithLabelValues(k.ID, reject).Inc()
+			doRelease()
+			return noop, reject, http.StatusTooManyRequests
+		}
+
+		// 2. Monthly quota (separate manager since rolling daily counters
+		// can't be reused for monthly accumulation).
+		if h.quota != nil && k.Quota != nil {
+			if reject := h.quota.Check(k.ID, 0, 0, k.Quota.MonthlyRequests, k.Quota.MonthlyTokens); reject != "" {
+				h.metrics.RateLimitHits.WithLabelValues(k.ID, reject).Inc()
+				doRelease()
+				return noop, reject, http.StatusTooManyRequests
+			}
+		}
+
+		// 3. Concurrency.
+		concLimit := 0
+		if k.RateLimit != nil {
+			concLimit = k.RateLimit.ConcurrentRequests
+		}
+		if !h.concurrency.Acquire("key:"+k.ID, concLimit) {
+			h.metrics.RateLimitHits.WithLabelValues(k.ID, "concurrent_limit").Inc()
+			doRelease()
+			return noop, "concurrent_limit", http.StatusTooManyRequests
+		}
+		releases = append(releases, func() { h.concurrency.Release("key:"+k.ID, concLimit) })
+
+		// 4. Optional delay (QoS).
+		if k.DelayMS > 0 {
+			select {
+			case <-time.After(time.Duration(k.DelayMS) * time.Millisecond):
+			case <-ctx.Done():
+				doRelease()
+				return noop, "client_canceled", 499
+			}
+		}
 	}
-	if tokenLimit > 0 && !h.limiter.AllowTokens("tok:"+k.ID, int64(tokenLimit)) {
-		return "token_rate_limit_exceeded"
+
+	// 5. Per-model request queue (backpressure).
+	if h.queue != nil && h.cfg.Queue.Enabled {
+		rel, err := h.queue.Acquire(ctx, "model:"+internalModel)
+		if err != nil {
+			c := "queue_timeout"
+			if errors.Is(err, queue.ErrFull) {
+				c = "queue_full"
+			}
+			h.metrics.RateLimitHits.WithLabelValues(apiKeyID(k), c).Inc()
+			doRelease()
+			return noop, c, http.StatusTooManyRequests
+		}
+		releases = append(releases, rel)
+		h.metrics.QueueDepth.WithLabelValues("model:" + internalModel).Set(float64(h.queue.Depth("model:" + internalModel)))
 	}
-	return ""
+
+	// 6. Account the request for monthly quota now that admission succeeded.
+	if h.quota != nil && k != nil {
+		h.quota.AddRequest(k.ID)
+	}
+	return doRelease, "", 0
 }
 
 func (h *Handler) shouldLog(k *store.APIKey, field string) bool {
@@ -582,14 +619,27 @@ func (h *Handler) shouldLog(k *store.APIKey, field string) bool {
 	return def
 }
 
+// filterRoutable returns backends that are admissible for routing.
+//
+// Routable states: healthy, unknown (just-started), degraded (responsive but
+// reporting some failure - still worth trying, with a warning logged).
+// Excluded states: disabled, unhealthy, maintenance.
+// Excluded: backends at max concurrency.
+// Excluded: backends with weight 0 (drain mode).
 func filterRoutable(in []*store.Backend) []*store.Backend {
 	out := make([]*store.Backend, 0, len(in))
 	for _, b := range in {
 		if !b.Enabled {
 			continue
 		}
-		status := b.Status()
-		if status != store.StatusHealthy && status != store.StatusUnknown {
+		switch b.Status() {
+		case store.StatusHealthy, store.StatusUnknown, store.StatusDegraded:
+			// admissible
+		default:
+			continue
+		}
+		if b.Weight == 0 {
+			// 0 weight is interpreted as "drain": registered but no new traffic.
 			continue
 		}
 		if b.MaxConcurrentRequests > 0 && b.ActiveRequests() >= int64(b.MaxConcurrentRequests) {

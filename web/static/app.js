@@ -144,6 +144,7 @@
     analytics: loadAnalytics,
     audit: loadAudit,
     users: loadUsers,
+    settings: loadSettings,
   };
 
   async function loadMe() {
@@ -418,39 +419,25 @@
 
   async function loadAnalytics() {
     const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
-    const m = await api('/logs?since=' + encodeURIComponent(since) + '&limit=1000');
-    const stats = {};
-    for (const r of (m.data || [])) {
-      const isErr = !(r.status_code >= 200 && r.status_code < 400);
-      tally(stats, 'model', r.model, isErr, r.total_tokens);
-      tally(stats, 'backend', r.backend_id, isErr, r.total_tokens);
-      tally(stats, 'key', r.api_key_id, isErr, r.total_tokens);
-    }
-    const totalReq = (m.data || []).length;
-    const totalErr = (m.data || []).filter(r => !(r.status_code >= 200 && r.status_code < 400)).length;
-    const totalTokens = (m.data || []).reduce((s, r) => s + (r.total_tokens || 0), 0);
+    const stats = await api('/stats/range?since=' + encodeURIComponent(since));
     document.getElementById('analytics-cards').innerHTML = [
-      { l: 'Requests (24h)', v: fmt(totalReq) },
-      { l: 'Errors', v: fmt(totalErr), k: totalErr > 0 ? 'warn' : 'ok' },
-      { l: 'Tokens', v: fmt(totalTokens) },
+      { l: 'Requests (24h)', v: fmt(stats.total_requests || 0) },
+      { l: 'Success', v: fmt(stats.success_total || 0), k: 'ok' },
+      { l: 'Errors', v: fmt(stats.error_total || 0), k: (stats.error_total || 0) > 0 ? 'warn' : 'ok' },
+      { l: 'Prompt tokens', v: fmt(stats.prompt_tokens || 0) },
+      { l: 'Completion tokens', v: fmt(stats.completion_tokens || 0) },
+      { l: 'Total tokens', v: fmt(stats.total_tokens || 0) },
     ].map(c => `<div class="card ${c.k || ''}"><div class="l">${escapeHTML(c.l)}</div><div class="v">${escapeHTML(String(c.v))}</div></div>`).join('');
-    renderTop('#analytics-models tbody', stats.model);
-    renderTop('#analytics-backends tbody', stats.backend);
-    renderTop('#analytics-keys tbody', stats.key);
-  }
-  function tally(stats, scope, key, isErr, tokens) {
-    if (!key) return;
-    stats[scope] = stats[scope] || {};
-    const c = stats[scope][key] || { req: 0, err: 0, tok: 0 };
-    c.req++;
-    if (isErr) c.err++;
-    c.tok += tokens || 0;
-    stats[scope][key] = c;
+    renderTop('#analytics-models tbody', stats.by_model || {});
+    renderTop('#analytics-backends tbody', stats.by_backend || {});
+    renderTop('#analytics-keys tbody', stats.by_api_key || {});
   }
   function renderTop(sel, data) {
-    if (!data) { document.querySelector(sel).innerHTML = ''; return; }
-    const rows = Object.entries(data).sort((a, b) => b[1].req - a[1].req).slice(0, 20)
-      .map(([k, v]) => `<tr><td class="mono">${escapeHTML(k)}</td><td>${v.req}</td><td>${v.err}</td><td>${fmt(v.tok)}</td></tr>`).join('');
+    const rows = Object.entries(data || {})
+      .sort((a, b) => (b[1].requests || 0) - (a[1].requests || 0))
+      .slice(0, 20)
+      .map(([k, v]) => `<tr><td class="mono">${escapeHTML(k || '(anonymous)')}</td><td>${v.requests || 0}</td><td>${v.errors || 0}</td><td>${fmt(v.tokens || 0)}</td></tr>`)
+      .join('');
     document.querySelector(sel).innerHTML = rows;
   }
 
@@ -504,6 +491,40 @@
       return true;
     });
   };
+
+  async function loadSettings() {
+    const cfg = await api('/settings');
+    const counts = cfg.counts || {};
+    document.getElementById('settings-info').innerHTML = [
+      { l: 'Backends', v: counts.backends || 0 },
+      { l: 'Models', v: counts.models || 0 },
+      { l: 'Aliases', v: counts.model_aliases || 0 },
+      { l: 'API keys', v: counts.api_keys || 0 },
+      { l: 'Admin users', v: counts.admin_users || 0 },
+    ].map(c => `<div class="card"><div class="l">${escapeHTML(c.l)}</div><div class="v">${escapeHTML(String(c.v))}</div></div>`).join('');
+
+    const flatten = (obj, prefix = '') => {
+      const rows = [];
+      for (const k of Object.keys(obj || {})) {
+        const v = obj[k];
+        const key = prefix ? prefix + '.' + k : k;
+        if (v && typeof v === 'object' && !Array.isArray(v)) {
+          rows.push(...flatten(v, key));
+        } else {
+          rows.push([key, Array.isArray(v) ? v.join(', ') : String(v == null ? '' : v)]);
+        }
+      }
+      return rows;
+    };
+    const renderRows = (selector, obj) => {
+      const rows = flatten(obj).map(([k, v]) => `<tr><td class="mono small">${escapeHTML(k)}</td><td>${escapeHTML(v)}</td></tr>`).join('');
+      document.querySelector(selector).innerHTML = rows;
+    };
+    renderRows('#settings-routing tbody', { routing: cfg.routing, health_check: cfg.health_check, auth: cfg.auth });
+    renderRows('#settings-limits tbody', { rate_limit: cfg.rate_limit });
+    renderRows('#settings-storage tbody', { storage: cfg.storage, logging: cfg.logging, metrics: cfg.metrics });
+    renderRows('#settings-misc tbody', { queue: cfg.queue, tracing: cfg.tracing, dashboard: cfg.dashboard });
+  }
 
   // ---- boot ----------------------------------------------------------------
   (async function () {

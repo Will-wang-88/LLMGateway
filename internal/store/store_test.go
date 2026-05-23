@@ -14,11 +14,54 @@ func TestMatchPattern(t *testing.T) {
 		{"llama-*", "qwen-72b", false},
 		{"qwen-*", "qwen-72b", true},
 		{"qwen-*", "Qwen-72b", false},
+		// general wildcards
+		{"*-prod", "model-prod", true},
+		{"*-prod", "model-test", false},
+		{"gpt-*-mini", "gpt-4-mini", true},
+		{"gpt-*-mini", "gpt-4-large", false},
+		{"gpt-*-mini", "claude-mini", false},
+		{"*-*", "a-b", true},
+		{"a*b*c", "a___b___c", true},
+		{"a*b*c", "a___c", false},
+		// empty pattern is never a match
+		{"", "anything", false},
 	}
 	for _, c := range cases {
 		if got := matchPattern(c.pattern, c.value); got != c.want {
 			t.Errorf("matchPattern(%q,%q)=%v want %v", c.pattern, c.value, got, c.want)
 		}
+	}
+}
+
+func TestResolveAliasChains(t *testing.T) {
+	s := New("")
+	s.UpsertModelAlias(&ModelAlias{Alias: "a", InternalModel: "b", ForwardingMode: "use_internal", Enabled: true})
+	s.UpsertModelAlias(&ModelAlias{Alias: "b", InternalModel: "c", ForwardingMode: "use_internal", Enabled: true})
+	s.UpsertModelAlias(&ModelAlias{Alias: "c", InternalModel: "real-model", ForwardingMode: "use_internal", Enabled: true})
+
+	got, forward := s.ResolveAlias("a")
+	if got != "real-model" || forward != "real-model" {
+		t.Errorf("expected chain to resolve a->b->c->real-model, got (%q, %q)", got, forward)
+	}
+
+	// Cycle: should not infinite-loop.
+	s.UpsertModelAlias(&ModelAlias{Alias: "x", InternalModel: "y", ForwardingMode: "use_internal", Enabled: true})
+	s.UpsertModelAlias(&ModelAlias{Alias: "y", InternalModel: "x", ForwardingMode: "use_internal", Enabled: true})
+	got, _ = s.ResolveAlias("x")
+	if got == "" {
+		t.Error("cycle should not return empty")
+	}
+}
+
+func TestResolveAliasKeepExternal(t *testing.T) {
+	s := New("")
+	s.UpsertModelAlias(&ModelAlias{Alias: "company-model", InternalModel: "llama-3.1-70b", ForwardingMode: "keep_external", Enabled: true})
+	internal, forward := s.ResolveAlias("company-model")
+	if internal != "llama-3.1-70b" {
+		t.Errorf("internal=%q want llama-3.1-70b", internal)
+	}
+	if forward != "company-model" {
+		t.Errorf("forward=%q want company-model", forward)
 	}
 }
 

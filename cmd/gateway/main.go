@@ -4,9 +4,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -75,6 +77,9 @@ func main() {
 	if err := s.LoadFromConfig(cfg); err != nil {
 		logger.Error("failed to load config into store", logging.F("error", err.Error()))
 		os.Exit(1)
+	}
+	if !s.HasExplicitHashSecret() {
+		logger.Warn("auth.hash_secret is not set - API keys are being hashed with a default HMAC secret; set LLMGATEWAY_HASH_SECRET in production", nil)
 	}
 
 	m := metrics.New()
@@ -229,13 +234,12 @@ func envOr(key, fallback string) string {
 }
 
 func splitHostPort(s string) (string, int, bool) {
-	i := strings.LastIndex(s, ":")
-	if i <= 0 || i == len(s)-1 {
+	host, portStr, err := net.SplitHostPort(s)
+	if err != nil || portStr == "" {
 		return "", 0, false
 	}
-	host := s[:i]
-	var port int
-	if _, err := fmt.Sscanf(s[i+1:], "%d", &port); err != nil {
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 || port > 65535 {
 		return "", 0, false
 	}
 	return host, port, true

@@ -68,9 +68,16 @@ func (s *Server) Register(mux *http.ServeMux) {
 
 	mux.Handle("GET /admin/api-keys", auth(http.HandlerFunc(s.listAPIKeys)))
 	mux.Handle("POST /admin/api-keys", auth(http.HandlerFunc(s.createAPIKey)))
+	mux.Handle("GET /admin/api-keys/{id}", auth(http.HandlerFunc(s.getAPIKey)))
+	mux.Handle("PATCH /admin/api-keys/{id}", auth(http.HandlerFunc(s.patchAPIKey)))
 	mux.Handle("DELETE /admin/api-keys/{id}", auth(http.HandlerFunc(s.deleteAPIKey)))
+	mux.Handle("POST /admin/api-keys/{id}/enable", auth(http.HandlerFunc(s.enableAPIKey)))
+	mux.Handle("POST /admin/api-keys/{id}/disable", auth(http.HandlerFunc(s.disableAPIKey)))
+	mux.Handle("POST /admin/api-keys/{id}/rotate", auth(http.HandlerFunc(s.rotateAPIKey)))
+	mux.Handle("POST /admin/backends/{id}/maintenance", auth(http.HandlerFunc(s.toggleMaintenance)))
 
 	mux.Handle("GET /admin/stats/overview", auth(http.HandlerFunc(s.statsOverview)))
+	mux.Handle("GET /admin/stats/range", auth(http.HandlerFunc(s.statsRange)))
 
 	mux.Handle("GET /admin/logs", auth(http.HandlerFunc(s.listLogs)))
 	mux.Handle("GET /admin/audit", auth(http.HandlerFunc(s.listAudit)))
@@ -82,6 +89,54 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.Handle("GET /admin/api-keys/{id}/usage", auth(http.HandlerFunc(s.keyUsage)))
 
 	mux.Handle("GET /admin/me", auth(http.HandlerFunc(s.me)))
+	mux.Handle("GET /admin/settings", auth(http.HandlerFunc(s.settings)))
+}
+
+// settings returns a redacted snapshot of the runtime config so the dashboard
+// Settings page can show operators what's live. Secrets are stripped.
+func (s *Server) settings(w http.ResponseWriter, _ *http.Request) {
+	cfg := s.cfg
+	writeJSON(w, http.StatusOK, map[string]any{
+		"server": map[string]any{
+			"host":                   cfg.Server.Host,
+			"port":                   cfg.Server.Port,
+			"request_body_limit_mb":  cfg.Server.RequestBodyLimitMB,
+			"default_timeout_ms":     cfg.Server.DefaultTimeoutMS,
+			"stream_idle_timeout_ms": cfg.Server.StreamIdleTimeoutMS,
+		},
+		"routing": cfg.Routing,
+		"rate_limit": map[string]any{
+			"backend":                     cfg.RateLimit.Backend,
+			"default_requests_per_minute": cfg.RateLimit.DefaultRequestsPerMinute,
+			"default_concurrent_requests": cfg.RateLimit.DefaultConcurrentReq,
+		},
+		"storage": map[string]any{
+			"driver":             cfg.Storage.Driver,
+			"log_retention_days": cfg.Storage.LogRetentionDays,
+		},
+		"queue":   cfg.Queue,
+		"tracing": map[string]any{
+			"enabled":      cfg.Tracing.Enabled,
+			"service_name": cfg.Tracing.Service,
+			"sample_ratio": cfg.Tracing.SampleRatio,
+		},
+		"logging": cfg.Logging,
+		"metrics": cfg.Metrics,
+		"dashboard": cfg.Dashboard,
+		"health_check": cfg.HealthCheck,
+		"auth": map[string]any{
+			"api_key_header": cfg.Auth.APIKeyHeader,
+			"api_key_prefix": cfg.Auth.APIKeyPrefix,
+			"hash_algorithm": cfg.Auth.HashAlgorithm,
+		},
+		"counts": map[string]any{
+			"backends":      len(s.store.Backends()),
+			"models":        len(s.store.Models()),
+			"model_aliases": len(s.store.ModelAliases()),
+			"api_keys":      len(s.store.APIKeys()),
+			"admin_users":   len(s.users.List()),
+		},
+	})
 }
 
 type ctxKey struct{ name string }
@@ -117,8 +172,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			u, p, ok := r.BasicAuth()
 			if ok {
 				user, found := s.users.Get(u)
-				if found && user.PasswordHash != "" &&
-					subtle.ConstantTimeCompare([]byte(HashPassword(p)), []byte(user.PasswordHash)) == 1 {
+				if found && user.PasswordHash != "" && VerifyPassword(p, user.PasswordHash) {
 					next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), adminUserKey, user)))
 					return
 				}
@@ -337,6 +391,11 @@ func (s *Server) patchBackend(w http.ResponseWriter, r *http.Request) {
 		proxy.WriteError(w, http.StatusNotFound, proxy.NotFound("Backend not found", "backend_not_found"))
 		return
 	}
+	oldVal := map[string]any{
+		"id": b.ID, "base_url": b.BaseURL, "enabled": b.Enabled,
+		"weight": b.Weight, "max_concurrent_requests": b.MaxConcurrentRequests,
+		"models": append([]string(nil), b.Models...),
+	}
 	var body backendBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest("Invalid JSON: "+err.Error(), "invalid_json"))
@@ -376,7 +435,12 @@ func (s *Server) patchBackend(w http.ResponseWriter, r *http.Request) {
 		b.Tags = body.Tags
 	}
 	s.store.UpsertBackend(b)
-	s.audit(r, "backend.update", "backend", b.ID, nil, nil)
+	newVal := map[string]any{
+		"id": b.ID, "base_url": b.BaseURL, "enabled": b.Enabled,
+		"weight": b.Weight, "max_concurrent_requests": b.MaxConcurrentRequests,
+		"models": b.Models,
+	}
+	s.audit(r, "backend.update", "backend", b.ID, oldVal, newVal)
 	writeJSON(w, http.StatusOK, map[string]any{"id": b.ID, "status": "updated"})
 }
 

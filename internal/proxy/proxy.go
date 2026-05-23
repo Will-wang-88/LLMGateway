@@ -45,7 +45,10 @@ func New(logger *logging.Logger, m *metrics.Metrics) *Proxy {
 		ExpectContinueTimeout: 1 * time.Second,
 		// DisableCompression is important - gzip would buffer the stream.
 		DisableCompression:    true,
-		ResponseHeaderTimeout: 0,
+		// Detect upstream that accepts the TCP connection but never returns
+		// response headers. Without this a hung backend wedges the request
+		// until the client disconnects.
+		ResponseHeaderTimeout: 60 * time.Second,
 	}
 	return &Proxy{
 		client: &http.Client{

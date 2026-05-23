@@ -67,6 +67,34 @@ func (b *Backend) SetStatus(s BackendStatus) {
 	b.mu.Unlock()
 }
 
+// MarkDegraded records that a probe returned a non-fatal failure (e.g.
+// 4xx) so we know the backend is reachable but should be treated with
+// caution. Counters are reset (degraded is a soft state).
+func (b *Backend) MarkDegraded(latencyMS int64, reason string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.status = StatusDegraded
+	b.lastHealthCheckAt = time.Now()
+	b.lastLatencyMS = latencyMS
+	b.lastError = reason
+	b.failureStreak = 0
+	b.successStreak = 0
+}
+
+// MarkMaintenance puts a backend into the maintenance state.
+// Maintenance is set via the admin API and persists until cleared.
+func (b *Backend) MarkMaintenance(on bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if on {
+		b.status = StatusMaintenance
+	} else {
+		b.status = StatusUnknown
+		b.failureStreak = 0
+		b.successStreak = 0
+	}
+}
+
 func (b *Backend) RecordHealthCheck(success bool, latencyMS int64, errMsg string) (changed bool, newStatus BackendStatus) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -221,14 +249,43 @@ func (k *APIKey) ModelAllowed(model string) bool {
 }
 
 func matchPattern(pattern, value string) bool {
+	if pattern == "" {
+		return false
+	}
 	if pattern == "*" || pattern == value {
 		return true
 	}
-	if strings.HasSuffix(pattern, "*") {
-		prefix := strings.TrimSuffix(pattern, "*")
-		return strings.HasPrefix(value, prefix)
+	if !strings.ContainsRune(pattern, '*') {
+		return false
 	}
-	return false
+	parts := strings.Split(pattern, "*")
+	pos := 0
+	// Anchor at start unless pattern begins with '*'.
+	if parts[0] != "" {
+		if !strings.HasPrefix(value, parts[0]) {
+			return false
+		}
+		pos = len(parts[0])
+	}
+	for i := 1; i < len(parts)-1; i++ {
+		seg := parts[i]
+		if seg == "" {
+			continue
+		}
+		idx := strings.Index(value[pos:], seg)
+		if idx == -1 {
+			return false
+		}
+		pos += idx + len(seg)
+	}
+	// Anchor at end unless pattern ends with '*'.
+	last := parts[len(parts)-1]
+	if last != "" {
+		if !strings.HasSuffix(value[pos:], last) {
+			return false
+		}
+	}
+	return true
 }
 
 type Store struct {
@@ -252,15 +309,25 @@ func New(hashSecret string) *Store {
 	}
 }
 
+// HashKey produces an HMAC-SHA256 digest of the raw key using the store's
+// configured secret. The secret is mandatory in production - without one,
+// HMAC degrades to plain SHA256 which would let an attacker pre-compute
+// hashes from a leaked db. Callers should ensure store.New is given a
+// non-empty secret; if not, a fixed default sentinel is mixed in so the
+// hash is not just sha256(key), but operators are warned.
 func (s *Store) HashKey(key string) string {
-	if len(s.hashSecret) == 0 {
-		h := sha256.Sum256([]byte(key))
-		return hex.EncodeToString(h[:])
+	secret := s.hashSecret
+	if len(secret) == 0 {
+		secret = []byte("llmgateway-default-hmac-secret-replace-via-LLMGATEWAY_HASH_SECRET")
 	}
-	m := hmac.New(sha256.New, s.hashSecret)
+	m := hmac.New(sha256.New, secret)
 	m.Write([]byte(key))
 	return hex.EncodeToString(m.Sum(nil))
 }
+
+// HasExplicitHashSecret reports whether the store was constructed with a
+// non-empty HMAC secret.
+func (s *Store) HasExplicitHashSecret() bool { return len(s.hashSecret) > 0 }
 
 func (s *Store) LoadFromConfig(cfg *config.Config) error {
 	s.mu.Lock()
@@ -281,7 +348,9 @@ func (s *Store) LoadFromConfig(cfg *config.Config) error {
 			Tags:                  append([]string(nil), bc.Tags...),
 			status:                StatusUnknown,
 		}
-		if b.Weight <= 0 {
+		// Negative weight is invalid; treat as 1. Zero is preserved as a
+		// drain-mode signal so routing skips the backend.
+		if b.Weight < 0 {
 			b.Weight = 1
 		}
 		s.backends[b.ID] = b
@@ -379,7 +448,7 @@ func (s *Store) Backend(id string) (*Backend, error) {
 func (s *Store) UpsertBackend(b *Backend) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if b.Weight <= 0 {
+	if b.Weight < 0 {
 		b.Weight = 1
 	}
 	b.BaseURL = strings.TrimRight(b.BaseURL, "/")
@@ -433,19 +502,35 @@ func (s *Store) DeleteModel(name string) {
 	delete(s.models, name)
 }
 
+// ResolveAlias walks alias chains up to maxAliasHops with a cycle guard.
+// Returns (internalModel, modelToSendUpstream). modelToSendUpstream is the
+// caller-visible alias if forwarding_mode is keep_external on the first hop,
+// otherwise it's the fully-resolved internal model.
 func (s *Store) ResolveAlias(name string) (internal string, forwardName string) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	a, ok := s.modelAliases[name]
-	if !ok || !a.Enabled {
-		return name, name
+	const maxAliasHops = 8
+	seen := map[string]bool{}
+	current := name
+	keepExternal := false
+	for i := 0; i < maxAliasHops; i++ {
+		a, ok := s.modelAliases[current]
+		if !ok || !a.Enabled {
+			break
+		}
+		if seen[current] {
+			break // cycle
+		}
+		seen[current] = true
+		if i == 0 && a.ForwardingMode == "keep_external" {
+			keepExternal = true
+		}
+		current = a.InternalModel
 	}
-	switch a.ForwardingMode {
-	case "keep_external":
-		return a.InternalModel, name
-	default:
-		return a.InternalModel, a.InternalModel
+	if keepExternal {
+		return current, name
 	}
+	return current, current
 }
 
 func (s *Store) ModelAliases() []*ModelAlias {

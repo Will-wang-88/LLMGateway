@@ -18,6 +18,7 @@
       <a data-page="analytics">Analytics</a>
       <a data-page="audit">Audit</a>
       <a data-page="users">Users</a>
+      <a data-page="settings">Settings</a>
     </nav>
     <div class="user-area">
       <span id="who"></span>
@@ -106,6 +107,20 @@
       <table id="audit-table"><thead><tr>
         <th>Time</th><th>Admin</th><th>Action</th><th>Target</th><th>IP</th>
       </tr></thead><tbody></tbody></table>
+    </section>
+
+    <section id="page-settings" class="page">
+      <h1>Admin Settings</h1>
+      <div class="cards" id="settings-info"></div>
+      <h2>Routing</h2>
+      <table id="settings-routing"><tbody></tbody></table>
+      <h2>Limits</h2>
+      <table id="settings-limits"><tbody></tbody></table>
+      <h2>Storage &amp; Logging</h2>
+      <table id="settings-storage"><tbody></tbody></table>
+      <h2>Queue &amp; Tracing</h2>
+      <table id="settings-misc"><tbody></tbody></table>
+      <p class="small">Settings are read-only from the dashboard. Edit the gateway YAML config and restart, or use the Admin API.</p>
     </section>
 
     <section id="page-users" class="page">

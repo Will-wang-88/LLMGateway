@@ -15,6 +15,7 @@ type Metrics struct {
 	PromptTokens     *prometheus.CounterVec
 	CompletionTokens *prometheus.CounterVec
 	TotalTokens      *prometheus.CounterVec
+	ReasoningTokens  *prometheus.CounterVec
 	BackendErrors    *prometheus.CounterVec
 	BackendStatus    *prometheus.GaugeVec
 	RateLimitHits    *prometheus.CounterVec
@@ -57,6 +58,10 @@ func New() *Metrics {
 		TotalTokens: factory.NewCounterVec(prometheus.CounterOpts{
 			Name: "llmgw_total_tokens_total",
 			Help: "Total tokens reported by backends",
+		}, []string{"model", "backend", "api_key"}),
+		ReasoningTokens: factory.NewCounterVec(prometheus.CounterOpts{
+			Name: "llmgw_reasoning_tokens_total",
+			Help: "Reasoning tokens reported by backends",
 		}, []string{"model", "backend", "api_key"}),
 		BackendErrors: factory.NewCounterVec(prometheus.CounterOpts{
 			Name: "llmgw_backend_errors_total",

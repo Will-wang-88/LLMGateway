@@ -12,8 +12,19 @@ import (
 )
 
 // streamResponse forwards an upstream SSE stream to the client.
-// It enforces strict passthrough: each "data: ..." line is forwarded byte-for-byte.
-// It still parses chunks opportunistically to extract a usage block for metrics.
+//
+// Strict passthrough semantics:
+//   - bytes from the backend are written to the client unmodified.
+//   - lines larger than the read buffer are reassembled before being parsed
+//     for usage (still forwarded byte-for-byte to the client).
+//   - on idle timeout, the stream is closed silently (we emit an SSE comment
+//     `: stream-idle-timeout` rather than fabricating a JSON error frame,
+//     because per the spec the gateway must not inject content into the
+//     stream).
+//
+// Goroutine lifecycle: the read goroutine sends to a buffered channel and
+// also selects on stopRead. When streamResponse returns, defer closes
+// stopRead and resp.Body (via the caller's defer), unblocking the producer.
 func (p *Proxy) streamResponse(w http.ResponseWriter, resp *http.Response, start time.Time, opts ForwardOptions) (int, error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -22,7 +33,6 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, resp *http.Response, start
 	}
 	clientCtx := resp.Request.Context()
 
-	// Copy headers so SSE works.
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -39,36 +49,46 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, resp *http.Response, start
 		idleMS = 30000
 	}
 
-	br := bufio.NewReaderSize(resp.Body, 64*1024)
+	br := bufio.NewReaderSize(resp.Body, 256*1024)
 	firstChunkSeen := false
 	var capturedUsage *Usage
 
-	// Idle timer: any chunk forwarded resets it. Triggering it cancels the read.
 	type readResult struct {
 		line []byte
 		err  error
 	}
-	chunkCh := make(chan readResult, 1)
+	chunkCh := make(chan readResult, 4)
 	stopRead := make(chan struct{})
+
+	// Producer goroutine. Uses readLine to reassemble lines larger than the
+	// bufio buffer. Selects on stopRead when sending so a dead consumer doesn't
+	// wedge it. Also closes resp.Body if the consumer signals stop, so an
+	// in-flight ReadBytes returns and the goroutine can exit.
 	go func() {
 		defer close(chunkCh)
 		for {
-			select {
-			case <-stopRead:
-				return
-			default:
-			}
-			line, err := br.ReadBytes('\n')
+			line, err := readLine(br)
 			if len(line) == 0 && err == nil {
 				continue
 			}
-			chunkCh <- readResult{line: line, err: err}
+			select {
+			case chunkCh <- readResult{line: line, err: err}:
+			case <-stopRead:
+				return
+			}
 			if err != nil {
 				return
 			}
 		}
 	}()
-	defer close(stopRead)
+	defer func() {
+		close(stopRead)
+		// Drain any pending chunks so the producer doesn't park on send.
+		go func() {
+			for range chunkCh {
+			}
+		}()
+	}()
 
 	idleTimer := time.NewTimer(time.Duration(idleMS) * time.Millisecond)
 	defer idleTimer.Stop()
@@ -78,9 +98,10 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, resp *http.Response, start
 		case <-clientCtx.Done():
 			return resp.StatusCode, nil
 		case <-idleTimer.C:
-			// idle timeout - send an [DONE]-like terminator and close. We do not send a fake error
-			// inside the SSE stream because that might confuse the client; instead we just stop.
-			_, _ = io.WriteString(w, "data: {\"error\":{\"message\":\"stream idle timeout\",\"type\":\"backend_timeout\",\"code\":\"stream_idle_timeout\"}}\n\n")
+			// Per spec: the gateway must not inject content into the stream.
+			// We emit a benign SSE comment (lines starting with ':' are
+			// ignored by SSE clients) and close. Clients will see EOF.
+			_, _ = io.WriteString(w, ": stream-idle-timeout\n\n")
 			flusher.Flush()
 			return resp.StatusCode, errors.New("stream idle timeout")
 		case res, ok := <-chunkCh:
@@ -94,12 +115,10 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, resp *http.Response, start
 						opts.OnTTFT(time.Since(start))
 					}
 				}
-				// Strict passthrough: write the line exactly.
 				if _, err := w.Write(res.line); err != nil {
 					return resp.StatusCode, err
 				}
 				flusher.Flush()
-				// Reset idle timer.
 				if !idleTimer.Stop() {
 					select {
 					case <-idleTimer.C:
@@ -108,7 +127,6 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, resp *http.Response, start
 				}
 				idleTimer.Reset(time.Duration(idleMS) * time.Millisecond)
 
-				// Try to extract usage from this chunk without altering it.
 				if opts.OnStreamUsage != nil && capturedUsage == nil {
 					if u := parseChunkUsage(res.line); u != nil {
 						capturedUsage = u
@@ -136,6 +154,31 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, resp *http.Response, start
 	}
 }
 
+// readLine reads until '\n' or EOF, reassembling buffer-full continuations so
+// long SSE lines are returned intact. The returned slice ends in '\n' for a
+// complete line, otherwise it ends at the partial read.
+func readLine(br *bufio.Reader) ([]byte, error) {
+	var out []byte
+	for {
+		chunk, err := br.ReadSlice('\n')
+		if len(chunk) > 0 {
+			// chunk is owned by bufio; copy if we need to combine multiple.
+			if out == nil && (err == nil || err == bufio.ErrBufferFull) {
+				// First read - we may still need to grow. Copy to detach from buffer.
+				out = append([]byte(nil), chunk...)
+			} else if out != nil {
+				out = append(out, chunk...)
+			} else {
+				// Single complete line (no further reads needed) and we're returning.
+				out = append([]byte(nil), chunk...)
+			}
+		}
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		return out, err
+	}
+}
 
 func hasContent(line []byte) bool {
 	trimmed := bytes.TrimSpace(line)
@@ -167,7 +210,10 @@ func parseChunkUsage(line []byte) *Usage {
 	return envelope.Usage
 }
 
-// helper used by handlers - not strictly streaming, but keeps SSE related helpers together.
+// WriteSSEError emits an OpenAI-style error frame as a single SSE event.
+// Used by handlers that need to surface an error AFTER the SSE headers were
+// already flushed (e.g. routing failure detected post-header). Not used for
+// idle-timeout (spec: no injection into the stream).
 func WriteSSEError(w http.ResponseWriter, err APIError) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
