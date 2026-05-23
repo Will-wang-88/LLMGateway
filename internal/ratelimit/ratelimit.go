@@ -5,6 +5,20 @@ import (
 	"time"
 )
 
+// Backend is the contract the handler uses so the in-process Limiter
+// and the Redis-backed RedisLimiter are interchangeable.
+type Backend interface {
+	CheckAndReserve(key string, rpm int, tpm int64, dailyReq int64, dailyTok int64) string
+	AddTokens(key string, tokens int64)
+}
+
+// Static interface assertions (compile-time guarantee that both
+// implementations satisfy Backend).
+var (
+	_ Backend = (*Limiter)(nil)
+	_ Backend = (*RedisLimiter)(nil)
+)
+
 // Limiter implements per-key fixed-window request, token, daily-request and
 // daily-token counters. Counters reset on window expiry (1 minute for the
 // rolling window; midnight UTC for the daily window).

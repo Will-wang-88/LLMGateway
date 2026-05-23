@@ -19,6 +19,8 @@ type Metrics struct {
 	BackendErrors    *prometheus.CounterVec
 	BackendStatus    *prometheus.GaugeVec
 	RateLimitHits    *prometheus.CounterVec
+	QuotaHits        *prometheus.CounterVec
+	Timeouts         *prometheus.CounterVec
 	QueueDepth       *prometheus.GaugeVec
 }
 
@@ -32,12 +34,12 @@ func New() *Metrics {
 		Requests: factory.NewCounterVec(prometheus.CounterOpts{
 			Name: "llmgw_requests_total",
 			Help: "Total requests handled by the gateway",
-		}, []string{"endpoint", "model", "backend", "api_key", "status", "stream"}),
+		}, []string{"endpoint", "model", "backend", "api_key", "status", "stream", "routing_policy"}),
 		RequestLatency: factory.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "llmgw_request_latency_seconds",
 			Help:    "Request latency in seconds",
 			Buckets: prometheus.ExponentialBuckets(0.05, 2, 12),
-		}, []string{"endpoint", "model", "backend", "stream"}),
+		}, []string{"endpoint", "model", "backend", "stream", "routing_policy"}),
 		TTFT: factory.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "llmgw_ttft_seconds",
 			Help:    "Time to first token (streaming) in seconds",
@@ -73,8 +75,16 @@ func New() *Metrics {
 		}, []string{"backend"}),
 		RateLimitHits: factory.NewCounterVec(prometheus.CounterOpts{
 			Name: "llmgw_rate_limit_total",
-			Help: "Rate limit / quota events",
+			Help: "Rate-limit events (per-minute / concurrent / queue). Quota events are tracked separately in llmgw_quota_total.",
 		}, []string{"api_key", "code"}),
+		QuotaHits: factory.NewCounterVec(prometheus.CounterOpts{
+			Name: "llmgw_quota_total",
+			Help: "Daily / monthly quota rejections (request and token)",
+		}, []string{"api_key", "code"}),
+		Timeouts: factory.NewCounterVec(prometheus.CounterOpts{
+			Name: "llmgw_timeouts_total",
+			Help: "Backend / stream timeouts split by kind",
+		}, []string{"backend", "kind"}),
 		QueueDepth: factory.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "llmgw_queue_depth",
 			Help: "Pending requests queue depth",

@@ -198,18 +198,20 @@ type ModelAlias struct {
 }
 
 type APIKey struct {
-	ID            string
-	Name          string
-	KeyPrefix     string
-	KeyHash       string
-	Enabled       bool
-	AllowedModels []string
-	DeniedModels  []string
-	RateLimit     *config.APIKeyRateLimit
-	Quota         *config.APIKeyQuota
-	DelayMS       int
-	Logging       *config.APIKeyLogging
-	ExpiresAt     time.Time
+	ID               string
+	Name             string
+	KeyPrefix        string
+	KeyHash          string
+	Enabled          bool
+	AllowedModels    []string
+	DeniedModels     []string
+	AllowedClientIPs []string
+	DeniedClientIPs  []string
+	RateLimit        *config.APIKeyRateLimit
+	Quota            *config.APIKeyQuota
+	DelayMS          int
+	Logging          *config.APIKeyLogging
+	ExpiresAt        time.Time
 
 	mu          sync.RWMutex
 	lastUsedAt  time.Time
@@ -217,6 +219,28 @@ type APIKey struct {
 	totalTokens   int64
 }
 
+// TouchRequest records that a request from this key was admitted/completed.
+// Token totals are updated separately via AddTokens (or via Touch for
+// callers that have both pieces of information at once).
+func (k *APIKey) TouchRequest() {
+	k.mu.Lock()
+	k.lastUsedAt = time.Now()
+	k.totalRequests++
+	k.mu.Unlock()
+}
+
+// AddTokens accumulates token usage without bumping the request counter.
+func (k *APIKey) AddTokens(tokens int64) {
+	if tokens <= 0 {
+		return
+	}
+	k.mu.Lock()
+	k.lastUsedAt = time.Now()
+	k.totalTokens += tokens
+	k.mu.Unlock()
+}
+
+// Touch is retained for callers that have both signals at once.
 func (k *APIKey) Touch(tokens int64) {
 	k.mu.Lock()
 	k.lastUsedAt = time.Now()
@@ -242,6 +266,31 @@ func (k *APIKey) ModelAllowed(model string) bool {
 	}
 	for _, a := range k.AllowedModels {
 		if matchPattern(a, model) {
+			return true
+		}
+	}
+	return false
+}
+
+// ModelAllowedResolved checks model permission for both the requested
+// (external) name and the resolved internal model. Deny is enforced on
+// either name; allow requires at least one name to match. This closes the
+// alias-bypass hole where a client uses an alias whose internal model is
+// in DeniedModels.
+func (k *APIKey) ModelAllowedResolved(requested, internal string) bool {
+	for _, d := range k.DeniedModels {
+		if matchPattern(d, requested) || (internal != requested && matchPattern(d, internal)) {
+			return false
+		}
+	}
+	if len(k.AllowedModels) == 0 {
+		return true
+	}
+	for _, a := range k.AllowedModels {
+		if matchPattern(a, requested) {
+			return true
+		}
+		if internal != requested && matchPattern(a, internal) {
 			return true
 		}
 	}
@@ -387,17 +436,19 @@ func (s *Store) LoadFromConfig(cfg *config.Config) error {
 	}
 	for _, kc := range cfg.APIKeys {
 		k := &APIKey{
-			ID:            kc.ID,
-			Name:          kc.Name,
-			KeyPrefix:     kc.KeyPrefix,
-			KeyHash:       kc.KeyHash,
-			Enabled:       kc.Enabled,
-			AllowedModels: append([]string(nil), kc.AllowedModels...),
-			DeniedModels:  append([]string(nil), kc.DeniedModels...),
-			RateLimit:     kc.RateLimit,
-			Quota:         kc.Quota,
-			DelayMS:       kc.DelayMS,
-			Logging:       kc.Logging,
+			ID:               kc.ID,
+			Name:             kc.Name,
+			KeyPrefix:        kc.KeyPrefix,
+			KeyHash:          kc.KeyHash,
+			Enabled:          kc.Enabled,
+			AllowedModels:    append([]string(nil), kc.AllowedModels...),
+			DeniedModels:     append([]string(nil), kc.DeniedModels...),
+			AllowedClientIPs: append([]string(nil), kc.AllowedClientIPs...),
+			DeniedClientIPs:  append([]string(nil), kc.DeniedClientIPs...),
+			RateLimit:        kc.RateLimit,
+			Quota:            kc.Quota,
+			DelayMS:          kc.DelayMS,
+			Logging:          kc.Logging,
 		}
 		if kc.Key != "" {
 			k.KeyHash = s.HashKey(kc.Key)

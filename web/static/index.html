@@ -80,13 +80,17 @@
         <input name="model" placeholder="model">
         <input name="backend_id" placeholder="backend_id">
         <input name="api_key_id" placeholder="api_key_id">
+        <input name="client_ip" placeholder="client_ip">
         <input name="request_id" placeholder="request_id">
+        <input name="error_code" placeholder="error_code">
         <input name="status_code" placeholder="status_code" type="number">
         <select name="stream"><option value="">stream?</option><option value="true">stream</option><option value="false">non-stream</option></select>
+        <input name="since" placeholder="since (RFC3339)">
+        <input name="until" placeholder="until (RFC3339)">
         <button>Search</button>
       </form>
       <table id="logs-table"><thead><tr>
-        <th>Time</th><th>Endpoint</th><th>Model</th><th>Backend</th><th>API key</th><th>Status</th><th>Stream</th>
+        <th>Time</th><th>Endpoint</th><th>Model</th><th>Backend</th><th>API key</th><th>Client IP</th><th>Status</th><th>Stream</th>
         <th>Tokens</th><th>Latency</th><th>TTFT</th><th>Request ID</th>
       </tr></thead><tbody></tbody></table>
     </section>

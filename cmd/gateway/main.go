@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"flag"
 	"fmt"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/will-wang-88/llmgateway/internal/admin"
@@ -24,7 +26,11 @@ import (
 	"github.com/will-wang-88/llmgateway/internal/logging"
 	"github.com/will-wang-88/llmgateway/internal/logstore"
 	"github.com/will-wang-88/llmgateway/internal/metrics"
+	"github.com/will-wang-88/llmgateway/internal/netutil"
+	"github.com/will-wang-88/llmgateway/internal/notify"
 	"github.com/will-wang-88/llmgateway/internal/proxy"
+	"github.com/redis/go-redis/v9"
+
 	"github.com/will-wang-88/llmgateway/internal/queue"
 	"github.com/will-wang-88/llmgateway/internal/quota"
 	"github.com/will-wang-88/llmgateway/internal/ratelimit"
@@ -42,12 +48,17 @@ const (
 
 func main() {
 	configPath := flag.String("config", envOr(envConfigPath, "config/gateway.yaml"), "Path to YAML config file")
+	healthcheck := flag.Bool("healthcheck", false, "Probe /healthz on the configured listener and exit 0/1 (for Docker HEALTHCHECK)")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 		os.Exit(1)
+	}
+
+	if *healthcheck {
+		os.Exit(runHealthCheck(cfg))
 	}
 
 	if v := os.Getenv(envHashSecret); v != "" {
@@ -85,7 +96,23 @@ func main() {
 	m := metrics.New()
 	p := proxy.New(logger, m)
 	bal := balancer.New()
-	rl := ratelimit.New()
+	var rl ratelimit.Backend
+	switch strings.ToLower(cfg.RateLimit.Backend) {
+	case "redis":
+		opts, err := redis.ParseURL(cfg.RateLimit.RedisURL)
+		if err != nil {
+			logger.Error("failed to parse rate_limit.redis_url", logging.F("error", err.Error()))
+			os.Exit(1)
+		}
+		rdb := redis.NewClient(opts)
+		rl = ratelimit.NewRedisLimiter(rdb, cfg.RateLimit.RedisPrefix)
+		logger.Info("rate limit backend: redis", logging.F("prefix", cfg.RateLimit.RedisPrefix))
+	default:
+		rl = ratelimit.New()
+		if cfg.RateLimit.Backend != "" && cfg.RateLimit.Backend != "memory" {
+			logger.Warn("unknown rate_limit.backend, defaulting to memory", logging.F("got", cfg.RateLimit.Backend))
+		}
+	}
 	cc := ratelimit.NewConcurrency()
 	qm := quota.New()
 	qq := queue.New(cfg.Queue.QueueTimeoutMS, cfg.Queue.MaxQueueSize, cfg.Queue.PerModelLimit)
@@ -102,7 +129,6 @@ func main() {
 			os.Exit(1)
 		}
 		ls = sl
-		// Background purge.
 		if cfg.Storage.LogRetentionDays > 0 {
 			go func() {
 				t := time.NewTicker(6 * time.Hour)
@@ -110,6 +136,32 @@ func main() {
 				for range t.C {
 					retention := time.Duration(cfg.Storage.LogRetentionDays) * 24 * time.Hour
 					_ = sl.Purge(context.Background(), retention)
+				}
+			}()
+		}
+	case "postgres", "postgresql":
+		dsn := cfg.Storage.DSN
+		if v := os.Getenv("LLMGATEWAY_PG_DSN"); v != "" {
+			dsn = v
+		}
+		db, err := sql.Open("pgx", dsn)
+		if err != nil {
+			logger.Error("failed to open postgres", logging.F("error", err.Error()))
+			os.Exit(1)
+		}
+		pg, err := logstore.OpenPostgres(db)
+		if err != nil {
+			logger.Error("failed to migrate postgres", logging.F("error", err.Error()))
+			os.Exit(1)
+		}
+		ls = pg
+		if cfg.Storage.LogRetentionDays > 0 {
+			go func() {
+				t := time.NewTicker(6 * time.Hour)
+				defer t.Stop()
+				for range t.C {
+					retention := time.Duration(cfg.Storage.LogRetentionDays) * 24 * time.Hour
+					_ = pg.Purge(context.Background(), retention)
 				}
 			}()
 		}
@@ -122,6 +174,11 @@ func main() {
 	tr := tracing.New(cfg.Tracing, logger)
 	defer tr.Stop()
 
+	notifier := notify.New(cfg.Notifications, logger)
+	notifier.Start()
+	defer notifier.Stop()
+	hostname := notify.Hostname()
+
 	hc := backend.NewHealthChecker(s, cfg.HealthCheck, logger, func(b *store.Backend, status store.BackendStatus) {
 		v := 0.0
 		if status == store.StatusHealthy {
@@ -129,14 +186,22 @@ func main() {
 		}
 		m.BackendStatus.WithLabelValues(b.ID).Set(v)
 	})
+	hc.AddObserver(func(b *store.Backend, prev, next store.BackendStatus, latencyMS int64, errMsg string) {
+		notifier.Notify(notify.Event{
+			BackendID: b.ID, BackendName: b.Name, BackendURL: b.BaseURL,
+			Prev: prev, Next: next, LatencyMS: latencyMS, Error: errMsg,
+			Models: b.Models, Hostname: hostname, At: time.Now().UTC(),
+		})
+	})
 	hc.Start()
 	defer hc.Stop()
 
 	h := handlers.New(cfg, s, p, bal, rl, cc, logger, m).
 		WithLogStore(ls).
 		WithQuota(qm).
-		WithQueue(qq)
-	adminSrv := admin.NewServer(cfg, s, hc, logger).WithLogStore(ls).WithQuota(qm)
+		WithQueue(qq).
+		WithTracer(tr)
+	adminSrv := admin.NewServer(cfg, s, hc, logger).WithLogStore(ls).WithQuota(qm).WithNotifier(notifier)
 	adminSrv.Users().LoadFromConfig(cfg.AdminUsers)
 
 	mux := http.NewServeMux()
@@ -170,7 +235,9 @@ func main() {
 	}
 
 	// Build /v1/* handlers wrapped with API-key auth.
-	authn := auth.New(s, cfg.Auth.APIKeyHeader, cfg.Auth.APIKeyPrefix)
+	ipExtractor := netutil.NewExtractor(cfg.Server.TrustedProxies)
+	authn := auth.New(s, cfg.Auth.APIKeyHeader, cfg.Auth.APIKeyPrefix).
+		WithClientIPExtractor(ipExtractor)
 	v1Auth := authn.Middleware(func(r *http.Request) bool {
 		return strings.HasPrefix(r.URL.Path, "/v1/")
 	})
@@ -191,8 +258,6 @@ func main() {
 	if cfg.Dashboard.Enabled {
 		web.Register(mux)
 	}
-
-	_ = tr // tracer wired in handlers in a future pass; kept available here.
 
 	srv := &http.Server{
 		Addr:              fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port),
@@ -224,6 +289,30 @@ func main() {
 		logger.Error("shutdown error", logging.F("error", err.Error()))
 	}
 	logger.Info("shutdown complete", nil)
+}
+
+// runHealthCheck performs a lightweight HTTP GET against /healthz on the
+// listener address the gateway would itself bind to. It's invoked via
+// `llmgateway --healthcheck` so docker-compose / k8s probes can verify
+// liveness without a shell.
+func runHealthCheck(cfg *config.Config) int {
+	host := cfg.Server.Host
+	if host == "0.0.0.0" || host == "" {
+		host = "127.0.0.1"
+	}
+	url := fmt.Sprintf("http://%s:%d/healthz", host, cfg.Server.Port)
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "healthcheck: %v\n", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "healthcheck: status %d\n", resp.StatusCode)
+		return 1
+	}
+	return 0
 }
 
 func envOr(key, fallback string) string {

@@ -36,6 +36,7 @@ func (s *Server) listLogs(w http.ResponseWriter, r *http.Request) {
 	q := logstore.LogQuery{
 		RequestID: r.URL.Query().Get("request_id"),
 		APIKeyID:  r.URL.Query().Get("api_key_id"),
+		ClientIP:  r.URL.Query().Get("client_ip"),
 		Model:     r.URL.Query().Get("model"),
 		BackendID: r.URL.Query().Get("backend_id"),
 		Endpoint:  r.URL.Query().Get("endpoint"),

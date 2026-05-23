@@ -23,18 +23,20 @@ func (s *Server) getAPIKey(w http.ResponseWriter, r *http.Request) {
 	}
 	last, totalReqs, totalToks := k.Stats()
 	out := map[string]any{
-		"id":             k.ID,
-		"name":           k.Name,
-		"key_prefix":     k.KeyPrefix,
-		"enabled":        k.Enabled,
-		"allowed_models": k.AllowedModels,
-		"denied_models":  k.DeniedModels,
-		"rate_limit":     k.RateLimit,
-		"quota":          k.Quota,
-		"delay_ms":       k.DelayMS,
-		"logging":        k.Logging,
-		"total_requests": totalReqs,
-		"total_tokens":   totalToks,
+		"id":                 k.ID,
+		"name":               k.Name,
+		"key_prefix":         k.KeyPrefix,
+		"enabled":            k.Enabled,
+		"allowed_models":     k.AllowedModels,
+		"denied_models":      k.DeniedModels,
+		"allowed_client_ips": k.AllowedClientIPs,
+		"denied_client_ips":  k.DeniedClientIPs,
+		"rate_limit":         k.RateLimit,
+		"quota":              k.Quota,
+		"delay_ms":           k.DelayMS,
+		"logging":            k.Logging,
+		"total_requests":     totalReqs,
+		"total_tokens":       totalToks,
 	}
 	if !last.IsZero() {
 		out["last_used_at"] = last.UTC().Format(time.RFC3339)
@@ -59,15 +61,17 @@ func (s *Server) patchAPIKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body := struct {
-		Name          *string                 `json:"name"`
-		Enabled       *bool                   `json:"enabled"`
-		AllowedModels *[]string               `json:"allowed_models"`
-		DeniedModels  *[]string               `json:"denied_models"`
-		RateLimit     *config.APIKeyRateLimit `json:"rate_limit"`
-		Quota         *config.APIKeyQuota     `json:"quota"`
-		DelayMS       *int                    `json:"delay_ms"`
-		Logging       *config.APIKeyLogging   `json:"logging"`
-		ExpiresAt     *string                 `json:"expires_at"`
+		Name             *string                 `json:"name"`
+		Enabled          *bool                   `json:"enabled"`
+		AllowedModels    *[]string               `json:"allowed_models"`
+		DeniedModels     *[]string               `json:"denied_models"`
+		AllowedClientIPs *[]string               `json:"allowed_client_ips"`
+		DeniedClientIPs  *[]string               `json:"denied_client_ips"`
+		RateLimit        *config.APIKeyRateLimit `json:"rate_limit"`
+		Quota            *config.APIKeyQuota     `json:"quota"`
+		DelayMS          *int                    `json:"delay_ms"`
+		Logging          *config.APIKeyLogging   `json:"logging"`
+		ExpiresAt        *string                 `json:"expires_at"`
 	}{}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest("Invalid JSON: "+err.Error(), "invalid_json"))
@@ -86,6 +90,12 @@ func (s *Server) patchAPIKey(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.DeniedModels != nil {
 		k.DeniedModels = *body.DeniedModels
+	}
+	if body.AllowedClientIPs != nil {
+		k.AllowedClientIPs = *body.AllowedClientIPs
+	}
+	if body.DeniedClientIPs != nil {
+		k.DeniedClientIPs = *body.DeniedClientIPs
 	}
 	if body.RateLimit != nil {
 		k.RateLimit = body.RateLimit
@@ -231,18 +241,20 @@ func (s *Server) statsRange(w http.ResponseWriter, r *http.Request) {
 func summarizeKey(k *store.APIKey) map[string]any {
 	last, totalReqs, totalToks := k.Stats()
 	out := map[string]any{
-		"id":             k.ID,
-		"name":           k.Name,
-		"key_prefix":     k.KeyPrefix,
-		"enabled":        k.Enabled,
-		"allowed_models": k.AllowedModels,
-		"denied_models":  k.DeniedModels,
-		"rate_limit":     k.RateLimit,
-		"quota":          k.Quota,
-		"delay_ms":       k.DelayMS,
-		"logging":        k.Logging,
-		"total_requests": totalReqs,
-		"total_tokens":   totalToks,
+		"id":                 k.ID,
+		"name":               k.Name,
+		"key_prefix":         k.KeyPrefix,
+		"enabled":            k.Enabled,
+		"allowed_models":     k.AllowedModels,
+		"denied_models":      k.DeniedModels,
+		"allowed_client_ips": k.AllowedClientIPs,
+		"denied_client_ips":  k.DeniedClientIPs,
+		"rate_limit":         k.RateLimit,
+		"quota":              k.Quota,
+		"delay_ms":           k.DelayMS,
+		"logging":            k.Logging,
+		"total_requests":     totalReqs,
+		"total_tokens":       totalToks,
 	}
 	if !last.IsZero() {
 		out["last_used_at"] = last.UTC().Format(time.RFC3339)

@@ -1,4 +1,10 @@
-replicaCount: 2
+# IMPORTANT: replicaCount > 1 requires shared state across pods.
+#   * storage.driver MUST be `postgres` (sqlite/memory are per-pod).
+#   * rate_limit.backend MUST be `redis` (memory is per-pod).
+# If you cannot provide both, keep replicaCount=1 and disable HPA, or
+# accept that each replica enforces its own per-pod rate limits and
+# logs to its own local sqlite/memory.
+replicaCount: 1
 
 image:
   repository: ghcr.io/will-wang-88/llmgateway
@@ -25,8 +31,10 @@ resources:
     memory: 1Gi
 
 autoscaling:
+  # Same caveat as replicaCount: HPA only makes sense when both
+  # storage.driver=postgres and rate_limit.backend=redis are configured.
   enabled: false
-  minReplicas: 2
+  minReplicas: 1
   maxReplicas: 8
   targetCPUUtilizationPercentage: 70
 

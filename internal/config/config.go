@@ -9,18 +9,19 @@ import (
 )
 
 type Config struct {
-	Server      ServerConfig      `yaml:"server"`
-	Auth        AuthConfig        `yaml:"auth"`
-	Routing     RoutingConfig     `yaml:"routing"`
-	HealthCheck HealthCheckConfig `yaml:"health_check"`
-	RateLimit   RateLimitConfig   `yaml:"rate_limit"`
-	Logging     LoggingConfig     `yaml:"logging"`
-	Metrics     MetricsConfig     `yaml:"metrics"`
-	Admin       AdminConfig       `yaml:"admin"`
-	Storage     StorageConfig     `yaml:"storage"`
-	Queue       QueueConfig       `yaml:"queue"`
-	Tracing     TracingConfig     `yaml:"tracing"`
-	Dashboard   DashboardConfig   `yaml:"dashboard"`
+	Server        ServerConfig        `yaml:"server"`
+	Auth          AuthConfig          `yaml:"auth"`
+	Routing       RoutingConfig       `yaml:"routing"`
+	HealthCheck   HealthCheckConfig   `yaml:"health_check"`
+	RateLimit     RateLimitConfig     `yaml:"rate_limit"`
+	Logging       LoggingConfig       `yaml:"logging"`
+	Metrics       MetricsConfig       `yaml:"metrics"`
+	Admin         AdminConfig         `yaml:"admin"`
+	Storage       StorageConfig       `yaml:"storage"`
+	Queue         QueueConfig         `yaml:"queue"`
+	Tracing       TracingConfig       `yaml:"tracing"`
+	Dashboard     DashboardConfig     `yaml:"dashboard"`
+	Notifications NotificationsConfig `yaml:"notifications"`
 
 	Backends     []BackendConfig    `yaml:"backends"`
 	Models       []ModelConfig      `yaml:"models"`
@@ -29,14 +30,37 @@ type Config struct {
 	AdminUsers   []AdminUserConfig  `yaml:"admin_users"`
 }
 
+type NotificationsConfig struct {
+	Email EmailNotifierConfig `yaml:"email" json:"email"`
+}
+
+type EmailNotifierConfig struct {
+	Enabled    bool     `yaml:"enabled" json:"enabled"`
+	SMTPHost   string   `yaml:"smtp_host" json:"smtp_host"`
+	SMTPPort   int      `yaml:"smtp_port" json:"smtp_port"`
+	Username   string   `yaml:"username" json:"username"`
+	Password   string   `yaml:"password" json:"-"`
+	From       string   `yaml:"from" json:"from"`
+	To         []string `yaml:"to" json:"to"`
+	UseTLS     bool     `yaml:"use_tls" json:"use_tls"`
+	StartTLS   bool     `yaml:"start_tls" json:"start_tls"`
+	CooldownMS int      `yaml:"cooldown_ms" json:"cooldown_ms"`
+	NotifyOn   []string `yaml:"notify_on" json:"notify_on"`
+}
+
 type ServerConfig struct {
-	Host                 string `yaml:"host"`
-	Port                 int    `yaml:"port"`
-	RequestBodyLimitMB   int    `yaml:"request_body_limit_mb"`
-	DefaultTimeoutMS     int    `yaml:"default_timeout_ms"`
-	StreamIdleTimeoutMS  int    `yaml:"stream_idle_timeout_ms"`
-	ReadHeaderTimeoutMS  int    `yaml:"read_header_timeout_ms"`
-	ShutdownTimeoutMS    int    `yaml:"shutdown_timeout_ms"`
+	Host                 string   `yaml:"host"`
+	Port                 int      `yaml:"port"`
+	RequestBodyLimitMB   int      `yaml:"request_body_limit_mb"`
+	DefaultTimeoutMS     int      `yaml:"default_timeout_ms"`
+	StreamIdleTimeoutMS  int      `yaml:"stream_idle_timeout_ms"`
+	ReadHeaderTimeoutMS  int      `yaml:"read_header_timeout_ms"`
+	ShutdownTimeoutMS    int      `yaml:"shutdown_timeout_ms"`
+	// TrustedProxies lists IPs / CIDRs that are allowed to set
+	// X-Forwarded-For / X-Real-IP. Headers from any other peer are
+	// ignored when resolving the client IP. Empty (default) means: never
+	// trust forwarded headers.
+	TrustedProxies       []string `yaml:"trusted_proxies"`
 }
 
 type AuthConfig struct {
@@ -50,20 +74,40 @@ type RoutingConfig struct {
 	DefaultPolicy      string `yaml:"default_policy" json:"default_policy"`
 	ModelAliasEnabled  bool   `yaml:"model_alias_enabled" json:"model_alias_enabled"`
 	UnknownFieldPolicy string `yaml:"unknown_field_policy" json:"unknown_field_policy"`
+	// AllowDegradedBackends, when true, lets routing pick backends in the
+	// "degraded" state (e.g. health probe returned 4xx). Default false:
+	// degraded backends are excluded from routing because the gateway
+	// has already observed an unrecoverable error from them.
+	AllowDegradedBackends bool `yaml:"allow_degraded_backends" json:"allow_degraded_backends"`
 }
 
 type HealthCheckConfig struct {
+	// Enabled lets operators turn off probing for a specific backend
+	// without removing it from the catalog. nil = use the default.
+	Enabled *bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	// Type selects the probe transport. Supported: "http" (default),
+	// "tcp". The "completion" probe is reserved for a future change.
+	Type             string `yaml:"type,omitempty" json:"type,omitempty"`
 	IntervalMS       int    `yaml:"interval_ms" json:"interval_ms"`
 	TimeoutMS        int    `yaml:"timeout_ms" json:"timeout_ms"`
 	FailureThreshold int    `yaml:"failure_threshold" json:"failure_threshold"`
 	SuccessThreshold int    `yaml:"success_threshold" json:"success_threshold"`
 	Path             string `yaml:"path" json:"path"`
+	// Method is the HTTP verb used by the http probe (default GET).
+	Method string `yaml:"method,omitempty" json:"method,omitempty"`
+	// Body is an optional request body for completion-style probes.
+	Body string `yaml:"body,omitempty" json:"body,omitempty"`
 }
 
 type RateLimitConfig struct {
 	Backend                  string `yaml:"backend"`
 	DefaultRequestsPerMinute int    `yaml:"default_requests_per_minute"`
 	DefaultConcurrentReq     int    `yaml:"default_concurrent_requests"`
+	// RedisURL is consumed when Backend = "redis". Example:
+	// "redis://:password@redis:6379/0". Multi-replica deployments
+	// require this to keep limits consistent across pods.
+	RedisURL   string `yaml:"redis_url"`
+	RedisPrefix string `yaml:"redis_prefix"`
 }
 
 type LoggingConfig struct {
@@ -154,19 +198,21 @@ type ModelAliasConfig struct {
 }
 
 type APIKeyConfig struct {
-	ID             string                 `yaml:"id"`
-	Name           string                 `yaml:"name"`
-	Key            string                 `yaml:"key"`
-	KeyPrefix      string                 `yaml:"key_prefix"`
-	KeyHash        string                 `yaml:"key_hash"`
-	Enabled        bool                   `yaml:"enabled"`
-	AllowedModels  []string               `yaml:"allowed_models"`
-	DeniedModels   []string               `yaml:"denied_models"`
-	RateLimit      *APIKeyRateLimit       `yaml:"rate_limit,omitempty"`
-	Quota          *APIKeyQuota           `yaml:"quota,omitempty"`
-	DelayMS        int                    `yaml:"delay_ms"`
-	Logging        *APIKeyLogging         `yaml:"logging,omitempty"`
-	ExpiresAt      string                 `yaml:"expires_at"`
+	ID                string                 `yaml:"id"`
+	Name              string                 `yaml:"name"`
+	Key               string                 `yaml:"key"`
+	KeyPrefix         string                 `yaml:"key_prefix"`
+	KeyHash           string                 `yaml:"key_hash"`
+	Enabled           bool                   `yaml:"enabled"`
+	AllowedModels     []string               `yaml:"allowed_models"`
+	DeniedModels      []string               `yaml:"denied_models"`
+	AllowedClientIPs  []string               `yaml:"allowed_client_ips"`
+	DeniedClientIPs   []string               `yaml:"denied_client_ips"`
+	RateLimit         *APIKeyRateLimit       `yaml:"rate_limit,omitempty"`
+	Quota             *APIKeyQuota           `yaml:"quota,omitempty"`
+	DelayMS           int                    `yaml:"delay_ms"`
+	Logging           *APIKeyLogging         `yaml:"logging,omitempty"`
+	ExpiresAt         string                 `yaml:"expires_at"`
 }
 
 type APIKeyRateLimit struct {

@@ -21,17 +21,48 @@ import (
 
 // Server hosts the /admin/* HTTP API for managing the gateway at runtime.
 type Server struct {
-	cfg     *config.Config
-	store   *store.Store
-	health  *backend.HealthChecker
-	logger  *logging.Logger
-	users   *Users
-	logs    logstore.Store
-	quota   *quota.Manager
+	cfg      *config.Config
+	store    *store.Store
+	health   *backend.HealthChecker
+	logger   *logging.Logger
+	users    *Users
+	logs     logstore.Store
+	quota    *quota.Manager
+	notifier NotifierStatus
+	sessions *SessionManager
+}
+
+// NotifierStatus is the contract Admin uses to expose notification
+// health to operators.
+type NotifierStatus interface {
+	LastResult() (time.Time, string)
 }
 
 func NewServer(cfg *config.Config, s *store.Store, hc *backend.HealthChecker, log *logging.Logger) *Server {
-	return &Server{cfg: cfg, store: s, health: hc, logger: log, users: NewUsers()}
+	return &Server{cfg: cfg, store: s, health: hc, logger: log, users: NewUsers(), sessions: NewSessionManager()}
+}
+
+// WithNotifier attaches a notifier so /admin/notifications/status can
+// report send health.
+func (s *Server) WithNotifier(n NotifierStatus) *Server { s.notifier = n; return s }
+
+func (s *Server) notificationsStatus(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePerm("view_logs", w, r) {
+		return
+	}
+	out := map[string]any{
+		"email_enabled": s.cfg.Notifications.Email.Enabled,
+		"recipients":    s.cfg.Notifications.Email.To,
+		"notify_on":     s.cfg.Notifications.Email.NotifyOn,
+	}
+	if s.notifier != nil {
+		last, lastErr := s.notifier.LastResult()
+		if !last.IsZero() {
+			out["last_send_at"] = last.UTC().Format(time.RFC3339)
+		}
+		out["last_error"] = lastErr
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // WithUsers attaches an in-memory user store and loads users from config.
@@ -60,10 +91,13 @@ func (s *Server) Register(mux *http.ServeMux) {
 
 	mux.Handle("GET /admin/models", auth(http.HandlerFunc(s.listModels)))
 	mux.Handle("POST /admin/models", auth(http.HandlerFunc(s.upsertModel)))
+	mux.Handle("GET /admin/models/{name}", auth(http.HandlerFunc(s.getModel)))
+	mux.Handle("PATCH /admin/models/{name}", auth(http.HandlerFunc(s.patchModel)))
 	mux.Handle("DELETE /admin/models/{name}", auth(http.HandlerFunc(s.deleteModel)))
 
 	mux.Handle("GET /admin/model-aliases", auth(http.HandlerFunc(s.listAliases)))
 	mux.Handle("POST /admin/model-aliases", auth(http.HandlerFunc(s.upsertAlias)))
+	mux.Handle("PATCH /admin/model-aliases/{alias}", auth(http.HandlerFunc(s.patchAlias)))
 	mux.Handle("DELETE /admin/model-aliases/{alias}", auth(http.HandlerFunc(s.deleteAlias)))
 
 	mux.Handle("GET /admin/api-keys", auth(http.HandlerFunc(s.listAPIKeys)))
@@ -78,6 +112,11 @@ func (s *Server) Register(mux *http.ServeMux) {
 
 	mux.Handle("GET /admin/stats/overview", auth(http.HandlerFunc(s.statsOverview)))
 	mux.Handle("GET /admin/stats/range", auth(http.HandlerFunc(s.statsRange)))
+	mux.Handle("GET /admin/stats/models", auth(http.HandlerFunc(s.statsModels)))
+	mux.Handle("GET /admin/stats/backends", auth(http.HandlerFunc(s.statsBackends)))
+	mux.Handle("GET /admin/stats/api-keys", auth(http.HandlerFunc(s.statsAPIKeys)))
+	mux.Handle("GET /admin/metrics", auth(http.HandlerFunc(s.adminMetrics)))
+	mux.Handle("GET /admin/notifications/status", auth(http.HandlerFunc(s.notificationsStatus)))
 
 	mux.Handle("GET /admin/logs", auth(http.HandlerFunc(s.listLogs)))
 	mux.Handle("GET /admin/audit", auth(http.HandlerFunc(s.listAudit)))
@@ -90,6 +129,11 @@ func (s *Server) Register(mux *http.ServeMux) {
 
 	mux.Handle("GET /admin/me", auth(http.HandlerFunc(s.me)))
 	mux.Handle("GET /admin/settings", auth(http.HandlerFunc(s.settings)))
+
+	// Session login/logout. Login is NOT behind auth - it accepts HTTP
+	// Basic credentials and returns a short-lived bearer token.
+	mux.HandleFunc("POST /admin/auth/login", s.loginHandler)
+	mux.HandleFunc("POST /admin/auth/logout", s.logoutHandler)
 }
 
 // settings returns a redacted snapshot of the runtime config so the dashboard
@@ -155,7 +199,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			proxy.WriteError(w, http.StatusForbidden, proxy.PermissionError("Admin API is disabled", "admin_disabled"))
 			return
 		}
-		// 1. Bearer token (super_admin)
+		// 1a. Bearer admin token (super_admin)
 		if s.cfg.Admin.BindToken != "" {
 			authHeader := r.Header.Get("Authorization")
 			if strings.HasPrefix(authHeader, "Bearer ") {
@@ -163,6 +207,18 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 				if subtle.ConstantTimeCompare([]byte(provided), []byte(s.cfg.Admin.BindToken)) == 1 {
 					tokenUser := &User{Username: "token", Role: RoleSuperAdmin}
 					next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), adminUserKey, tokenUser)))
+					return
+				}
+			}
+		}
+		// 1b. Short-lived session token issued via /admin/auth/login.
+		if s.sessions != nil {
+			authHeader := r.Header.Get("Authorization")
+			if strings.HasPrefix(authHeader, "Bearer ") {
+				tok := strings.TrimPrefix(authHeader, "Bearer ")
+				if c, ok := s.sessions.Verify(tok); ok {
+					sessionUser := &User{Username: c.Username, Role: Role(c.Role)}
+					next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), adminUserKey, sessionUser)))
 					return
 				}
 			}
@@ -636,17 +692,19 @@ func (s *Server) deleteAlias(w http.ResponseWriter, r *http.Request) {
 }
 
 type apiKeyBody struct {
-	ID            string                  `json:"id"`
-	Name          string                  `json:"name"`
-	Key           string                  `json:"key"`
-	Enabled       *bool                   `json:"enabled"`
-	AllowedModels []string                `json:"allowed_models"`
-	DeniedModels  []string                `json:"denied_models"`
-	RateLimit     *config.APIKeyRateLimit `json:"rate_limit,omitempty"`
-	Quota         *config.APIKeyQuota     `json:"quota,omitempty"`
-	DelayMS       int                     `json:"delay_ms"`
-	Logging       *config.APIKeyLogging   `json:"logging,omitempty"`
-	ExpiresAt     string                  `json:"expires_at"`
+	ID               string                  `json:"id"`
+	Name             string                  `json:"name"`
+	Key              string                  `json:"key"`
+	Enabled          *bool                   `json:"enabled"`
+	AllowedModels    []string                `json:"allowed_models"`
+	DeniedModels     []string                `json:"denied_models"`
+	AllowedClientIPs []string                `json:"allowed_client_ips"`
+	DeniedClientIPs  []string                `json:"denied_client_ips"`
+	RateLimit        *config.APIKeyRateLimit `json:"rate_limit,omitempty"`
+	Quota            *config.APIKeyQuota     `json:"quota,omitempty"`
+	DelayMS          int                     `json:"delay_ms"`
+	Logging          *config.APIKeyLogging   `json:"logging,omitempty"`
+	ExpiresAt        string                  `json:"expires_at"`
 }
 
 func (s *Server) listAPIKeys(w http.ResponseWriter, _ *http.Request) {
@@ -654,18 +712,20 @@ func (s *Server) listAPIKeys(w http.ResponseWriter, _ *http.Request) {
 	for _, k := range s.store.APIKeys() {
 		last, totalReqs, totalToks := k.Stats()
 		entry := map[string]any{
-			"id":             k.ID,
-			"name":           k.Name,
-			"key_prefix":     k.KeyPrefix,
-			"enabled":        k.Enabled,
-			"allowed_models": k.AllowedModels,
-			"denied_models":  k.DeniedModels,
-			"rate_limit":     k.RateLimit,
-			"quota":          k.Quota,
-			"delay_ms":       k.DelayMS,
-			"logging":        k.Logging,
-			"total_requests": totalReqs,
-			"total_tokens":   totalToks,
+			"id":                 k.ID,
+			"name":               k.Name,
+			"key_prefix":         k.KeyPrefix,
+			"enabled":            k.Enabled,
+			"allowed_models":     k.AllowedModels,
+			"denied_models":      k.DeniedModels,
+			"allowed_client_ips": k.AllowedClientIPs,
+			"denied_client_ips":  k.DeniedClientIPs,
+			"rate_limit":         k.RateLimit,
+			"quota":              k.Quota,
+			"delay_ms":           k.DelayMS,
+			"logging":            k.Logging,
+			"total_requests":     totalReqs,
+			"total_tokens":       totalToks,
 		}
 		if !last.IsZero() {
 			entry["last_used_at"] = last.UTC().Format(time.RFC3339)
@@ -687,24 +747,28 @@ func (s *Server) createAPIKey(w http.ResponseWriter, r *http.Request) {
 		proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest("Invalid JSON: "+err.Error(), "invalid_json"))
 		return
 	}
+	// If the caller doesn't supply a raw key, generate one and return
+	// it exactly once. This prevents weak operator-chosen keys from
+	// going into production.
 	if b.Key == "" {
-		proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest("key is required (raw key shown once; only hash is stored)", "missing_key"))
-		return
+		b.Key = generateAPIKey()
 	}
 	enabled := true
 	if b.Enabled != nil {
 		enabled = *b.Enabled
 	}
 	k := &store.APIKey{
-		ID:            b.ID,
-		Name:          b.Name,
-		Enabled:       enabled,
-		AllowedModels: b.AllowedModels,
-		DeniedModels:  b.DeniedModels,
-		RateLimit:     b.RateLimit,
-		Quota:         b.Quota,
-		DelayMS:       b.DelayMS,
-		Logging:       b.Logging,
+		ID:               b.ID,
+		Name:             b.Name,
+		Enabled:          enabled,
+		AllowedModels:    b.AllowedModels,
+		DeniedModels:     b.DeniedModels,
+		AllowedClientIPs: b.AllowedClientIPs,
+		DeniedClientIPs:  b.DeniedClientIPs,
+		RateLimit:        b.RateLimit,
+		Quota:            b.Quota,
+		DelayMS:          b.DelayMS,
+		Logging:          b.Logging,
 	}
 	if b.ExpiresAt != "" {
 		if t, err := time.Parse(time.RFC3339, b.ExpiresAt); err == nil {

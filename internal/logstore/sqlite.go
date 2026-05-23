@@ -43,6 +43,7 @@ func (s *SQLite) migrate() error {
 			request_id TEXT NOT NULL,
 			api_key_id TEXT,
 			api_key_name TEXT,
+			client_ip TEXT,
 			model TEXT NOT NULL,
 			internal_model TEXT,
 			backend_id TEXT,
@@ -61,8 +62,12 @@ func (s *SQLite) migrate() error {
 			metadata TEXT,
 			created_at INTEGER NOT NULL
 		)`,
+		// Best-effort add for existing databases that pre-date client_ip.
+		// Ignored if the column already exists.
+		`ALTER TABLE request_logs ADD COLUMN client_ip TEXT`,
 		`CREATE INDEX IF NOT EXISTS idx_request_logs_created ON request_logs(created_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_request_logs_api_key ON request_logs(api_key_id, created_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_request_logs_client_ip ON request_logs(client_ip, created_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_request_logs_model ON request_logs(model, created_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_request_logs_backend ON request_logs(backend_id, created_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_request_logs_request ON request_logs(request_id)`,
@@ -82,9 +87,17 @@ func (s *SQLite) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_audit_logs_user ON audit_logs(admin_user, created_at)`,
 	}
 	for _, q := range stmts {
-		if _, err := s.db.Exec(q); err != nil {
-			return fmt.Errorf("migrate: %w", err)
+		_, err := s.db.Exec(q)
+		if err == nil {
+			continue
 		}
+		// ALTER TABLE ... ADD COLUMN is used to upgrade older databases
+		// in place; tolerate "duplicate column" for already-migrated DBs.
+		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(q)), "ALTER TABLE") &&
+			strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			continue
+		}
+		return fmt.Errorf("migrate: %w", err)
 	}
 	return nil
 }
@@ -94,13 +107,13 @@ func (s *SQLite) Close() error { return s.db.Close() }
 func (s *SQLite) AppendRequest(ctx context.Context, r *RequestLog) error {
 	meta, _ := json.Marshal(r.Metadata)
 	_, err := s.db.ExecContext(ctx, `INSERT INTO request_logs
-		(id, request_id, api_key_id, api_key_name, model, internal_model, backend_id,
+		(id, request_id, api_key_id, api_key_name, client_ip, model, internal_model, backend_id,
 		 endpoint, stream, status_code, error_code, prompt_tokens, completion_tokens,
 		 total_tokens, reasoning_tokens, latency_ms, ttft_ms, raw_request, raw_response,
 		 metadata, created_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		r.ID, r.RequestID, nullable(r.APIKeyID), nullable(r.APIKeyName), r.Model,
-		nullable(r.InternalModel), nullable(r.BackendID), r.Endpoint, boolInt(r.Stream),
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		r.ID, r.RequestID, nullable(r.APIKeyID), nullable(r.APIKeyName), nullable(r.ClientIP),
+		r.Model, nullable(r.InternalModel), nullable(r.BackendID), r.Endpoint, boolInt(r.Stream),
 		r.StatusCode, nullable(r.ErrorCode), r.PromptTokens, r.CompletionTokens,
 		r.TotalTokens, r.ReasoningTokens, r.LatencyMS, r.TTFTMS,
 		nullable(r.RawRequest), nullable(r.RawResponse), string(meta),
@@ -122,6 +135,10 @@ func (s *SQLite) QueryRequests(ctx context.Context, q LogQuery) ([]*RequestLog, 
 	if q.APIKeyID != "" {
 		conds = append(conds, "api_key_id = ?")
 		args = append(args, q.APIKeyID)
+	}
+	if q.ClientIP != "" {
+		conds = append(conds, "client_ip = ?")
+		args = append(args, q.ClientIP)
 	}
 	if q.Model != "" {
 		conds = append(conds, "model = ?")
@@ -160,10 +177,10 @@ func (s *SQLite) QueryRequests(ctx context.Context, q LogQuery) ([]*RequestLog, 
 		where = "WHERE " + strings.Join(conds, " AND ")
 	}
 	sqlStr := fmt.Sprintf(`SELECT id, request_id, COALESCE(api_key_id,''), COALESCE(api_key_name,''),
-		model, COALESCE(internal_model,''), COALESCE(backend_id,''), endpoint, stream,
-		status_code, COALESCE(error_code,''), prompt_tokens, completion_tokens, total_tokens,
-		reasoning_tokens, latency_ms, ttft_ms, COALESCE(raw_request,''), COALESCE(raw_response,''),
-		COALESCE(metadata,''), created_at
+		COALESCE(client_ip,''), model, COALESCE(internal_model,''), COALESCE(backend_id,''),
+		endpoint, stream, status_code, COALESCE(error_code,''), prompt_tokens, completion_tokens,
+		total_tokens, reasoning_tokens, latency_ms, ttft_ms, COALESCE(raw_request,''),
+		COALESCE(raw_response,''), COALESCE(metadata,''), created_at
 		FROM request_logs %s ORDER BY created_at DESC LIMIT ? OFFSET ?`, where)
 	args = append(args, limit, q.Offset)
 	rows, err := s.db.QueryContext(ctx, sqlStr, args...)
@@ -177,8 +194,8 @@ func (s *SQLite) QueryRequests(ctx context.Context, q LogQuery) ([]*RequestLog, 
 		var createdAt int64
 		var streamInt int
 		var metadata string
-		if err := rows.Scan(&r.ID, &r.RequestID, &r.APIKeyID, &r.APIKeyName, &r.Model,
-			&r.InternalModel, &r.BackendID, &r.Endpoint, &streamInt, &r.StatusCode,
+		if err := rows.Scan(&r.ID, &r.RequestID, &r.APIKeyID, &r.APIKeyName, &r.ClientIP,
+			&r.Model, &r.InternalModel, &r.BackendID, &r.Endpoint, &streamInt, &r.StatusCode,
 			&r.ErrorCode, &r.PromptTokens, &r.CompletionTokens, &r.TotalTokens,
 			&r.ReasoningTokens, &r.LatencyMS, &r.TTFTMS, &r.RawRequest, &r.RawResponse,
 			&metadata, &createdAt); err != nil {
