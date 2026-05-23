@@ -1,0 +1,21 @@
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: llmgateway:dev
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config/gateway.yaml:/app/gateway.yaml:ro
+    environment:
+      LLMGATEWAY_CONFIG: /app/gateway.yaml
+      # Override secrets at runtime; do not bake them into the image.
+      LLMGATEWAY_HASH_SECRET: ${LLMGATEWAY_HASH_SECRET:-change-me}
+      LLMGATEWAY_ADMIN_TOKEN: ${LLMGATEWAY_ADMIN_TOKEN:-change-me-admin}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/app/llmgateway", "--config", "/dev/null", "--help"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

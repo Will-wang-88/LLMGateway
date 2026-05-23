@@ -1,0 +1,112 @@
+replicaCount: 2
+
+image:
+  repository: ghcr.io/will-wang-88/llmgateway
+  tag: ""
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+ingress:
+  enabled: false
+  className: nginx
+  host: llmgateway.local
+  tls: false
+
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    cpu: 2000m
+    memory: 1Gi
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 8
+  targetCPUUtilizationPercentage: 70
+
+# Secrets are pulled from a Kubernetes Secret you create out-of-band. Set the
+# name here. Required keys: hashSecret, adminToken.
+existingSecret: ""
+
+# In-line gateway.yaml. For production set this from an external configmap/secret.
+config: |
+  server:
+    host: 0.0.0.0
+    port: 8080
+    request_body_limit_mb: 50
+  auth:
+    api_key_header: Authorization
+    api_key_prefix: "Bearer "
+    hash_algorithm: hmac_sha256
+  routing:
+    default_policy: weighted_round_robin
+    model_alias_enabled: true
+    unknown_field_policy: passthrough
+  health_check:
+    interval_ms: 5000
+    timeout_ms: 2000
+    failure_threshold: 3
+    success_threshold: 2
+  rate_limit:
+    backend: memory
+    default_requests_per_minute: 600
+    default_concurrent_requests: 20
+  logging:
+    level: info
+    default_log_metadata: true
+  metrics:
+    prometheus_enabled: true
+    prometheus_path: /metrics
+  admin:
+    enabled: true
+  storage:
+    driver: sqlite
+    dsn: /data/llmgateway.db
+    log_retention_days: 30
+  dashboard:
+    enabled: true
+
+persistence:
+  enabled: true
+  size: 2Gi
+  storageClass: ""
+
+probes:
+  liveness:
+    httpGet:
+      path: /healthz
+      port: http
+    initialDelaySeconds: 5
+    periodSeconds: 10
+  readiness:
+    httpGet:
+      path: /readyz
+      port: http
+    initialDelaySeconds: 5
+    periodSeconds: 5
+
+serviceMonitor:
+  enabled: false
+  interval: 30s
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+
+securityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

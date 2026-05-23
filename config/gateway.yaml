@@ -1,0 +1,216 @@
+# LLM Gateway sample configuration.
+# Copy this file, edit the backends/api_keys sections, and start the gateway:
+#   LLMGATEWAY_CONFIG=config/gateway.yaml ./llmgateway
+#
+# Everything Gateway-specific lives in this file. Backend APIs must be
+# OpenAI-compatible (e.g. vLLM, SGLang, TGI, Ollama, llama.cpp server).
+
+server:
+  host: 0.0.0.0
+  port: 8080
+  request_body_limit_mb: 50
+  default_timeout_ms: 120000
+  stream_idle_timeout_ms: 30000
+  read_header_timeout_ms: 30000
+  shutdown_timeout_ms: 30000
+
+auth:
+  api_key_header: Authorization
+  api_key_prefix: "Bearer "
+  hash_algorithm: hmac_sha256
+  # In production, set LLMGATEWAY_HASH_SECRET env var instead.
+  hash_secret: "change-me-in-production"
+
+routing:
+  default_policy: weighted_round_robin
+  model_alias_enabled: true
+  # Gateway is a transparent proxy: unknown JSON fields are forwarded as-is.
+  unknown_field_policy: passthrough
+
+health_check:
+  interval_ms: 5000
+  timeout_ms: 2000
+  failure_threshold: 3
+  success_threshold: 2
+  path: /models
+
+rate_limit:
+  backend: memory
+  default_requests_per_minute: 600
+  default_concurrent_requests: 20
+
+logging:
+  level: info
+  default_log_metadata: true
+  default_log_input: false
+  default_log_output: false
+  default_log_raw_request: false
+  default_log_raw_response: false
+  default_log_stream_chunks: false
+
+metrics:
+  prometheus_enabled: true
+  prometheus_path: /metrics
+
+admin:
+  enabled: true
+  # Either set bind_token here, or set LLMGATEWAY_ADMIN_TOKEN env var.
+  bind_token: "change-me-admin-token"
+
+# Persistent storage for request_logs and audit_logs.
+# Driver "memory" (default) keeps the last 50k records in process.
+# Driver "sqlite" persists to a local file (pure-Go, no CGO).
+storage:
+  driver: sqlite             # memory | sqlite
+  dsn: data/llmgateway.db
+  log_retention_days: 30
+
+# Optional per-model queue with backpressure. When disabled (default) requests
+# are routed immediately.
+queue:
+  enabled: false
+  max_queue_size: 1000
+  queue_timeout_ms: 30000
+  per_model_limit: 64
+
+# Optional OTLP/HTTP tracing.
+tracing:
+  enabled: false
+  endpoint: http://otel-collector:4318
+  service_name: llmgateway
+  sample_ratio: 1.0
+
+# Web dashboard at /ui/.
+dashboard:
+  enabled: true
+
+# Multi-user RBAC. Roles: super_admin, admin, operator, viewer, auditor.
+# Passwords are SHA-256 hashed at load time.
+admin_users:
+  - username: alice
+    password: "change-me-alice"
+    email: alice@example.com
+    role: super_admin
+  - username: bob
+    password: "change-me-bob"
+    role: viewer
+
+backends:
+  - id: gpu-01
+    name: GPU Node 01 (vLLM)
+    base_url: http://localhost:8000/v1
+    enabled: true
+    models:
+      - llama-3.1-70b
+      - llama-3.1-8b
+    weight: 2
+    max_concurrent_requests: 32
+    timeout_ms: 120000
+    stream_idle_timeout_ms: 30000
+    tags: [gpu, h100, zone-a]
+
+  - id: gpu-02
+    name: GPU Node 02 (vLLM)
+    base_url: http://localhost:8001/v1
+    enabled: true
+    models:
+      - llama-3.1-70b
+      - qwen-72b
+    weight: 1
+    max_concurrent_requests: 32
+    timeout_ms: 120000
+    stream_idle_timeout_ms: 30000
+    tags: [gpu, h100, zone-b]
+
+  - id: gpu-03
+    name: GPU Node 03 (SGLang reasoning)
+    base_url: http://localhost:8002/v1
+    enabled: true
+    models:
+      - deepseek-r1
+      - qwen-thinking
+    weight: 1
+    max_concurrent_requests: 16
+    timeout_ms: 300000
+    stream_idle_timeout_ms: 60000
+    tags: [gpu, reasoning]
+
+models:
+  - name: llama-3.1-70b
+    type: chat
+    enabled: true
+    context_length: 131072
+    capability_mode: passthrough
+    routing_policy: weighted_round_robin
+  - name: llama-3.1-8b
+    type: chat
+    enabled: true
+    context_length: 131072
+    capability_mode: passthrough
+  - name: qwen-72b
+    type: chat
+    enabled: true
+    capability_mode: passthrough
+  - name: deepseek-r1
+    type: chat
+    enabled: true
+    capability_mode: passthrough
+  - name: qwen-thinking
+    type: chat
+    enabled: true
+    capability_mode: passthrough
+
+model_aliases:
+  - alias: company-main-model
+    internal_model: llama-3.1-70b
+    forwarding_mode: use_internal
+    enabled: true
+  - alias: reasoning-main
+    internal_model: deepseek-r1
+    forwarding_mode: use_internal
+    enabled: true
+
+api_keys:
+  - id: key-team-a
+    name: Team A Production Key
+    # Plaintext value - shown once. On startup it is hashed and the
+    # plaintext is dropped. Rotate via the admin API.
+    key: "sk-prod-team-a-CHANGE-ME"
+    enabled: true
+    allowed_models:
+      - "llama-*"
+      - qwen-72b
+      - deepseek-r1
+      - company-main-model
+      - reasoning-main
+    denied_models: []
+    rate_limit:
+      enabled: true
+      requests_per_minute: 600
+      tokens_per_minute: 1000000
+      concurrent_requests: 20
+    quota:
+      daily_requests: 100000
+      daily_tokens: 100000000
+      monthly_requests: 3000000
+      monthly_tokens: 1000000000
+    delay_ms: 0
+    logging:
+      log_metadata: true
+      log_input: false
+      log_output: false
+      log_raw_request: false
+      log_raw_response: false
+      log_stream_chunks: false
+
+  - id: key-trial
+    name: Trial Tier
+    key: "sk-trial-CHANGE-ME"
+    enabled: true
+    allowed_models:
+      - llama-3.1-8b
+    rate_limit:
+      enabled: true
+      requests_per_minute: 30
+      concurrent_requests: 2
+    delay_ms: 500
