@@ -1,6 +1,10 @@
 package store
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/will-wang-88/llmgateway/internal/config"
+)
 
 func TestMatchPattern(t *testing.T) {
 	cases := []struct {
@@ -95,7 +99,8 @@ func TestAPIKeyModelAllowed(t *testing.T) {
 
 func TestBackendHealthTransitions(t *testing.T) {
 	b := &Backend{Enabled: true, status: StatusUnknown}
-	// 3 successes -> healthy
+	// Default success_threshold=2: a backend in unknown state must
+	// observe two successive probes before being marked healthy.
 	b.RecordHealthCheck(true, 5, "")
 	b.RecordHealthCheck(true, 5, "")
 	if b.Status() != StatusHealthy {
@@ -113,6 +118,32 @@ func TestBackendHealthTransitions(t *testing.T) {
 	b.RecordHealthCheck(true, 5, "")
 	if b.Status() != StatusHealthy {
 		t.Errorf("expected healthy after recovery, got %s", b.Status())
+	}
+}
+
+// P1-6 (review): unknown -> healthy must respect success_threshold,
+// no startup-shortcut bypass.
+func TestUnknownBackendRequiresSuccessThreshold(t *testing.T) {
+	threshold := 3
+	b := &Backend{
+		Enabled:     true,
+		status:      StatusUnknown,
+		HealthCheck: &config.HealthCheckConfig{SuccessThreshold: threshold},
+	}
+	// First probe: must not flip to healthy.
+	b.RecordHealthCheck(true, 5, "")
+	if b.Status() != StatusUnknown {
+		t.Errorf("expected unknown after 1 success with threshold=%d, got %s", threshold, b.Status())
+	}
+	// Second probe: still under threshold.
+	b.RecordHealthCheck(true, 5, "")
+	if b.Status() != StatusUnknown {
+		t.Errorf("expected unknown after 2 successes with threshold=%d, got %s", threshold, b.Status())
+	}
+	// Third probe: hits threshold -> healthy.
+	b.RecordHealthCheck(true, 5, "")
+	if b.Status() != StatusHealthy {
+		t.Errorf("expected healthy after 3 successes with threshold=%d, got %s", threshold, b.Status())
 	}
 }
 

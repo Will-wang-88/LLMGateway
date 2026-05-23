@@ -340,6 +340,20 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("backend %s declares no models", b.ID)
 		}
 	}
+	for _, m := range c.Models {
+		switch m.CapabilityMode {
+		case "", "passthrough", "declared", "strict":
+		default:
+			return fmt.Errorf("model %s: invalid capability_mode %q (must be passthrough/declared/strict)", m.Name, m.CapabilityMode)
+		}
+	}
+	for _, a := range c.ModelAliases {
+		switch a.ForwardingMode {
+		case "", "use_internal", "keep_external":
+		default:
+			return fmt.Errorf("alias %s: invalid forwarding_mode %q (must be use_internal/keep_external)", a.Alias, a.ForwardingMode)
+		}
+	}
 	return nil
 }
 

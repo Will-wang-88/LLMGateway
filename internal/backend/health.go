@@ -28,9 +28,15 @@ type HealthChecker struct {
 
 	mu        sync.Mutex
 	observers []StatusChangeObserver
+	// loops[backendID] holds the stop channel for that backend's
+	// per-backend health goroutine. Used by Rescan() / Remove() to start
+	// new probes on runtime-added backends and stop probes on
+	// runtime-deleted backends without leaking goroutines.
+	loops map[string]chan struct{}
 
-	stop chan struct{}
-	wg   sync.WaitGroup
+	stop    chan struct{}
+	wg      sync.WaitGroup
+	started bool
 }
 
 func NewHealthChecker(s *store.Store, defaults config.HealthCheckConfig, logger *logging.Logger, onChange func(*store.Backend, store.BackendStatus)) *HealthChecker {
@@ -39,6 +45,7 @@ func NewHealthChecker(s *store.Store, defaults config.HealthCheckConfig, logger 
 		defaults:   defaults,
 		httpClient: &http.Client{Timeout: time.Duration(max(defaults.TimeoutMS, 1)) * time.Millisecond},
 		logger:     logger,
+		loops:      make(map[string]chan struct{}),
 		stop:       make(chan struct{}),
 	}
 	if onChange != nil {
@@ -71,15 +78,80 @@ func (h *HealthChecker) emit(b *store.Backend, prev, next store.BackendStatus, l
 
 func (h *HealthChecker) Start() {
 	// One goroutine per backend so per-backend interval is honored.
-	// Backends added after start are picked up by Rescan().
+	// Backends added after start are picked up by Rescan() (or the
+	// admin server calling AddBackend directly).
+	h.mu.Lock()
+	h.started = true
+	h.mu.Unlock()
 	for _, b := range h.store.Backends() {
 		h.spawn(b)
 	}
 }
 
+// spawn registers a per-backend goroutine if one isn't already running.
+// Re-entrant: calling it twice for the same backend is a no-op so admin
+// rescans can't double-probe.
 func (h *HealthChecker) spawn(b *store.Backend) {
+	h.mu.Lock()
+	if _, ok := h.loops[b.ID]; ok {
+		h.mu.Unlock()
+		return
+	}
+	ch := make(chan struct{})
+	h.loops[b.ID] = ch
+	h.mu.Unlock()
 	h.wg.Add(1)
-	go h.loop(b)
+	go h.loop(b, ch)
+}
+
+// AddBackend starts a periodic health-check goroutine for a backend
+// that was created at runtime (e.g. via admin API). Idempotent.
+func (h *HealthChecker) AddBackend(b *store.Backend) {
+	h.mu.Lock()
+	if !h.started {
+		h.mu.Unlock()
+		return
+	}
+	h.mu.Unlock()
+	h.spawn(b)
+}
+
+// RemoveBackend stops the per-backend health-check goroutine. Idempotent.
+func (h *HealthChecker) RemoveBackend(id string) {
+	h.mu.Lock()
+	ch, ok := h.loops[id]
+	if ok {
+		delete(h.loops, id)
+	}
+	h.mu.Unlock()
+	if ok {
+		close(ch)
+	}
+}
+
+// Rescan reconciles the running probes with the current store state:
+// new backends get a goroutine, deleted backends get their goroutine
+// stopped. Called by Admin after CRUD operations.
+func (h *HealthChecker) Rescan() {
+	current := h.store.Backends()
+	seen := make(map[string]struct{}, len(current))
+	for _, b := range current {
+		seen[b.ID] = struct{}{}
+		h.AddBackend(b)
+	}
+	// Stop goroutines for backends no longer in the store.
+	h.mu.Lock()
+	toStop := make([]chan struct{}, 0)
+	for id, ch := range h.loops {
+		if _, ok := seen[id]; !ok {
+			toStop = append(toStop, ch)
+			delete(h.loops, id)
+		}
+	}
+	h.mu.Unlock()
+	for _, ch := range toStop {
+		close(ch)
+	}
 }
 
 func (h *HealthChecker) Stop() {
@@ -131,7 +203,7 @@ func (h *HealthChecker) effective(b *store.Backend) config.HealthCheckConfig {
 	return hc
 }
 
-func (h *HealthChecker) loop(b *store.Backend) {
+func (h *HealthChecker) loop(b *store.Backend, perBackendStop chan struct{}) {
 	defer h.wg.Done()
 	hc := h.effective(b)
 	if hc.Enabled != nil && !*hc.Enabled {
@@ -147,6 +219,8 @@ func (h *HealthChecker) loop(b *store.Backend) {
 	for {
 		select {
 		case <-h.stop:
+			return
+		case <-perBackendStop:
 			return
 		case <-t.C:
 			h.checkOne(b)

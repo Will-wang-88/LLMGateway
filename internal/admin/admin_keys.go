@@ -220,7 +220,10 @@ func (s *Server) toggleMaintenance(w http.ResponseWriter, r *http.Request) {
 func (s *Server) statsRange(w http.ResponseWriter, r *http.Request) {
 	if s.logs == nil {
 		writeJSON(w, http.StatusOK, &logstore.Stats{
-			ByModel: map[string]logstore.ModelStat{}, ByBackend: map[string]logstore.BackendStat{}, ByAPIKey: map[string]logstore.KeyStat{},
+			ByModel:    map[string]logstore.ModelStat{},
+			ByBackend:  map[string]logstore.BackendStat{},
+			ByAPIKey:   map[string]logstore.KeyStat{},
+			ByClientIP: map[string]logstore.ClientIPStat{},
 		})
 		return
 	}

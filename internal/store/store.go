@@ -115,10 +115,11 @@ func (b *Backend) RecordHealthCheck(success bool, latencyMS int64, errMsg string
 		b.successStreak++
 		b.failureStreak = 0
 		b.lastError = ""
+		// success_threshold is the canonical gate. unknown is treated
+		// the same as any non-healthy state — operators expect "the
+		// probe must succeed N times before I trust this backend".
+		// (The previous shortcut for unknown is removed.)
 		if prev != StatusHealthy && b.successStreak >= threshSucc {
-			b.status = StatusHealthy
-		}
-		if prev == "" || prev == StatusUnknown {
 			b.status = StatusHealthy
 		}
 	} else {

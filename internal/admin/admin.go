@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/will-wang-88/llmgateway/internal/config"
 	"github.com/will-wang-88/llmgateway/internal/logging"
 	"github.com/will-wang-88/llmgateway/internal/logstore"
+	"github.com/will-wang-88/llmgateway/internal/netutil"
 	"github.com/will-wang-88/llmgateway/internal/proxy"
 	"github.com/will-wang-88/llmgateway/internal/quota"
 	"github.com/will-wang-88/llmgateway/internal/store"
@@ -21,15 +23,16 @@ import (
 
 // Server hosts the /admin/* HTTP API for managing the gateway at runtime.
 type Server struct {
-	cfg      *config.Config
-	store    *store.Store
-	health   *backend.HealthChecker
-	logger   *logging.Logger
-	users    *Users
-	logs     logstore.Store
-	quota    *quota.Manager
-	notifier NotifierStatus
-	sessions *SessionManager
+	cfg       *config.Config
+	store     *store.Store
+	health    *backend.HealthChecker
+	logger    *logging.Logger
+	users     *Users
+	logs      logstore.Store
+	quota     *quota.Manager
+	notifier  NotifierStatus
+	sessions  *SessionManager
+	extractor *netutil.Extractor
 }
 
 // NotifierStatus is the contract Admin uses to expose notification
@@ -45,6 +48,15 @@ func NewServer(cfg *config.Config, s *store.Store, hc *backend.HealthChecker, lo
 // WithNotifier attaches a notifier so /admin/notifications/status can
 // report send health.
 func (s *Server) WithNotifier(n NotifierStatus) *Server { s.notifier = n; return s }
+
+// WithClientIPExtractor wires the same trusted-proxy-aware extractor
+// used by the gateway data plane, so audit log IPs reflect a consistent
+// policy (and can't be spoofed via X-Forwarded-For from an untrusted
+// peer).
+func (s *Server) WithClientIPExtractor(e *netutil.Extractor) *Server {
+	s.extractor = e
+	return s
+}
 
 func (s *Server) notificationsStatus(w http.ResponseWriter, r *http.Request) {
 	if !s.requirePerm("view_logs", w, r) {
@@ -282,7 +294,7 @@ func (s *Server) audit(r *http.Request, action, targetType, targetID string, old
 		TargetID:   targetID,
 		OldValue:   oldVal,
 		NewValue:   newVal,
-		IP:         clientIP(r),
+		IP:         s.clientIP(r),
 		UserAgent:  r.Header.Get("User-Agent"),
 		CreatedAt:  time.Now().UTC(),
 	}
@@ -295,12 +307,18 @@ func (s *Server) audit(r *http.Request, action, targetType, targetID string, old
 	}()
 }
 
-func clientIP(r *http.Request) string {
-	if v := r.Header.Get("X-Forwarded-For"); v != "" {
-		if idx := strings.IndexByte(v, ','); idx > 0 {
-			return strings.TrimSpace(v[:idx])
+// clientIP resolves the admin's client IP using the configured trusted
+// proxy policy when one is attached. Otherwise it falls back to the
+// raw RemoteAddr (without honoring forwarded headers) — the safe choice
+// when no proxy is configured.
+func (s *Server) clientIP(r *http.Request) string {
+	if s.extractor != nil {
+		if ip := s.extractor.ClientIP(r); ip != "" {
+			return ip
 		}
-		return strings.TrimSpace(v)
+	}
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
 	}
 	return r.RemoteAddr
 }
@@ -403,7 +421,12 @@ func (s *Server) createBackend(w http.ResponseWriter, r *http.Request) {
 		Tags:                  b.Tags,
 	}
 	s.store.UpsertBackend(bk)
-	s.health.CheckOnce(bk)
+	// One immediate probe so the new backend has a non-unknown status
+	// quickly, then register a periodic loop so health is kept fresh.
+	if s.health != nil {
+		s.health.CheckOnce(bk)
+		s.health.AddBackend(bk)
+	}
 	s.audit(r, "backend.create", "backend", b.ID, nil, map[string]any{
 		"id": b.ID, "base_url": bk.BaseURL, "models": bk.Models, "enabled": bk.Enabled,
 	})
@@ -484,6 +507,7 @@ func (s *Server) patchBackend(w http.ResponseWriter, r *http.Request) {
 	if body.StreamIdleTimeoutMS > 0 {
 		b.StreamIdleTimeoutMS = body.StreamIdleTimeoutMS
 	}
+	healthChanged := body.HealthCheck != nil
 	if body.HealthCheck != nil {
 		b.HealthCheck = body.HealthCheck
 	}
@@ -491,6 +515,12 @@ func (s *Server) patchBackend(w http.ResponseWriter, r *http.Request) {
 		b.Tags = body.Tags
 	}
 	s.store.UpsertBackend(b)
+	// If health_check interval/enabled/type changed, restart the loop
+	// so the new settings take effect immediately.
+	if healthChanged && s.health != nil {
+		s.health.RemoveBackend(b.ID)
+		s.health.AddBackend(b)
+	}
 	newVal := map[string]any{
 		"id": b.ID, "base_url": b.BaseURL, "enabled": b.Enabled,
 		"weight": b.Weight, "max_concurrent_requests": b.MaxConcurrentRequests,
@@ -506,6 +536,9 @@ func (s *Server) deleteBackend(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 	s.store.DeleteBackend(id)
+	if s.health != nil {
+		s.health.RemoveBackend(id)
+	}
 	s.audit(r, "backend.delete", "backend", id, nil, nil)
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -616,6 +649,13 @@ func (s *Server) upsertModel(w http.ResponseWriter, r *http.Request) {
 	if b.CapabilityMode == "" {
 		b.CapabilityMode = "passthrough"
 	}
+	if !validCapabilityMode(b.CapabilityMode) {
+		proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest(
+			"capability_mode must be one of passthrough/declared/strict",
+			"invalid_capability_mode",
+		))
+		return
+	}
 	s.store.UpsertModel(&store.Model{
 		Name: b.Name, Type: b.Type, Enabled: enabled, ContextLength: b.ContextLength,
 		CapabilityMode: b.CapabilityMode, Capabilities: b.Capabilities, RoutingPolicy: b.RoutingPolicy,
@@ -673,6 +713,13 @@ func (s *Server) upsertAlias(w http.ResponseWriter, r *http.Request) {
 	}
 	if b.ForwardingMode == "" {
 		b.ForwardingMode = "use_internal"
+	}
+	if !validForwardingMode(b.ForwardingMode) {
+		proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest(
+			"forwarding_mode must be use_internal or keep_external",
+			"invalid_forwarding_mode",
+		))
+		return
 	}
 	s.store.UpsertModelAlias(&store.ModelAlias{
 		Alias: b.Alias, InternalModel: b.InternalModel, ForwardingMode: b.ForwardingMode, Enabled: enabled,

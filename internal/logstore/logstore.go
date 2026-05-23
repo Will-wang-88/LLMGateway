@@ -77,15 +77,16 @@ type AuditQuery struct {
 
 // Stats aggregates totals over a window.
 type Stats struct {
-	TotalRequests int64                  `json:"total_requests"`
-	SuccessTotal  int64                  `json:"success_total"`
-	ErrorTotal    int64                  `json:"error_total"`
-	PromptTokens  int64                  `json:"prompt_tokens"`
-	CompletionTokens int64               `json:"completion_tokens"`
-	TotalTokens   int64                  `json:"total_tokens"`
-	ByModel       map[string]ModelStat   `json:"by_model"`
-	ByBackend     map[string]BackendStat `json:"by_backend"`
-	ByAPIKey      map[string]KeyStat     `json:"by_api_key"`
+	TotalRequests int64                    `json:"total_requests"`
+	SuccessTotal  int64                    `json:"success_total"`
+	ErrorTotal    int64                    `json:"error_total"`
+	PromptTokens  int64                    `json:"prompt_tokens"`
+	CompletionTokens int64                 `json:"completion_tokens"`
+	TotalTokens   int64                    `json:"total_tokens"`
+	ByModel       map[string]ModelStat     `json:"by_model"`
+	ByBackend     map[string]BackendStat   `json:"by_backend"`
+	ByAPIKey      map[string]KeyStat       `json:"by_api_key"`
+	ByClientIP    map[string]ClientIPStat  `json:"by_client_ip"`
 }
 
 type ModelStat struct {
@@ -101,6 +102,12 @@ type BackendStat struct {
 }
 
 type KeyStat struct {
+	Requests int64 `json:"requests"`
+	Errors   int64 `json:"errors"`
+	Tokens   int64 `json:"tokens"`
+}
+
+type ClientIPStat struct {
 	Requests int64 `json:"requests"`
 	Errors   int64 `json:"errors"`
 	Tokens   int64 `json:"tokens"`
@@ -185,9 +192,10 @@ func (m *Memory) StatsSince(_ context.Context, since time.Time) (*Stats, error) 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	s := &Stats{
-		ByModel:   make(map[string]ModelStat),
-		ByBackend: make(map[string]BackendStat),
-		ByAPIKey:  make(map[string]KeyStat),
+		ByModel:    make(map[string]ModelStat),
+		ByBackend:  make(map[string]BackendStat),
+		ByAPIKey:   make(map[string]KeyStat),
+		ByClientIP: make(map[string]ClientIPStat),
 	}
 	for _, r := range m.requests {
 		if r.CreatedAt.Before(since) {
@@ -226,6 +234,16 @@ func (m *Memory) StatsSince(_ context.Context, since time.Time) (*Stats, error) 
 			ks.Errors++
 		}
 		s.ByAPIKey[r.APIKeyID] = ks
+
+		if r.ClientIP != "" {
+			cs := s.ByClientIP[r.ClientIP]
+			cs.Requests++
+			cs.Tokens += r.TotalTokens
+			if r.StatusCode >= 400 {
+				cs.Errors++
+			}
+			s.ByClientIP[r.ClientIP] = cs
+		}
 	}
 	return s, nil
 }

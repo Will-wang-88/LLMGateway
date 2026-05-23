@@ -193,9 +193,10 @@ func (p *Postgres) QueryRequests(ctx context.Context, q LogQuery) ([]*RequestLog
 func (p *Postgres) StatsSince(ctx context.Context, since time.Time) (*Stats, error) {
 	sinceMS := since.UTC().UnixMilli()
 	stats := &Stats{
-		ByModel:   make(map[string]ModelStat),
-		ByBackend: make(map[string]BackendStat),
-		ByAPIKey:  make(map[string]KeyStat),
+		ByModel:    make(map[string]ModelStat),
+		ByBackend:  make(map[string]BackendStat),
+		ByAPIKey:   make(map[string]KeyStat),
+		ByClientIP: make(map[string]ClientIPStat),
 	}
 	row := p.db.QueryRowContext(ctx, `SELECT
 		COUNT(*),
@@ -249,6 +250,16 @@ func (p *Postgres) StatsSince(ctx context.Context, since time.Time) (*Stats, err
 		FROM request_logs WHERE created_at >= $1 GROUP BY api_key_id`,
 		func(k string, r, e, t int64) {
 			stats.ByAPIKey[k] = KeyStat{Requests: r, Errors: e, Tokens: t}
+		}); err != nil {
+		return nil, err
+	}
+	if err := groupQ(`SELECT COALESCE(client_ip,''), COUNT(*),
+		COALESCE(SUM(CASE WHEN status_code >= 400 OR status_code = 0 THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(total_tokens),0)
+		FROM request_logs WHERE created_at >= $1 AND client_ip IS NOT NULL AND client_ip <> ''
+		GROUP BY client_ip`,
+		func(k string, r, e, t int64) {
+			stats.ByClientIP[k] = ClientIPStat{Requests: r, Errors: e, Tokens: t}
 		}); err != nil {
 		return nil, err
 	}

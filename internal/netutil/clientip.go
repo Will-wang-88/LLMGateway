@@ -51,18 +51,45 @@ func NewExtractor(trusted []string) *Extractor {
 // ClientIP returns the originating client IP as a string. Returns the
 // canonical textual form (no port). If the request has no usable address
 // it returns the empty string.
+//
+// XFF is parsed using the rightmost-untrusted algorithm: starting from
+// the last entry, skip every IP that is itself a trusted proxy; the
+// first non-trusted IP is the real client. This prevents a malicious
+// client from forging the leftmost XFF entry — even when a trusted proxy
+// is configured to append (rather than overwrite) the header.
 func (e *Extractor) ClientIP(r *http.Request) string {
 	peer := remoteIP(r.RemoteAddr)
-	if e != nil && e.isTrustedIP(peer) {
-		if ip := parseFirstForwardedFor(r.Header.Get("X-Forwarded-For")); ip != "" {
-			return ip
+	if e == nil || !e.isTrustedIP(peer) {
+		// Immediate peer is not trusted: ignore all forwarded headers.
+		return peer
+	}
+	// Build the candidate chain from XFF (left-to-right reflects the
+	// forwarding order: client, proxy1, proxy2, ...). The current peer
+	// is implicit at the right end.
+	xff := splitForwardedFor(r.Header.Get("X-Forwarded-For"))
+	// Walk right-to-left, skipping trusted IPs. The first untrusted IP
+	// is the real client.
+	for i := len(xff) - 1; i >= 0; i-- {
+		ip := xff[i]
+		if ip == "" {
+			continue
 		}
-		if ip := strings.TrimSpace(r.Header.Get("X-Real-IP")); ip != "" {
-			if parsed := net.ParseIP(ip); parsed != nil {
+		if e.isTrustedIP(ip) {
+			continue
+		}
+		return ip
+	}
+	// All XFF entries were trusted (or XFF was empty). Honor X-Real-IP
+	// only when set by the trusted hop, and only when XFF didn't supply
+	// a usable answer.
+	if real := strings.TrimSpace(r.Header.Get("X-Real-IP")); real != "" {
+		if parsed := net.ParseIP(real); parsed != nil {
+			if !e.isTrustedIP(parsed.String()) {
 				return parsed.String()
 			}
 		}
 	}
+	// Last resort: the immediate peer (trusted) itself.
 	return peer
 }
 
@@ -134,22 +161,28 @@ func remoteIP(remoteAddr string) string {
 	return remoteAddr
 }
 
-func parseFirstForwardedFor(header string) string {
+// splitForwardedFor returns a list of canonical IP strings from the
+// X-Forwarded-For header in original order (leftmost = client per
+// convention). Entries that don't parse as an IP are dropped so the
+// rightmost-untrusted scan doesn't pick up garbage.
+func splitForwardedFor(header string) []string {
 	if header == "" {
-		return ""
+		return nil
 	}
 	parts := strings.Split(header, ",")
-	first := strings.TrimSpace(parts[0])
-	if first == "" {
-		return ""
-	}
-	if ip := net.ParseIP(first); ip != nil {
-		return ip.String()
-	}
-	if host, _, err := net.SplitHostPort(first); err == nil {
-		if ip := net.ParseIP(host); ip != nil {
-			return ip.String()
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		s := strings.TrimSpace(p)
+		if s == "" {
+			continue
+		}
+		// XFF can carry "ip:port" (rare) — strip the port.
+		if host, _, err := net.SplitHostPort(s); err == nil {
+			s = host
+		}
+		if ip := net.ParseIP(s); ip != nil {
+			out = append(out, ip.String())
 		}
 	}
-	return first
+	return out
 }

@@ -78,6 +78,17 @@ func (h *Handler) WithQueue(q *queue.Manager) *Handler { h.queue = q; return h }
 // request.
 func (h *Handler) WithTracer(t *tracing.Tracer) *Handler { h.tracer = t; return h }
 
+// rawForLog returns raw only if the effective logging policy permits
+// persisting the client-original request body. All error paths must use
+// this helper before calling recordLog, otherwise log_raw_request=false
+// would still leak request bodies via gateway-side rejection logs.
+func (h *Handler) rawForLog(k *store.APIKey, raw []byte) []byte {
+	if !h.shouldLog(k, "log_raw_request") {
+		return nil
+	}
+	return raw
+}
+
 // ListModels implements GET /v1/models.
 // It returns the union of every model declared by an enabled backend, plus any
 // aliases. We do not filter by health here so clients can still see configured
@@ -96,14 +107,19 @@ func (h *Handler) ListModels(w http.ResponseWriter, r *http.Request) {
 	out := make([]modelEntry, 0)
 	now := time.Now().Unix()
 
-	add := func(name string) {
+	// addResolved adds an entry checking permission against BOTH the
+	// displayed name and (for aliases) its internal model. Without the
+	// internal-model check, /v1/models could advertise an alias whose
+	// internal model is in DeniedModels — and the user would then get a
+	// 403 only at request time.
+	addResolved := func(name, internal string) {
 		if name == "" {
 			return
 		}
 		if _, ok := seen[name]; ok {
 			return
 		}
-		if apiKey != nil && !apiKey.ModelAllowed(name) {
+		if apiKey != nil && !apiKey.ModelAllowedResolved(name, internal) {
 			return
 		}
 		seen[name] = struct{}{}
@@ -114,6 +130,7 @@ func (h *Handler) ListModels(w http.ResponseWriter, r *http.Request) {
 			OwnedBy: "llmgateway",
 		})
 	}
+	add := func(name string) { addResolved(name, name) }
 
 	// Build the explicit model registry first so we can honor model.enabled
 	// for entries that exist there. Models advertised only by a backend
@@ -145,7 +162,10 @@ func (h *Handler) ListModels(w http.ResponseWriter, r *http.Request) {
 		if r, ok := registry[a.InternalModel]; ok && !r.Enabled {
 			continue
 		}
-		add(a.Alias)
+		// Resolve the alias to its terminal internal model so a key
+		// that denies the internal model can't see the alias either.
+		internal, _ := h.store.ResolveAlias(a.Alias)
+		addResolved(a.Alias, internal)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 
@@ -191,6 +211,9 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 				code = "payload_too_large"
 				status = http.StatusRequestEntityTooLarge
 			}
+			// raw may be partial / truncated here; even if logging policy
+			// allowed raw_request, persisting a partial body is more
+			// confusing than useful, so we drop it.
 			h.recordLog(r.Context(), requestID, apiKey, clientIP, "", "", "", upstreamPath, false, status, code, nil, time.Since(started).Milliseconds(), 0, nil, nil)
 			if errors.As(err, &maxErr) {
 				proxy.WriteError(w, http.StatusRequestEntityTooLarge, proxy.APIError{
@@ -218,7 +241,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 			Stream *bool  `json:"stream"`
 		}
 		if err := json.Unmarshal(raw, &peek); err != nil {
-			h.recordLog(r.Context(), requestID, apiKey, clientIP, "", "", "", upstreamPath, false, http.StatusBadRequest, "invalid_json", nil, time.Since(started).Milliseconds(), 0, raw, nil)
+			h.recordLog(r.Context(), requestID, apiKey, clientIP, "", "", "", upstreamPath, false, http.StatusBadRequest, "invalid_json", nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil)
 			proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest(
 				"Invalid JSON: "+err.Error(),
 				"invalid_json",
@@ -226,7 +249,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 			return
 		}
 		if peek.Model == "" {
-			h.recordLog(r.Context(), requestID, apiKey, clientIP, "", "", "", upstreamPath, false, http.StatusBadRequest, "missing_model", nil, time.Since(started).Milliseconds(), 0, raw, nil)
+			h.recordLog(r.Context(), requestID, apiKey, clientIP, "", "", "", upstreamPath, false, http.StatusBadRequest, "missing_model", nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil)
 			proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest(
 				"Missing required field: model",
 				"missing_model",
@@ -242,7 +265,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 		// resolved internal model are checked so an alias cannot bypass
 		// DeniedModels.
 		if apiKey != nil && !apiKey.ModelAllowedResolved(peek.Model, internalModel) {
-			h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusForbidden, "model_not_allowed", nil, time.Since(started).Milliseconds(), 0, raw, nil)
+			h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusForbidden, "model_not_allowed", nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil)
 			proxy.WriteError(w, http.StatusForbidden, proxy.PermissionError(
 				fmt.Sprintf("The API key is not allowed to use model: %s", peek.Model),
 				"model_not_allowed",
@@ -256,7 +279,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 		// of only hiding the model from /v1/models.
 		if m, ok := h.store.Model(internalModel); ok {
 			if !m.Enabled {
-				h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusNotFound, "model_not_found", nil, time.Since(started).Milliseconds(), 0, raw, nil)
+				h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusNotFound, "model_not_found", nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil)
 				proxy.WriteError(w, http.StatusNotFound, proxy.NotFound(
 					fmt.Sprintf("Model is disabled: %s", peek.Model),
 					"model_not_found",
@@ -264,7 +287,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 				return
 			}
 			if reason := capability.Check(m.CapabilityMode, m.Capabilities, raw); reason != "" {
-				h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusBadRequest, reason, nil, time.Since(started).Milliseconds(), 0, raw, nil)
+				h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusBadRequest, reason, nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil)
 				proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest(
 					fmt.Sprintf("Model %s does not support this capability: %s", peek.Model, reason),
 					reason,
@@ -276,7 +299,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 		// Look up backends supporting this model.
 		candidates := h.store.BackendsForModel(internalModel)
 		if len(candidates) == 0 {
-			h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusNotFound, "model_not_found", nil, time.Since(started).Milliseconds(), 0, raw, nil)
+			h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusNotFound, "model_not_found", nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil)
 			proxy.WriteError(w, http.StatusNotFound, proxy.NotFound(
 				fmt.Sprintf("Unknown model: %s", peek.Model),
 				"model_not_found",
@@ -290,7 +313,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 			if isQuotaCode(code) {
 				h.metrics.QuotaHits.WithLabelValues(apiKeyID(apiKey), code).Inc()
 			}
-			h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, status, code, nil, time.Since(started).Milliseconds(), 0, raw, nil)
+			h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, status, code, nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil)
 			proxy.WriteError(w, status, proxy.RateLimit("Rejected: "+code, code))
 			return
 		}
@@ -299,7 +322,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 		// Filter for healthy + within-capacity, then pick one.
 		ready := filterRoutable(candidates, h.cfg.Routing.AllowDegradedBackends)
 		if len(ready) == 0 {
-			h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusServiceUnavailable, "no_healthy_backend", nil, time.Since(started).Milliseconds(), 0, raw, nil)
+			h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusServiceUnavailable, "no_healthy_backend", nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil)
 			proxy.WriteError(w, http.StatusServiceUnavailable, proxy.BackendUnavailable(
 				fmt.Sprintf("No healthy backend available for model: %s", peek.Model),
 				"no_healthy_backend",
@@ -631,9 +654,9 @@ func (h *Handler) recordUsage(u *proxy.Usage, model, backendID, apiKeyLabel stri
 		// Request counter is incremented unconditionally elsewhere
 		// (see Forward); attribute the token total only.
 		apiKey.AddTokens(u.TotalTokens)
-		if apiKey.RateLimit != nil && apiKey.RateLimit.TokensPerMinute > 0 {
-			h.limiter.AddTokens("tok:"+apiKey.ID, u.TotalTokens)
-		}
+		// Use the same bucket key as CheckAndReserve so token-per-minute
+		// and daily-token limits actually see this accumulation.
+		h.limiter.AddTokens("key:"+apiKey.ID, u.TotalTokens)
 	}
 	if h.quota != nil && u.TotalTokens > 0 {
 		h.quota.AddTokens(apiKeyLabel, u.TotalTokens)
