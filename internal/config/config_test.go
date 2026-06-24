@@ -46,3 +46,56 @@ func TestConfigRejectsInvalidForwardingMode(t *testing.T) {
 		t.Fatal("expected Validate to reject invalid forwarding_mode")
 	}
 }
+
+func baseOrchestrationConfig() *Config {
+	c := Default()
+	c.Backends = []BackendConfig{{ID: "b1", BaseURL: "http://b", Models: []string{"qwen3.6-27b"}}}
+	c.Orchestration = OrchestrationConfig{
+		Enabled:             true,
+		RouterModel:         "fugu-auto",
+		ConductorModel:      "fugu-ultra",
+		ConfidenceThreshold: 0.55,
+		MaxSteps:            5,
+		Workers:             []OrchestrationWorker{{ID: "qwen", Model: "qwen3.6-27b"}},
+	}
+	return c
+}
+
+func TestOrchestrationValidConfig(t *testing.T) {
+	if err := baseOrchestrationConfig().Validate(); err != nil {
+		t.Fatalf("expected valid orchestration config, got %v", err)
+	}
+}
+
+func TestOrchestrationRejectsNoWorkers(t *testing.T) {
+	c := baseOrchestrationConfig()
+	c.Orchestration.Workers = nil
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "no workers") {
+		t.Fatalf("expected no-workers error, got %v", err)
+	}
+}
+
+func TestOrchestrationRejectsTooManySteps(t *testing.T) {
+	c := baseOrchestrationConfig()
+	c.Orchestration.MaxSteps = 6
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "max_steps") {
+		t.Fatalf("expected max_steps error, got %v", err)
+	}
+}
+
+func TestOrchestrationRejectsSameVirtualModel(t *testing.T) {
+	c := baseOrchestrationConfig()
+	c.Orchestration.ConductorModel = c.Orchestration.RouterModel
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "must differ") {
+		t.Fatalf("expected differ error, got %v", err)
+	}
+}
+
+func TestOrchestrationDisabledSkipsValidation(t *testing.T) {
+	c := Default() // Orchestration.Enabled defaults false
+	c.Orchestration.MaxSteps = 99
+	c.Orchestration.Workers = nil
+	if err := c.Validate(); err != nil {
+		t.Fatalf("disabled orchestration should not validate, got %v", err)
+	}
+}

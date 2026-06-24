@@ -20,6 +20,7 @@ import (
 	"github.com/will-wang-88/llmgateway/internal/logging"
 	"github.com/will-wang-88/llmgateway/internal/logstore"
 	"github.com/will-wang-88/llmgateway/internal/metrics"
+	"github.com/will-wang-88/llmgateway/internal/orchestrator"
 	"github.com/will-wang-88/llmgateway/internal/proxy"
 	"github.com/will-wang-88/llmgateway/internal/queue"
 	"github.com/will-wang-88/llmgateway/internal/quota"
@@ -29,18 +30,19 @@ import (
 )
 
 type Handler struct {
-	cfg         *config.Config
-	store       *store.Store
-	proxy       *proxy.Proxy
-	balancer    *balancer.Balancer
-	limiter     ratelimit.Backend
-	concurrency *ratelimit.Concurrency
-	logger      *logging.Logger
-	metrics     *metrics.Metrics
-	logstore    logstore.Store
-	quota       *quota.Manager
-	queue       *queue.Manager
-	tracer      *tracing.Tracer
+	cfg          *config.Config
+	store        *store.Store
+	proxy        *proxy.Proxy
+	balancer     *balancer.Balancer
+	limiter      ratelimit.Backend
+	concurrency  *ratelimit.Concurrency
+	logger       *logging.Logger
+	metrics      *metrics.Metrics
+	logstore     logstore.Store
+	quota        *quota.Manager
+	queue        *queue.Manager
+	tracer       *tracing.Tracer
+	orchestrator *orchestrator.Orchestrator
 }
 
 func New(
@@ -167,6 +169,12 @@ func (h *Handler) ListModels(w http.ResponseWriter, r *http.Request) {
 		internal, _ := h.store.ResolveAlias(a.Alias)
 		addResolved(a.Alias, internal)
 	}
+	// Orchestration virtual models (Tier-A router / Tier-B conductor).
+	if h.orchestrator != nil {
+		for _, vm := range h.orchestrator.VirtualModels() {
+			add(vm)
+		}
+	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 
 	resp := map[string]any{
@@ -270,6 +278,21 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 				fmt.Sprintf("The API key is not allowed to use model: %s", peek.Model),
 				"model_not_allowed",
 			))
+			return
+		}
+
+		// Orchestration: if the resolved model is one of the Fugu-style
+		// virtual models, hand the whole request to the orchestrator,
+		// which fans out to the worker pool. This must run before the
+		// registry / capability / backend checks below, because a virtual
+		// model has no backends of its own.
+		if h.orchestrator != nil && h.orchestrator.Handles(internalModel) {
+			if span != nil {
+				span.Attributes["model"] = peek.Model
+				span.Attributes["internal_model"] = internalModel
+				span.Attributes["orchestration"] = true
+			}
+			h.serveOrchestration(w, r, requestID, started, apiKey, clientIP, internalModel, isStream, raw)
 			return
 		}
 
@@ -886,4 +909,3 @@ func isQuotaCode(code string) bool {
 	}
 	return false
 }
-

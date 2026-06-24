@@ -225,6 +225,7 @@ internal/auth/       API key middleware
 internal/backend/    health checker
 internal/balancer/   load-balancing policies
 internal/proxy/      request and SSE passthrough
+internal/orchestrator/ Fugu-style Tier-A router + Tier-B conductor
 internal/ratelimit/  in-memory rate and concurrency limiters
 internal/handlers/   /v1/* request handlers
 internal/admin/      /admin/* admin API
@@ -318,6 +319,131 @@ Every mutating admin action emits an entry to the `audit_logs` table:
 - `hash` - hash of API key id -> deterministic backend
 - `sticky` - first request from an API key pins to one backend for the model
 
+## Fugu-style model orchestration
+
+The gateway can act as a **behaviour-level model orchestrator** (à la Sakana
+Fugu): a single OpenAI-compatible endpoint that, at inference time, decides
+which self-hosted worker model should answer a request — or decomposes a hard
+request across several. **No model weights are merged.** The pool is
+architecturally heterogeneous (e.g. an MoE model plus dense models with
+different tokenizers), so weight merges (SLERP/TIES/DARE) are impossible;
+each model is treated as a black box behind its own OpenAI-compatible
+endpoint and reached over HTTP.
+
+Two tiers are exposed as ordinary virtual models, so clients keep calling one
+endpoint:
+
+- **Tier-A router** (`router_model`, e.g. `fugu-auto`) — low latency. A
+  rule-based classifier inspects the request, classifies the task
+  (`code` / `reasoning` / `zh` / `general`), and dispatches to the single
+  best-suited worker. When classifier confidence is below
+  `confidence_threshold`, the request escalates to Tier-B (or, if no
+  conductor is configured, to the strongest eligible worker).
+- **Tier-B conductor** (`conductor_model`, e.g. `fugu-ultra`) — higher
+  quality. A bounded (`max_steps` ≤ 5) DAG decomposes the task across workers
+  in **Thinker → Worker → Verifier → Synthesizer** roles. The verifier is
+  forced to a **different model** than the producer (heterogeneous
+  cross-check), and per-step **access lists** gate which prior outputs each
+  worker can see.
+
+### Configuration
+
+```yaml
+orchestration:
+  enabled: true
+  router_model: fugu-auto
+  conductor_model: fugu-ultra     # omit to disable Tier-B
+  confidence_threshold: 0.55      # below this, Tier-A escalates
+  max_steps: 5                    # hard cap on Tier-B worker calls (≤5)
+  cost_penalty: 0.0               # effective_score = strength - cost_penalty*cost
+  request_timeout_ms: 120000
+  secret_level_header: X-Secret-Level
+  workers:
+    - id: qwen
+      model: qwen3.6-27b          # an internal model that resolves to backends
+      tasks: [code, zh, verify]
+      strength: 0.82
+      cost: 2
+      secret_max_level: 0         # 0 = unlimited (on-prem); set low for cloud workers
+    - id: gptoss
+      model: gpt-oss-120b
+      tasks: [reasoning, verify]
+      strength: 0.90
+      cost: 5
+    - id: gemma
+      model: gemma-4-26b
+      tasks: [general]
+      strength: 0.70
+      cost: 1
+```
+
+Each worker's `model` must be a normal internal model that resolves to one or
+more backends — worker dispatch reuses the same health, capacity and
+load-balancing machinery as the main request path. The virtual models also
+appear in `GET /v1/models` and are subject to the same API-key permissions,
+rate limits, quotas, and per-model queue as any other model.
+
+### Data governance (access list)
+
+Requests may carry a data-sensitivity level via the `secret_level_header`
+header (or a top-level `secret_level` field in the body). A worker is
+eligible only if its `secret_max_level` admits that level (`0` =
+unlimited). Because the reference pool is fully self-hosted, all workers set
+`secret_max_level: 0` and the constraint is a no-op; if a cloud worker is
+added later, give it a low `secret_max_level` so sensitive data never routes
+to it.
+
+### Response
+
+Responses are standard `chat.completion` objects with an extra
+`x_orchestration` field describing the decision:
+
+```json
+"x_orchestration": {
+  "tier": "conductor",
+  "task": "code",
+  "confidence": 0.44,
+  "escalated": true,
+  "route": [
+    {"step":1,"role":"thinker","worker":"gptoss","model":"gpt-oss-120b","backend":"gpu-fugu-gptoss","latency_ms":820},
+    {"step":2,"role":"worker","worker":"qwen","model":"qwen3.6-27b","backend":"gpu-fugu-qwen","latency_ms":1310},
+    {"step":3,"role":"verifier","worker":"gptoss","model":"gpt-oss-120b","backend":"gpu-fugu-gptoss","latency_ms":640},
+    {"step":4,"role":"synthesizer","worker":"qwen","model":"qwen3.6-27b","backend":"gpu-fugu-qwen","latency_ms":900}
+  ]
+}
+```
+
+Streaming (`stream: true`) is supported: the orchestrated answer is produced
+whole and delivered as a single SSE content chunk plus `[DONE]`, so OpenAI
+streaming clients work unchanged.
+
+### Metrics
+
+- `llmgw_orchestration_routes_total{tier,worker,task,outcome}`
+- `llmgw_orchestration_escalations_total{reason}`
+- `llmgw_orchestration_steps_total{role,worker}`
+
+### Relationship to the full Fugu design (roadmap)
+
+This is the **rule-based MVP** from the spec's landing path: a deterministic
+classifier and a deterministic TRINITY DAG. The learned components described
+in the spec are model-training work that lives outside this Go gateway and is
+intended to *replace the rule layer in place* without changing the client
+contract:
+
+1. **Tier-A learned router** — a tiny bias-free selection head on a small
+   backbone, warm-started with SFT then optimised gradient-free
+   (sep-CMA-ES) against end-to-end terminal reward. Drops in behind the same
+   `router_model` virtual model.
+2. **Tier-B learned conductor** — a small LM trained with RL (PPO/GRPO) to
+   author the ≤5-step workflow, with a cost-penalty reward term so it
+   doesn't over-use expensive workers.
+
+Until those are trained, set sensible `tasks`/`strength`/`cost` priors and
+tune `confidence_threshold` and `cost_penalty`. See
+[`docs/orchestration.md`](docs/orchestration.md) for the full design and
+training plan.
+
 ## Audio endpoints
 
 `/v1/audio/transcriptions`, `/v1/audio/translations` and `/v1/audio/speech` are
@@ -387,6 +513,7 @@ helm install llmgateway ./deploy/helm/llmgateway \
 | Docker (Go 1.25), `--healthcheck` flag, compose healthcheck via /healthz | implemented |
 | Web dashboard: backends / models / api-keys (CRUD + rotate + IP lists) / logs filters / analytics / audit / users / settings | implemented |
 | Helm chart with PVC + ServiceMonitor + HPA | implemented (replicaCount=1 unless postgres+redis) |
+| Fugu-style orchestration: Tier-A rule router + Tier-B conductor DAG, access-list governance, virtual models | implemented (rule-based MVP; learned router/conductor on roadmap) |
 
 ## Roadmap
 
@@ -395,3 +522,4 @@ helm install llmgateway ./deploy/helm/llmgateway \
 - Streaming raw-response capture into the persistent log
 - Per-tenant analytics with retention tiers
 - Completion-style health probe (lightweight `/v1/chat/completions` test)
+- Learned Tier-A selection head (SFT + sep-CMA-ES) and RL-trained Tier-B conductor (see [`docs/orchestration.md`](docs/orchestration.md))
