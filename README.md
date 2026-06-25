@@ -414,8 +414,15 @@ Responses are standard `chat.completion` objects with an extra
 ```
 
 Streaming (`stream: true`) is supported: the orchestrated answer is produced
-whole and delivered as a single SSE content chunk plus `[DONE]`, so OpenAI
-streaming clients work unchanged.
+whole and delivered as a content chunk followed by a terminating chunk that
+carries `usage` and `x_orchestration` (so streaming and non-streaming expose
+the same metadata) plus `[DONE]`, so OpenAI streaming clients work unchanged.
+
+Virtual model names are validated at startup against the real catalog (a
+name collision is rejected rather than silently shadowing a real model), and
+worker dispatch honors the model registry kill-switch, the
+`allow_degraded_backends` routing flag, and per-backend timeouts — the same
+rules as the direct path.
 
 ### Metrics
 

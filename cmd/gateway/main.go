@@ -222,6 +222,7 @@ func main() {
 		WithTracer(tr)
 	if cfg.Orchestration.Enabled {
 		orch := orchestrator.New(cfg.Orchestration, s, bal, logger).
+			WithRouting(cfg.Routing.AllowDegradedBackends).
 			WithMetrics(handlers.OrchestratorMetricsSink(m))
 		h = h.WithOrchestrator(orch)
 		logger.Info("orchestration enabled", logging.F(

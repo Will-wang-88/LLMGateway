@@ -243,10 +243,12 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 			return
 		}
 
-		// Decode just enough to find "model" and "stream"; preserve every other field.
+		// Decode just enough to find "model", "stream" and the optional
+		// orchestration "secret_level"; preserve every other field.
 		var peek struct {
-			Model  string `json:"model"`
-			Stream *bool  `json:"stream"`
+			Model       string `json:"model"`
+			Stream      *bool  `json:"stream"`
+			SecretLevel *int   `json:"secret_level"`
 		}
 		if err := json.Unmarshal(raw, &peek); err != nil {
 			h.recordLog(r.Context(), requestID, apiKey, clientIP, "", "", "", upstreamPath, false, http.StatusBadRequest, "invalid_json", nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil)
@@ -287,12 +289,28 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 		// registry / capability / backend checks below, because a virtual
 		// model has no backends of its own.
 		if h.orchestrator != nil && h.orchestrator.Handles(internalModel) {
+			// Honor a capability descriptor declared on the virtual model
+			// (e.g. vision=false) before fanning out — the conductor
+			// flattens content to text, so capabilities the pool can't
+			// satisfy should be rejected up front rather than silently
+			// dropped.
+			if m, ok := h.store.Model(internalModel); ok {
+				if reason := capability.Check(m.CapabilityMode, m.Capabilities, raw); reason != "" {
+					h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusBadRequest, reason, nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil)
+					proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest(
+						fmt.Sprintf("Model %s does not support this capability: %s", peek.Model, reason),
+						reason,
+					))
+					return
+				}
+			}
 			if span != nil {
 				span.Attributes["model"] = peek.Model
 				span.Attributes["internal_model"] = internalModel
 				span.Attributes["orchestration"] = true
 			}
-			h.serveOrchestration(w, r, requestID, started, apiKey, clientIP, internalModel, isStream, raw)
+			secretLevel := h.secretLevel(r, peek.SecretLevel)
+			h.serveOrchestration(w, r, requestID, started, apiKey, clientIP, internalModel, isStream, raw, secretLevel)
 			return
 		}
 
@@ -827,41 +845,11 @@ func (h *Handler) shouldLog(k *store.APIKey, field string) bool {
 	return def
 }
 
-// filterRoutable returns backends that are admissible for routing.
-//
-// Routable states: healthy, unknown (just-started). Degraded is routable
-// only when allowDegraded is true (off by default), because the health
-// probe has already observed a 4xx from the backend - sending real
-// traffic to it would surface the same failure to the client.
-// Excluded states: disabled, unhealthy, maintenance.
-// Excluded: backends at max concurrency.
-// Excluded: backends with weight 0 (drain mode).
+// filterRoutable returns backends admissible for routing. It delegates to
+// store.FilterRoutable so the main path and the orchestrator share one
+// definition of "routable" (see store.FilterRoutable for the rules).
 func filterRoutable(in []*store.Backend, allowDegraded bool) []*store.Backend {
-	out := make([]*store.Backend, 0, len(in))
-	for _, b := range in {
-		if !b.Enabled {
-			continue
-		}
-		switch b.Status() {
-		case store.StatusHealthy, store.StatusUnknown:
-			// admissible
-		case store.StatusDegraded:
-			if !allowDegraded {
-				continue
-			}
-		default:
-			continue
-		}
-		if b.Weight == 0 {
-			// 0 weight is interpreted as "drain": registered but no new traffic.
-			continue
-		}
-		if b.MaxConcurrentRequests > 0 && b.ActiveRequests() >= int64(b.MaxConcurrentRequests) {
-			continue
-		}
-		out = append(out, b)
-	}
-	return out
+	return store.FilterRoutable(in, allowDegraded)
 }
 
 // rewriteModelInBody replaces the top-level "model" field with the new name,

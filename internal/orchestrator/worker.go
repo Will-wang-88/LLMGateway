@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -69,12 +71,21 @@ type chatResponse struct {
 // assistant text plus usage. It enforces the worker's concurrency slot and
 // the configured per-call timeout.
 func (o *Orchestrator) callWorker(ctx context.Context, w *config.OrchestrationWorker, msgs []chatMessage, p genParams) (*completion, error) {
-	be, err := o.pickBackend(w.Model)
-	if err != nil {
-		return nil, err
+	// Acquire a concurrency slot, re-picking if we lose the race for the
+	// chosen backend (mirrors the direct path's retry in handlers.Forward).
+	var be *store.Backend
+	for attempts := 0; attempts < 3; attempts++ {
+		picked, err := o.pickBackend(w.Model)
+		if err != nil {
+			return nil, err
+		}
+		if picked.AcquireSlot() {
+			be = picked
+			break
+		}
 	}
-	if !be.AcquireSlot() {
-		return nil, fmt.Errorf("worker %s: backend %s at capacity", w.ID, be.ID)
+	if be == nil {
+		return nil, fmt.Errorf("worker %s: all backends for model %q at capacity", w.ID, w.Model)
 	}
 
 	body, _ := json.Marshal(chatRequest{
@@ -86,8 +97,12 @@ func (o *Orchestrator) callWorker(ctx context.Context, w *config.OrchestrationWo
 		MaxTokens:   p.MaxTokens,
 	})
 
+	// Per-call timeout: the backend's own TimeoutMS is authoritative when
+	// set (matching the direct proxy path), otherwise the orchestration
+	// default applies. This lets a slow MoE worker be given more time than
+	// the global default, not only less.
 	timeout := time.Duration(o.cfg.RequestTimeoutMS) * time.Millisecond
-	if be.TimeoutMS > 0 && time.Duration(be.TimeoutMS)*time.Millisecond < timeout {
+	if be.TimeoutMS > 0 {
 		timeout = time.Duration(be.TimeoutMS) * time.Millisecond
 	}
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -110,27 +125,39 @@ func (o *Orchestrator) callWorker(ctx context.Context, w *config.OrchestrationWo
 	resp, err := o.client.Do(req)
 	if err != nil {
 		be.ReleaseSlot(false)
+		if errors.Is(err, context.DeadlineExceeded) {
+			o.incTimeout(be.ID, "backend")
+			return nil, fmt.Errorf("worker %s: backend %s timed out: %w", w.ID, be.ID, err)
+		}
+		o.incBackendError(be.ID, "unreachable")
 		return nil, fmt.Errorf("worker %s: backend %s unreachable: %w", w.ID, be.ID, err)
 	}
 	defer resp.Body.Close()
 
-	var parsed chatResponse
-	dec := json.NewDecoder(resp.Body)
-	if err := dec.Decode(&parsed); err != nil {
-		be.ReleaseSlot(false)
-		return nil, fmt.Errorf("worker %s: decode backend response: %w", w.ID, err)
-	}
+	respBody, _ := io.ReadAll(resp.Body)
 	success := resp.StatusCode >= 200 && resp.StatusCode < 300
 	be.ReleaseSlot(success)
 
+	// Status is checked before parsing so a non-JSON error page (e.g. a 503
+	// HTML body from a fronting proxy) surfaces the real status instead of a
+	// misleading "decode failed".
 	if !success {
+		o.incBackendError(be.ID, statusLabel(resp.StatusCode))
 		msg := fmt.Sprintf("status %d", resp.StatusCode)
-		if parsed.Error != nil && parsed.Error.Message != "" {
-			msg = parsed.Error.Message
+		var errEnv chatResponse
+		if json.Unmarshal(respBody, &errEnv) == nil && errEnv.Error != nil && errEnv.Error.Message != "" {
+			msg = errEnv.Error.Message
 		}
 		return nil, fmt.Errorf("worker %s: backend %s error: %s", w.ID, be.ID, msg)
 	}
+
+	var parsed chatResponse
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
+		o.incBackendError(be.ID, "decode")
+		return nil, fmt.Errorf("worker %s: decode backend response: %w", w.ID, err)
+	}
 	if len(parsed.Choices) == 0 {
+		o.incBackendError(be.ID, "empty_response")
 		return nil, fmt.Errorf("worker %s: backend %s returned no choices", w.ID, be.ID)
 	}
 
@@ -148,27 +175,15 @@ func (o *Orchestrator) callWorker(ctx context.Context, w *config.OrchestrationWo
 }
 
 // pickBackend selects one routable backend for an internal model name using
-// the same health/capacity rules as the main request path.
+// the same routability rules as the direct path (store.FilterRoutable,
+// honoring allow_degraded), and refuses models disabled in the registry so
+// the admin kill-switch also covers orchestrated traffic.
 func (o *Orchestrator) pickBackend(model string) (*store.Backend, error) {
-	candidates := o.store.BackendsForModel(model)
-	ready := make([]*store.Backend, 0, len(candidates))
-	for _, b := range candidates {
-		if !b.Enabled {
-			continue
-		}
-		switch b.Status() {
-		case store.StatusHealthy, store.StatusUnknown:
-		default:
-			continue
-		}
-		if b.Weight == 0 {
-			continue
-		}
-		if b.MaxConcurrentRequests > 0 && b.ActiveRequests() >= int64(b.MaxConcurrentRequests) {
-			continue
-		}
-		ready = append(ready, b)
+	if m, ok := o.store.Model(model); ok && !m.Enabled {
+		return nil, fmt.Errorf("worker model %q is disabled", model)
 	}
+	candidates := o.store.BackendsForModel(model)
+	ready := store.FilterRoutable(candidates, o.allowDegraded)
 	if len(ready) == 0 {
 		return nil, fmt.Errorf("no healthy backend for worker model %q", model)
 	}
@@ -177,4 +192,11 @@ func (o *Orchestrator) pickBackend(model string) (*store.Backend, error) {
 		return nil, fmt.Errorf("no healthy backend for worker model %q", model)
 	}
 	return picked, nil
+}
+
+func statusLabel(code int) string {
+	if code <= 0 {
+		return "unknown"
+	}
+	return fmt.Sprintf("%d", code)
 }

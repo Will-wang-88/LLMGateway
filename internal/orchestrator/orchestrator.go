@@ -26,10 +26,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/will-wang-88/llmgateway/internal/balancer"
 	"github.com/will-wang-88/llmgateway/internal/config"
@@ -44,46 +42,48 @@ type MetricsSink interface {
 	IncRoute(tier, worker, task, outcome string)
 	IncEscalation(reason string)
 	IncStep(role, worker string)
+	// IncBackendError / IncTimeout mirror the direct path's per-backend
+	// error and timeout counters so worker-pool failures are visible on the
+	// same dashboards/alerts as normal backend traffic.
+	IncBackendError(backend, code string)
+	IncTimeout(backend, kind string)
 }
 
 // Orchestrator coordinates the worker pool. It reuses the shared store and
 // balancer so worker selection honors the same health/capacity rules as the
 // main request path.
 type Orchestrator struct {
-	cfg      config.OrchestrationConfig
-	store    *store.Store
-	balancer *balancer.Balancer
-	logger   *logging.Logger
-	metrics  MetricsSink
-	client   *http.Client
+	cfg           config.OrchestrationConfig
+	store         *store.Store
+	balancer      *balancer.Balancer
+	logger        *logging.Logger
+	metrics       MetricsSink
+	client        *http.Client
+	allowDegraded bool
 }
 
 // New constructs an Orchestrator. cfg is assumed already validated by
 // config.Validate.
 func New(cfg config.OrchestrationConfig, s *store.Store, b *balancer.Balancer, log *logging.Logger) *Orchestrator {
-	transport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   20,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		DisableCompression:    true,
-		ResponseHeaderTimeout: 60 * time.Second,
-	}
 	return &Orchestrator{
 		cfg:      cfg,
 		store:    s,
 		balancer: b,
 		logger:   log,
-		client:   &http.Client{Transport: transport},
+		client:   &http.Client{Transport: proxy.DefaultTransport()},
 	}
 }
 
 // WithMetrics attaches a metrics sink.
 func (o *Orchestrator) WithMetrics(m MetricsSink) *Orchestrator { o.metrics = m; return o }
+
+// WithRouting copies the relevant gateway routing defaults so the
+// orchestrator's worker dispatch agrees with the direct path (notably
+// whether degraded backends are routable).
+func (o *Orchestrator) WithRouting(allowDegraded bool) *Orchestrator {
+	o.allowDegraded = allowDegraded
+	return o
+}
 
 // Handles reports whether the given model name is one of the virtual models
 // this orchestrator owns.
@@ -199,6 +199,11 @@ func (o *Orchestrator) single(ctx context.Context, w *config.OrchestrationWorker
 // the request only if its SecretMaxLevel admits the request's secret level.
 // SecretMaxLevel 0 means "unlimited" (an on-prem worker).
 func (o *Orchestrator) eligibleWorkers(secretLevel int) []*config.OrchestrationWorker {
+	// A negative (or junk-parsed) level must never widen eligibility: clamp
+	// to 0 so an out-of-range header can't defeat the access list.
+	if secretLevel < 0 {
+		secretLevel = 0
+	}
 	out := make([]*config.OrchestrationWorker, 0, len(o.cfg.Workers))
 	for i := range o.cfg.Workers {
 		w := &o.cfg.Workers[i]
@@ -263,6 +268,18 @@ func (o *Orchestrator) incEscalation(reason string) {
 func (o *Orchestrator) incStep(role, worker string) {
 	if o.metrics != nil {
 		o.metrics.IncStep(role, worker)
+	}
+}
+
+func (o *Orchestrator) incBackendError(backend, code string) {
+	if o.metrics != nil {
+		o.metrics.IncBackendError(backend, code)
+	}
+}
+
+func (o *Orchestrator) incTimeout(backend, kind string) {
+	if o.metrics != nil {
+		o.metrics.IncTimeout(backend, kind)
 	}
 }
 

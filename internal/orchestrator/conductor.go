@@ -28,11 +28,15 @@ func (o *Orchestrator) runConductor(ctx context.Context, base []chatMessage, par
 	}
 
 	// Decide which optional stages fit the budget. The solver (draft) is
-	// mandatory; verifier and synthesizer are added as budget allows, and
-	// the thinker is added last because it is the most optional.
-	doVerifier := budget >= 2
+	// mandatory. Verifier and synthesizer are a PAIR: a critique is only
+	// worth producing if a synthesizer step can consume it, so they share
+	// one gate (budget>=3) — never run the verifier just to discard its
+	// output. The thinker is the most optional stage; it is added at the
+	// top end (budget>=4), and also at budget==2 where it is the single
+	// useful extra step that fits.
 	doSynth := budget >= 3
-	doThinker := budget >= 4
+	doVerifier := doSynth
+	doThinker := budget >= 4 || budget == 2
 
 	res := &Result{Tier: "conductor", Task: cls.Task, Confidence: cls.Confidence, Escalated: escalated}
 	stepNo := 0
@@ -65,7 +69,9 @@ func (o *Orchestrator) runConductor(ctx context.Context, base []chatMessage, par
 		c, err := o.callWorker(ctx, thinker, msgs, plannerParams(params))
 		if err != nil {
 			o.incRoute("conductor", thinker.ID, cls.Task, "error")
-			return nil, fmt.Errorf("conductor thinker step: %w", err)
+			// Return res (not nil) so partial usage from prior steps is
+			// still charged to the caller's quota.
+			return res, fmt.Errorf("conductor thinker step: %w", err)
 		}
 		plan = c.Text
 		addStep(roleThinker, c)
@@ -80,7 +86,7 @@ func (o *Orchestrator) runConductor(ctx context.Context, base []chatMessage, par
 	draftC, err := o.callWorker(ctx, solver, draftMsgs, params)
 	if err != nil {
 		o.incRoute("conductor", solver.ID, cls.Task, "error")
-		return nil, fmt.Errorf("conductor worker step: %w", err)
+		return res, fmt.Errorf("conductor worker step: %w", err)
 	}
 	draft := draftC.Text
 	addStep(roleWorker, draftC)

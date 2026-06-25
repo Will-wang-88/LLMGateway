@@ -425,6 +425,53 @@ func (c *Config) Validate() error {
 	if err := c.Orchestration.validate(); err != nil {
 		return err
 	}
+	if err := c.validateOrchestrationRefs(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateOrchestrationRefs cross-checks the orchestration config against the
+// rest of the catalog: a virtual model name must not collide with a real
+// model / alias / backend-advertised model (else it would silently shadow
+// it via the Handles() early-return in the request path), and every worker
+// model must resolve to at least one backend.
+func (c *Config) validateOrchestrationRefs() error {
+	o := &c.Orchestration
+	if !o.Enabled {
+		return nil
+	}
+	realModels := make(map[string]struct{})
+	for _, m := range c.Models {
+		realModels[m.Name] = struct{}{}
+	}
+	for _, a := range c.ModelAliases {
+		realModels[a.Alias] = struct{}{}
+	}
+	backendModels := make(map[string]struct{})
+	for _, b := range c.Backends {
+		for _, m := range b.Models {
+			backendModels[m] = struct{}{}
+			realModels[m] = struct{}{}
+		}
+	}
+	for _, vm := range []struct{ kind, name string }{
+		{"router_model", o.RouterModel},
+		{"conductor_model", o.ConductorModel},
+	} {
+		if vm.name == "" {
+			continue
+		}
+		if _, clash := realModels[vm.name]; clash {
+			return fmt.Errorf("orchestration %s %q collides with a real model/alias/backend model; pick a distinct virtual name", vm.kind, vm.name)
+		}
+	}
+	for i := range o.Workers {
+		w := &o.Workers[i]
+		if _, ok := backendModels[w.Model]; !ok {
+			return fmt.Errorf("orchestration worker %s references model %q that no backend serves", w.ID, w.Model)
+		}
+	}
 	return nil
 }
 

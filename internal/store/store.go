@@ -214,8 +214,8 @@ type APIKey struct {
 	Logging          *config.APIKeyLogging
 	ExpiresAt        time.Time
 
-	mu          sync.RWMutex
-	lastUsedAt  time.Time
+	mu            sync.RWMutex
+	lastUsedAt    time.Time
 	totalRequests int64
 	totalTokens   int64
 }
@@ -521,6 +521,46 @@ func (s *Store) BackendsForModel(model string) []*Backend {
 		if b.SupportsModel(model) {
 			out = append(out, b)
 		}
+	}
+	return out
+}
+
+// FilterRoutable returns the subset of backends admissible for routing.
+//
+// Routable states: healthy, unknown (just-started). Degraded is routable
+// only when allowDegraded is true (off by default), because the health
+// probe has already observed a 4xx from the backend - sending real traffic
+// to it would surface the same failure to the client.
+// Excluded states: disabled, unhealthy, maintenance.
+// Excluded: backends at max concurrency.
+// Excluded: backends with weight 0 (drain mode).
+//
+// This is the single definition of "routable" shared by the direct proxy
+// path and the orchestrator's worker dispatch.
+func FilterRoutable(in []*Backend, allowDegraded bool) []*Backend {
+	out := make([]*Backend, 0, len(in))
+	for _, b := range in {
+		if !b.Enabled {
+			continue
+		}
+		switch b.Status() {
+		case StatusHealthy, StatusUnknown:
+			// admissible
+		case StatusDegraded:
+			if !allowDegraded {
+				continue
+			}
+		default:
+			continue
+		}
+		if b.Weight == 0 {
+			// 0 weight is interpreted as "drain": registered but no new traffic.
+			continue
+		}
+		if b.MaxConcurrentRequests > 0 && b.ActiveRequests() >= int64(b.MaxConcurrentRequests) {
+			continue
+		}
+		out = append(out, b)
 	}
 	return out
 }

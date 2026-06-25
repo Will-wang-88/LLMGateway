@@ -41,6 +41,13 @@ func newTestOrchestrator(t *testing.T, oc config.OrchestrationConfig) (*Orchestr
 
 type recordingServer struct {
 	models []string // models seen, in order
+	// failAfter, when > 0, makes the server return HTTP 500 for the
+	// (failAfter+1)-th request onward, so tests can fail a later
+	// conductor step while earlier steps succeed.
+	failAfter int
+	// omitUsage, when true, returns a successful completion without a
+	// usage block (mimics backends that don't report usage).
+	omitUsage bool
 }
 
 func (s *recordingServer) handle(w http.ResponseWriter, r *http.Request) {
@@ -50,12 +57,19 @@ func (s *recordingServer) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.Unmarshal(body, &req)
 	s.models = append(s.models, req.Model)
+	if s.failAfter > 0 && len(s.models) > s.failAfter {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"message":"boom"}}`))
+		return
+	}
 	resp := map[string]any{
 		"choices": []map[string]any{{
 			"message":       map[string]string{"role": "assistant", "content": "answer from " + req.Model},
 			"finish_reason": "stop",
 		}},
-		"usage": map[string]int{"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+	}
+	if !s.omitUsage {
+		resp["usage"] = map[string]int{"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
@@ -254,5 +268,103 @@ func TestHandlesAndVirtualModels(t *testing.T) {
 	vm := o.VirtualModels()
 	if len(vm) != 2 {
 		t.Fatalf("expected 2 virtual models, got %v", vm)
+	}
+}
+
+func TestConductorVerifierPairedWithSynth(t *testing.T) {
+	// max_steps=2 must NOT run a verifier (its critique can't be consumed
+	// without a synthesizer step) — no wasted worker call.
+	oc := baseConfig()
+	oc.MaxSteps = 2
+	o, srv := newTestOrchestrator(t, oc)
+	res, err := o.Handle(context.Background(), "fugu-ultra", chatBody("write a function"), 0)
+	if err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	for _, s := range res.Steps {
+		if s.Role == roleVerifier {
+			t.Fatalf("verifier ran under max_steps=2 but its output is discarded: %+v", res.Steps)
+		}
+	}
+	if len(srv.models) > 2 {
+		t.Fatalf("expected <=2 backend calls for max_steps=2, got %d", len(srv.models))
+	}
+}
+
+func TestConductorPartialUsageOnError(t *testing.T) {
+	o, srv := newTestOrchestrator(t, baseConfig())
+	srv.failAfter = 1 // first step (thinker) ok, second (worker) 500s
+	res, err := o.Handle(context.Background(), "fugu-ultra", chatBody("write a function"), 0)
+	if err == nil {
+		t.Fatalf("expected an error when a conductor step fails")
+	}
+	if res == nil {
+		t.Fatalf("expected partial result (non-nil) so consumed tokens can be charged")
+	}
+	if res.Usage.TotalTokens != 15 {
+		t.Fatalf("expected partial usage of 15 (thinker step), got %d", res.Usage.TotalTokens)
+	}
+}
+
+func TestSecretLevelNegativeClamped(t *testing.T) {
+	oc := baseConfig()
+	for i := range oc.Workers {
+		if oc.Workers[i].ID == "gemma" {
+			oc.Workers[i].SecretMaxLevel = 1
+		}
+	}
+	o, _ := newTestOrchestrator(t, oc)
+	// A negative level must not widen eligibility beyond level 0.
+	if got := len(o.eligibleWorkers(-1)); got != 3 {
+		t.Fatalf("negative secret level should clamp to 0 (all 3 eligible), got %d", got)
+	}
+}
+
+func TestWorkerModelDisabledKillSwitch(t *testing.T) {
+	o, _ := newTestOrchestrator(t, baseConfig())
+	// Operator disables the coding worker's model in the registry.
+	o.store.UpsertModel(&store.Model{Name: "qwen3.6-27b", Enabled: false})
+	_, err := o.Handle(context.Background(), "fugu-auto", chatBody("write a python function and fix the bug"), 0)
+	if err == nil {
+		t.Fatalf("expected error: disabled worker model must not receive orchestrated traffic")
+	}
+	if !strings.Contains(err.Error(), "disabled") {
+		t.Fatalf("expected 'disabled' in error, got %v", err)
+	}
+}
+
+func TestWorkerUsesBackendTimeoutWhenLarger(t *testing.T) {
+	// Regression: per-call timeout must honor a backend TimeoutMS larger
+	// than the global default, not only shrink it.
+	oc := baseConfig()
+	oc.RequestTimeoutMS = 50 // tiny global
+	o, srv := newTestOrchestrator(t, oc)
+	// Bump the backends' timeout well above the global; pickBackend should
+	// then use the backend value so a normal call still succeeds.
+	for _, b := range o.store.Backends() {
+		b.TimeoutMS = 5000
+	}
+	_ = srv
+	res, err := o.Handle(context.Background(), "fugu-auto", chatBody("hello"), 0)
+	if err != nil {
+		t.Fatalf("call should succeed using backend timeout: %v", err)
+	}
+	if res.Content == "" {
+		t.Fatalf("expected content")
+	}
+}
+
+func TestWorkerOmittedUsageYieldsZero(t *testing.T) {
+	// When a worker omits the usage block, the orchestrator reports zero
+	// tokens (it does not fabricate counts); the handler is responsible for
+	// the conservative estimate fallback that keeps quotas charged.
+	o, srv := newTestOrchestrator(t, baseConfig())
+	srv.omitUsage = true
+	res, err := o.Handle(context.Background(), "fugu-auto", chatBody("hello there"), 0)
+	if err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	if res.Usage.TotalTokens != 0 {
+		t.Fatalf("expected zero usage when worker omits it, got %d", res.Usage.TotalTokens)
 	}
 }

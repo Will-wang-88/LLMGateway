@@ -99,3 +99,20 @@ func TestOrchestrationDisabledSkipsValidation(t *testing.T) {
 		t.Fatalf("disabled orchestration should not validate, got %v", err)
 	}
 }
+
+func TestOrchestrationRejectsVirtualModelCollision(t *testing.T) {
+	c := baseOrchestrationConfig()
+	// router_model collides with the worker's real backend model name.
+	c.Orchestration.RouterModel = "qwen3.6-27b"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "collides") {
+		t.Fatalf("expected collision error, got %v", err)
+	}
+}
+
+func TestOrchestrationRejectsUnservedWorkerModel(t *testing.T) {
+	c := baseOrchestrationConfig()
+	c.Orchestration.Workers = []OrchestrationWorker{{ID: "w", Model: "model-no-backend"}}
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "no backend serves") {
+		t.Fatalf("expected unserved-worker-model error, got %v", err)
+	}
+}
