@@ -1,0 +1,3490 @@
+From 439db2b3ec30a5d02106d3bcc738197810d76fe8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 24 Jun 2026 15:16:32 +0000
+Subject: [PATCH 1/2] Add Fugu-style model orchestration layer
+
+Implements behaviour-level model fusion (no weight merging) as an
+inference-time orchestrator over a heterogeneous self-hosted worker pool,
+exposed through single OpenAI-compatible virtual models.
+
+- Tier-A router (fugu-auto): rule-based task classifier (code / reasoning /
+  zh / general) with capability priors, cost penalty, and confidence-based
+  escalation to Tier-B or the strongest worker.
+- Tier-B conductor (fugu-ultra): bounded (<=5 step) Thinker -> Worker ->
+  Verifier -> Synthesizer DAG; verifier forced to a different model than the
+  producer; per-step access lists gate cross-step visibility.
+- Access-list data governance via X-Secret-Level (workers excluded when a
+  request's sensitivity exceeds their secret_max_level).
+- Worker dispatch reuses store + balancer health/capacity/load-balancing.
+- Virtual models surfaced in /v1/models; full admission (rate limit / quota /
+  concurrency / queue) and streaming (SSE wrap) supported.
+- Prometheus metrics: orchestration routes / escalations / steps.
+- Config schema + validation, sample three-model pool (gpt-oss-120b,
+  gemma-4-26b, qwen3.6-27b), unit tests, README section, docs/orchestration.md
+  with the learned-router/conductor training roadmap.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZkEu6Lfy9sZke6vyJYdx9
+---
+ README.md                                  | 128 +++++++
+ cmd/gateway/main.go                        |  13 +-
+ config/gateway.yaml                        |  94 ++++++
+ docs/orchestration.md                      | 146 ++++++++
+ internal/config/config.go                  | 201 ++++++++---
+ internal/config/config_test.go             |  53 +++
+ internal/handlers/handlers.go              |  48 ++-
+ internal/handlers/orchestration.go         | 199 +++++++++++
+ internal/metrics/metrics.go                |  17 +
+ internal/orchestrator/classify.go          | 114 +++++++
+ internal/orchestrator/conductor.go         | 221 ++++++++++++
+ internal/orchestrator/orchestrator.go      | 369 +++++++++++++++++++++
+ internal/orchestrator/orchestrator_test.go | 258 ++++++++++++++
+ internal/orchestrator/worker.go            | 180 ++++++++++
+ 14 files changed, 1985 insertions(+), 56 deletions(-)
+ create mode 100644 docs/orchestration.md
+ create mode 100644 internal/handlers/orchestration.go
+ create mode 100644 internal/orchestrator/classify.go
+ create mode 100644 internal/orchestrator/conductor.go
+ create mode 100644 internal/orchestrator/orchestrator.go
+ create mode 100644 internal/orchestrator/orchestrator_test.go
+ create mode 100644 internal/orchestrator/worker.go
+
+diff --git a/README.md b/README.md
+index 309d4f1..ee55f26 100644
+--- a/README.md
++++ b/README.md
+@@ -225,6 +225,7 @@ internal/auth/       API key middleware
+ internal/backend/    health checker
+ internal/balancer/   load-balancing policies
+ internal/proxy/      request and SSE passthrough
++internal/orchestrator/ Fugu-style Tier-A router + Tier-B conductor
+ internal/ratelimit/  in-memory rate and concurrency limiters
+ internal/handlers/   /v1/* request handlers
+ internal/admin/      /admin/* admin API
+@@ -318,6 +319,131 @@ Every mutating admin action emits an entry to the `audit_logs` table:
+ - `hash` - hash of API key id -> deterministic backend
+ - `sticky` - first request from an API key pins to one backend for the model
+ 
++## Fugu-style model orchestration
++
++The gateway can act as a **behaviour-level model orchestrator** (à la Sakana
++Fugu): a single OpenAI-compatible endpoint that, at inference time, decides
++which self-hosted worker model should answer a request — or decomposes a hard
++request across several. **No model weights are merged.** The pool is
++architecturally heterogeneous (e.g. an MoE model plus dense models with
++different tokenizers), so weight merges (SLERP/TIES/DARE) are impossible;
++each model is treated as a black box behind its own OpenAI-compatible
++endpoint and reached over HTTP.
++
++Two tiers are exposed as ordinary virtual models, so clients keep calling one
++endpoint:
++
++- **Tier-A router** (`router_model`, e.g. `fugu-auto`) — low latency. A
++  rule-based classifier inspects the request, classifies the task
++  (`code` / `reasoning` / `zh` / `general`), and dispatches to the single
++  best-suited worker. When classifier confidence is below
++  `confidence_threshold`, the request escalates to Tier-B (or, if no
++  conductor is configured, to the strongest eligible worker).
++- **Tier-B conductor** (`conductor_model`, e.g. `fugu-ultra`) — higher
++  quality. A bounded (`max_steps` ≤ 5) DAG decomposes the task across workers
++  in **Thinker → Worker → Verifier → Synthesizer** roles. The verifier is
++  forced to a **different model** than the producer (heterogeneous
++  cross-check), and per-step **access lists** gate which prior outputs each
++  worker can see.
++
++### Configuration
++
++```yaml
++orchestration:
++  enabled: true
++  router_model: fugu-auto
++  conductor_model: fugu-ultra     # omit to disable Tier-B
++  confidence_threshold: 0.55      # below this, Tier-A escalates
++  max_steps: 5                    # hard cap on Tier-B worker calls (≤5)
++  cost_penalty: 0.0               # effective_score = strength - cost_penalty*cost
++  request_timeout_ms: 120000
++  secret_level_header: X-Secret-Level
++  workers:
++    - id: qwen
++      model: qwen3.6-27b          # an internal model that resolves to backends
++      tasks: [code, zh, verify]
++      strength: 0.82
++      cost: 2
++      secret_max_level: 0         # 0 = unlimited (on-prem); set low for cloud workers
++    - id: gptoss
++      model: gpt-oss-120b
++      tasks: [reasoning, verify]
++      strength: 0.90
++      cost: 5
++    - id: gemma
++      model: gemma-4-26b
++      tasks: [general]
++      strength: 0.70
++      cost: 1
++```
++
++Each worker's `model` must be a normal internal model that resolves to one or
++more backends — worker dispatch reuses the same health, capacity and
++load-balancing machinery as the main request path. The virtual models also
++appear in `GET /v1/models` and are subject to the same API-key permissions,
++rate limits, quotas, and per-model queue as any other model.
++
++### Data governance (access list)
++
++Requests may carry a data-sensitivity level via the `secret_level_header`
++header (or a top-level `secret_level` field in the body). A worker is
++eligible only if its `secret_max_level` admits that level (`0` =
++unlimited). Because the reference pool is fully self-hosted, all workers set
++`secret_max_level: 0` and the constraint is a no-op; if a cloud worker is
++added later, give it a low `secret_max_level` so sensitive data never routes
++to it.
++
++### Response
++
++Responses are standard `chat.completion` objects with an extra
++`x_orchestration` field describing the decision:
++
++```json
++"x_orchestration": {
++  "tier": "conductor",
++  "task": "code",
++  "confidence": 0.44,
++  "escalated": true,
++  "route": [
++    {"step":1,"role":"thinker","worker":"gptoss","model":"gpt-oss-120b","backend":"gpu-fugu-gptoss","latency_ms":820},
++    {"step":2,"role":"worker","worker":"qwen","model":"qwen3.6-27b","backend":"gpu-fugu-qwen","latency_ms":1310},
++    {"step":3,"role":"verifier","worker":"gptoss","model":"gpt-oss-120b","backend":"gpu-fugu-gptoss","latency_ms":640},
++    {"step":4,"role":"synthesizer","worker":"qwen","model":"qwen3.6-27b","backend":"gpu-fugu-qwen","latency_ms":900}
++  ]
++}
++```
++
++Streaming (`stream: true`) is supported: the orchestrated answer is produced
++whole and delivered as a single SSE content chunk plus `[DONE]`, so OpenAI
++streaming clients work unchanged.
++
++### Metrics
++
++- `llmgw_orchestration_routes_total{tier,worker,task,outcome}`
++- `llmgw_orchestration_escalations_total{reason}`
++- `llmgw_orchestration_steps_total{role,worker}`
++
++### Relationship to the full Fugu design (roadmap)
++
++This is the **rule-based MVP** from the spec's landing path: a deterministic
++classifier and a deterministic TRINITY DAG. The learned components described
++in the spec are model-training work that lives outside this Go gateway and is
++intended to *replace the rule layer in place* without changing the client
++contract:
++
++1. **Tier-A learned router** — a tiny bias-free selection head on a small
++   backbone, warm-started with SFT then optimised gradient-free
++   (sep-CMA-ES) against end-to-end terminal reward. Drops in behind the same
++   `router_model` virtual model.
++2. **Tier-B learned conductor** — a small LM trained with RL (PPO/GRPO) to
++   author the ≤5-step workflow, with a cost-penalty reward term so it
++   doesn't over-use expensive workers.
++
++Until those are trained, set sensible `tasks`/`strength`/`cost` priors and
++tune `confidence_threshold` and `cost_penalty`. See
++[`docs/orchestration.md`](docs/orchestration.md) for the full design and
++training plan.
++
+ ## Audio endpoints
+ 
+ `/v1/audio/transcriptions`, `/v1/audio/translations` and `/v1/audio/speech` are
+@@ -387,6 +513,7 @@ helm install llmgateway ./deploy/helm/llmgateway \
+ | Docker (Go 1.25), `--healthcheck` flag, compose healthcheck via /healthz | implemented |
+ | Web dashboard: backends / models / api-keys (CRUD + rotate + IP lists) / logs filters / analytics / audit / users / settings | implemented |
+ | Helm chart with PVC + ServiceMonitor + HPA | implemented (replicaCount=1 unless postgres+redis) |
++| Fugu-style orchestration: Tier-A rule router + Tier-B conductor DAG, access-list governance, virtual models | implemented (rule-based MVP; learned router/conductor on roadmap) |
+ 
+ ## Roadmap
+ 
+@@ -395,3 +522,4 @@ helm install llmgateway ./deploy/helm/llmgateway \
+ - Streaming raw-response capture into the persistent log
+ - Per-tenant analytics with retention tiers
+ - Completion-style health probe (lightweight `/v1/chat/completions` test)
++- Learned Tier-A selection head (SFT + sep-CMA-ES) and RL-trained Tier-B conductor (see [`docs/orchestration.md`](docs/orchestration.md))
+diff --git a/cmd/gateway/main.go b/cmd/gateway/main.go
+index 6a349ce..c4a6a7c 100644
+--- a/cmd/gateway/main.go
++++ b/cmd/gateway/main.go
+@@ -17,6 +17,7 @@ import (
+ 	_ "github.com/jackc/pgx/v5/stdlib"
+ 	"github.com/prometheus/client_golang/prometheus/promhttp"
+ 
++	"github.com/redis/go-redis/v9"
+ 	"github.com/will-wang-88/llmgateway/internal/admin"
+ 	"github.com/will-wang-88/llmgateway/internal/auth"
+ 	"github.com/will-wang-88/llmgateway/internal/backend"
+@@ -28,8 +29,8 @@ import (
+ 	"github.com/will-wang-88/llmgateway/internal/metrics"
+ 	"github.com/will-wang-88/llmgateway/internal/netutil"
+ 	"github.com/will-wang-88/llmgateway/internal/notify"
++	"github.com/will-wang-88/llmgateway/internal/orchestrator"
+ 	"github.com/will-wang-88/llmgateway/internal/proxy"
+-	"github.com/redis/go-redis/v9"
+ 
+ 	"github.com/will-wang-88/llmgateway/internal/queue"
+ 	"github.com/will-wang-88/llmgateway/internal/quota"
+@@ -219,6 +220,16 @@ func main() {
+ 		WithQuota(qm).
+ 		WithQueue(qq).
+ 		WithTracer(tr)
++	if cfg.Orchestration.Enabled {
++		orch := orchestrator.New(cfg.Orchestration, s, bal, logger).
++			WithMetrics(handlers.OrchestratorMetricsSink(m))
++		h = h.WithOrchestrator(orch)
++		logger.Info("orchestration enabled", logging.F(
++			"router_model", cfg.Orchestration.RouterModel,
++			"conductor_model", cfg.Orchestration.ConductorModel,
++			"workers", len(cfg.Orchestration.Workers),
++		))
++	}
+ 	ipExtractor := netutil.NewExtractor(cfg.Server.TrustedProxies)
+ 	adminSrv := admin.NewServer(cfg, s, hc, logger).
+ 		WithLogStore(ls).
+diff --git a/config/gateway.yaml b/config/gateway.yaml
+index 9d7205a..900c55c 100644
+--- a/config/gateway.yaml
++++ b/config/gateway.yaml
+@@ -177,6 +177,41 @@ backends:
+     stream_idle_timeout_ms: 60000
+     tags: [gpu, reasoning]
+ 
++  # --- Fugu-style orchestration worker pool (self-hosted) ---
++  - id: gpu-fugu-gptoss
++    name: gpt-oss-120b (vLLM, MoE, TP=4)
++    base_url: http://localhost:8010/v1
++    enabled: true
++    models:
++      - gpt-oss-120b
++    weight: 1
++    max_concurrent_requests: 8
++    timeout_ms: 300000
++    stream_idle_timeout_ms: 60000
++    tags: [gpu, h200, moe, reasoning]
++  - id: gpu-fugu-gemma
++    name: Gemma 4 26B (SGLang, TP=2, low latency)
++    base_url: http://localhost:8011/v1
++    enabled: true
++    models:
++      - gemma-4-26b
++    weight: 1
++    max_concurrent_requests: 32
++    timeout_ms: 120000
++    stream_idle_timeout_ms: 30000
++    tags: [gpu, dense, general]
++  - id: gpu-fugu-qwen
++    name: Qwen3.6 27B (vLLM, TP=2, prefix caching)
++    base_url: http://localhost:8012/v1
++    enabled: true
++    models:
++      - qwen3.6-27b
++    weight: 1
++    max_concurrent_requests: 24
++    timeout_ms: 180000
++    stream_idle_timeout_ms: 45000
++    tags: [gpu, dense, coding, zh]
++
+ models:
+   - name: llama-3.1-70b
+     type: chat
+@@ -201,6 +236,23 @@ models:
+     type: chat
+     enabled: true
+     capability_mode: passthrough
++  # Fugu worker models (direct access still possible; orchestration
++  # virtual models below fan out across them).
++  - name: gpt-oss-120b
++    type: chat
++    enabled: true
++    context_length: 131072
++    capability_mode: passthrough
++  - name: gemma-4-26b
++    type: chat
++    enabled: true
++    context_length: 131072
++    capability_mode: passthrough
++  - name: qwen3.6-27b
++    type: chat
++    enabled: true
++    context_length: 131072
++    capability_mode: passthrough
+ 
+ model_aliases:
+   - alias: company-main-model
+@@ -261,3 +313,45 @@ api_keys:
+       requests_per_minute: 30
+       concurrent_requests: 2
+     delay_ms: 500
++
++# --- Fugu-style model orchestration (behaviour-level fusion) ---
++# Exposes single OpenAI-compatible virtual models that route/decompose a
++# request across the self-hosted worker pool. No model weights are merged;
++# each worker is treated as a black box.
++orchestration:
++  enabled: false            # set true to activate the virtual models below
++  router_model: fugu-auto   # Tier-A: low-latency, single best worker
++  conductor_model: fugu-ultra  # Tier-B: ≤5-step Thinker/Worker/Verifier DAG
++  # When the Tier-A classifier's confidence is below this, the request is
++  # escalated to Tier-B (or, if no conductor, to the strongest worker).
++  confidence_threshold: 0.55
++  max_steps: 5              # hard upper bound on Tier-B worker calls
++  # effective_score = strength - cost_penalty * cost. 0 disables cost bias.
++  cost_penalty: 0.0
++  request_timeout_ms: 120000
++  # Inbound header carrying request data sensitivity. Workers whose
++  # secret_max_level is below the request level are excluded (access list /
++  # data governance). 0 = unlimited (on-prem).
++  secret_level_header: X-Secret-Level
++  workers:
++    - id: qwen
++      model: qwen3.6-27b
++      tasks: [code, zh, verify]   # strong at coding, tool use, 繁中
++      strength: 0.82
++      cost: 2
++      secret_max_level: 0         # self-hosted: any sensitivity
++      tags: [coding, tool_use, zh-tw]
++    - id: gptoss
++      model: gpt-oss-120b
++      tasks: [reasoning, verify]  # MoE capacity, deep reasoning / math
++      strength: 0.90
++      cost: 5
++      secret_max_level: 0
++      tags: [reasoning, math, long_context]
++    - id: gemma
++      model: gemma-4-26b
++      tasks: [general]            # general chat / summarization / multilingual
++      strength: 0.70
++      cost: 1
++      secret_max_level: 0
++      tags: [general, multilingual, summarization]
+diff --git a/docs/orchestration.md b/docs/orchestration.md
+new file mode 100644
+index 0000000..32dd7be
+--- /dev/null
++++ b/docs/orchestration.md
+@@ -0,0 +1,146 @@
++# Fugu-style Model Orchestration — Design & Roadmap
++
++This document describes the behaviour-level model orchestration layer built
++into the gateway, and the training roadmap for its learned variants. It is
++the engineering counterpart to the v0.1 specification.
++
++## 0. Why orchestration, not weight merging
++
++The target pool is architecturally heterogeneous and **cannot** be
++weight-merged:
++
++| Model        | Architecture   | Approx. scale            | Weight merge |
++|--------------|----------------|--------------------------|--------------|
++| gpt-oss-120b | MoE (sparse)   | 120B total / ~5B active  | ❌ not dense-compatible |
++| Gemma 4 26B  | Dense          | 26B                      | ❌ different vocab/depth |
++| Qwen3.6 27B  | Dense          | 27B                      | ❌ different vocab/depth |
++
++Even the tokenizers differ, so SLERP / TIES / DARE are out. The only viable
++route is **behaviour-level fusion**: a small orchestrator decides, at
++inference time, which black-box model(s) answer each request.
++
++## 1. Goals
++
++1. Expose a **single OpenAI-compatible endpoint**.
++2. Internally route to one worker, or decompose and fan out to several then
++   synthesize.
++3. All workers run **on-prem / self-hosted** (vLLM / SGLang) — no data
++   egress.
++4. Two operating modes: low-latency single-pick vs. high-quality multi-step.
++
++## 2. Two-tier architecture
++
++### Tier-A — Router (low latency)
++
++- **MVP (shipped):** a rule-based classifier (`internal/orchestrator/classify.go`)
++  scores the request across task classes (`code`, `reasoning`, `zh`,
++  `general`) from keyword/heuristic signals, plus a Traditional-Chinese Han
++  ratio. The dominant class and its confidence (its share of total signal
++  mass) drive a single-worker pick.
++- **Learned (roadmap):** a bias-free linear *selection head* on a small
++  backbone (e.g. Qwen3 0.6B). It reads an early-token hidden state, scores
++  each worker, and dispatches — no full generation, so latency ≈ one model
++  call. Trainable params are tiny (selection head + a few SVF offsets).
++  Training: large-scale SFT warm-up → **sep-CMA-ES** (gradient-free)
++  against end-to-end terminal reward.
++
++### Tier-B — Conductor (high quality)
++
++- **MVP (shipped):** a deterministic TRINITY DAG
++  (`internal/orchestrator/conductor.go`): **Thinker → Worker → Verifier →
++  Synthesizer**, trimmed to `max_steps` (≤5). The verifier is forced to a
++  different model than the producer; access lists gate cross-step visibility.
++- **Learned (roadmap):** a ~7B LM trained with RL (PPO/GRPO) to *author* the
++  ≤5-step workflow in natural language and assign subtasks, reward = final
++  task quality − (optional) cost penalty.
++
++## 3. Routing priors (pool capability map)
++
++Seeded by hand, then corrected by the orchestrator over time:
++
++| Task type                    | Preferred worker            | Rationale |
++|------------------------------|-----------------------------|-----------|
++| Code gen / debug             | Qwen3.6 27B                 | strong coding, stable tool use |
++| Long reasoning / math        | gpt-oss-120b                | MoE capacity, deep reasoning |
++| Multilingual / chat / summary| Gemma 4 26B                 | general, low latency |
++| Traditional Chinese (繁中)   | Qwen3.6 27B → Gemma cross   | better zh-TW corpus |
++| Critical verification step   | a **different** model        | forced heterogeneous check |
++
++These map onto each worker's `tasks`, `strength`, and `cost` in config.
++
++## 4. Inference topology
++
++```
++Client ──> [Gateway / OpenAI-compatible API]
++                 │
++                 ▼
++          [Orchestrator]
++          ├ Tier-A Router (rule head)        ← default, low-latency path
++          └ Tier-B Conductor (DAG, ≤5 step)  ← escalation / quality path
++                 │  (HTTP, access-list controls visibility)
++     ┌───────────┼───────────┐
++     ▼           ▼           ▼
++ gpt-oss-120b  Gemma 4 26B  Qwen3.6 27B
++   (vLLM)       (SGLang)     (vLLM)
++```
++
++Suggested worker serving:
++
++```
++gpt-oss-120b → vLLM, TP=4 (H200), MoE expert-parallel tuning
++Gemma 4 26B  → SGLang/vLLM, TP=2, latency-first
++Qwen3.6 27B  → vLLM, TP=2, prefix caching on (repeated code prefixes)
++```
++
++## 5. Training pipeline (roadmap — outside this Go service)
++
++1. **Data prep:** collect coding / reasoning / general prompts (incl. 繁中).
++   Run all three workers per prompt, record outputs + scores → per-class
++   "which model wins" ground truth.
++2. **Tier-A:** SFT the selection head on the best-model labels →
++   sep-CMA-ES against terminal reward (learns the latency/quality trade-off).
++3. **Tier-B:** RL-train the conductor to emit ≤5-step workflows;
++   reward = answer quality − cost penalty.
++
++**Eval targets:** the orchestrator should beat any single pool member;
++track task success rate, mean latency, mean token cost, and Tier-B
++escalation ratio.
++
++## 6. Access list & data governance
++
++Each request carries a sensitivity level (`X-Secret-Level` header or
++`secret_level` body field). A worker processes it only if its
++`secret_max_level` admits the level (`0` = unlimited / on-prem). Because the
++reference pool is fully self-hosted this is a no-op today; it becomes the
++enforcement point if a cloud worker is ever added (give it a low
++`secret_max_level` so high-sensitivity data never routes off-prem). Inside
++Tier-B, each step additionally declares which prior outputs are visible
++(e.g. the verifier sees the draft but not the planner's notes, to keep the
++check independent).
++
++## 7. Landing path
++
++1. **MVP (done):** rule router + conductor over three vLLM endpoints behind
++   one API. ✅
++2. **Learned router:** collect data, train the Tier-A selection head, swap it
++   in behind `router_model`.
++3. **Learned conductor:** RL-trained Tier-B planner behind `conductor_model`.
++4. **Cost optimisation:** tune `confidence_threshold` / `cost_penalty`,
++   measure ROI.
++
++## 8. Risks & trade-offs
++
++- **Mis-routing cost:** a wrong single pick can be worse than always using
++  the strongest model — hence the confidence threshold and Tier-B/strongest
++  fallback.
++- **Latency stacking:** multi-step workflows accumulate latency; ≤5 steps is
++  a hard cap (enforced in config validation).
++- **Eval bias:** a worker grading itself is untrustworthy — the verifier is
++  always a heterogeneous model.
++- **MoE tuning:** gpt-oss-120b expert routing is throughput-sensitive on
++  multi-GPU; benchmark it separately.
++
++## References
++
++- Sakana AI Fugu (official): `github.com/SakanaAI/fugu`
++- Open reimplementation: `github.com/trotsky1997/OpenFugu`
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 6f63e4a..0daaeca 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -22,6 +22,7 @@ type Config struct {
+ 	Tracing       TracingConfig       `yaml:"tracing"`
+ 	Dashboard     DashboardConfig     `yaml:"dashboard"`
+ 	Notifications NotificationsConfig `yaml:"notifications"`
++	Orchestration OrchestrationConfig `yaml:"orchestration"`
+ 
+ 	Backends     []BackendConfig    `yaml:"backends"`
+ 	Models       []ModelConfig      `yaml:"models"`
+@@ -49,25 +50,25 @@ type EmailNotifierConfig struct {
+ }
+ 
+ type ServerConfig struct {
+-	Host                 string   `yaml:"host"`
+-	Port                 int      `yaml:"port"`
+-	RequestBodyLimitMB   int      `yaml:"request_body_limit_mb"`
+-	DefaultTimeoutMS     int      `yaml:"default_timeout_ms"`
+-	StreamIdleTimeoutMS  int      `yaml:"stream_idle_timeout_ms"`
+-	ReadHeaderTimeoutMS  int      `yaml:"read_header_timeout_ms"`
+-	ShutdownTimeoutMS    int      `yaml:"shutdown_timeout_ms"`
++	Host                string `yaml:"host"`
++	Port                int    `yaml:"port"`
++	RequestBodyLimitMB  int    `yaml:"request_body_limit_mb"`
++	DefaultTimeoutMS    int    `yaml:"default_timeout_ms"`
++	StreamIdleTimeoutMS int    `yaml:"stream_idle_timeout_ms"`
++	ReadHeaderTimeoutMS int    `yaml:"read_header_timeout_ms"`
++	ShutdownTimeoutMS   int    `yaml:"shutdown_timeout_ms"`
+ 	// TrustedProxies lists IPs / CIDRs that are allowed to set
+ 	// X-Forwarded-For / X-Real-IP. Headers from any other peer are
+ 	// ignored when resolving the client IP. Empty (default) means: never
+ 	// trust forwarded headers.
+-	TrustedProxies       []string `yaml:"trusted_proxies"`
++	TrustedProxies []string `yaml:"trusted_proxies"`
+ }
+ 
+ type AuthConfig struct {
+-	APIKeyHeader   string `yaml:"api_key_header"`
+-	APIKeyPrefix   string `yaml:"api_key_prefix"`
+-	HashAlgorithm  string `yaml:"hash_algorithm"`
+-	HashSecret     string `yaml:"hash_secret"`
++	APIKeyHeader  string `yaml:"api_key_header"`
++	APIKeyPrefix  string `yaml:"api_key_prefix"`
++	HashAlgorithm string `yaml:"hash_algorithm"`
++	HashSecret    string `yaml:"hash_secret"`
+ }
+ 
+ type RoutingConfig struct {
+@@ -106,7 +107,7 @@ type RateLimitConfig struct {
+ 	// RedisURL is consumed when Backend = "redis". Example:
+ 	// "redis://:password@redis:6379/0". Multi-replica deployments
+ 	// require this to keep limits consistent across pods.
+-	RedisURL   string `yaml:"redis_url"`
++	RedisURL    string `yaml:"redis_url"`
+ 	RedisPrefix string `yaml:"redis_prefix"`
+ }
+ 
+@@ -126,10 +127,10 @@ type MetricsConfig struct {
+ }
+ 
+ type AdminConfig struct {
+-	Enabled    bool   `yaml:"enabled"`
+-	Username   string `yaml:"username"`
+-	Password   string `yaml:"password"`
+-	BindToken  string `yaml:"bind_token"`
++	Enabled   bool   `yaml:"enabled"`
++	Username  string `yaml:"username"`
++	Password  string `yaml:"password"`
++	BindToken string `yaml:"bind_token"`
+ }
+ 
+ type AdminUserConfig struct {
+@@ -141,9 +142,9 @@ type AdminUserConfig struct {
+ }
+ 
+ type StorageConfig struct {
+-	Driver string `yaml:"driver"` // memory (default), sqlite
+-	DSN    string `yaml:"dsn"`    // for sqlite: file path
+-	LogRetentionDays int `yaml:"log_retention_days"`
++	Driver           string `yaml:"driver"` // memory (default), sqlite
++	DSN              string `yaml:"dsn"`    // for sqlite: file path
++	LogRetentionDays int    `yaml:"log_retention_days"`
+ }
+ 
+ type QueueConfig struct {
+@@ -165,6 +166,66 @@ type DashboardConfig struct {
+ 	BaseURL string `yaml:"base_url" json:"base_url"`
+ }
+ 
++// OrchestrationConfig configures the Fugu-style model orchestration layer.
++// It exposes one or two virtual models (a low-latency Tier-A router and an
++// optional higher-quality Tier-B conductor) that fan a single request out
++// to a pool of self-hosted worker models. See internal/orchestrator.
++type OrchestrationConfig struct {
++	Enabled bool `yaml:"enabled" json:"enabled"`
++	// RouterModel is the virtual model name that triggers the Tier-A
++	// (low-latency, single-worker) routing path. Clients call this name
++	// like any other model.
++	RouterModel string `yaml:"router_model" json:"router_model"`
++	// ConductorModel is the virtual model name that triggers the Tier-B
++	// (multi-step DAG) path. Leave empty to disable Tier-B.
++	ConductorModel string `yaml:"conductor_model" json:"conductor_model"`
++	// ConfidenceThreshold: when the Tier-A classifier's confidence for a
++	// request falls below this value, the router escalates to Tier-B (if
++	// configured) or to the strongest worker. Range 0..1. Default 0.55.
++	ConfidenceThreshold float64 `yaml:"confidence_threshold" json:"confidence_threshold"`
++	// MaxSteps caps the Tier-B workflow length (hard upper bound on the
++	// number of worker calls in a single conductor run). Default 5.
++	MaxSteps int `yaml:"max_steps" json:"max_steps"`
++	// CostPenalty biases worker selection away from expensive workers when
++	// scores are close: effective_score = strength - cost_penalty*cost.
++	// 0 (default) disables the penalty.
++	CostPenalty float64 `yaml:"cost_penalty" json:"cost_penalty"`
++	// RequestTimeoutMS bounds a single worker call made by the
++	// orchestrator. Default 120000.
++	RequestTimeoutMS int `yaml:"request_timeout_ms" json:"request_timeout_ms"`
++	// SecretLevelHeader names the inbound HTTP header carrying the request
++	// data-sensitivity level (an integer). Workers whose secret_max_level
++	// is below the request level are excluded from routing. Default
++	// "X-Secret-Level".
++	SecretLevelHeader string `yaml:"secret_level_header" json:"secret_level_header"`
++	// Workers is the model pool the orchestrator can dispatch to.
++	Workers []OrchestrationWorker `yaml:"workers" json:"workers"`
++}
++
++// OrchestrationWorker describes one member of the orchestration pool. Model
++// must be an internal model name that resolves to one or more backends via
++// the normal routing machinery.
++type OrchestrationWorker struct {
++	ID    string `yaml:"id" json:"id"`
++	Model string `yaml:"model" json:"model"`
++	// Tasks lists the classifier task labels this worker is preferred for
++	// (e.g. code, reasoning, general, multilingual, zh, verify).
++	Tasks []string `yaml:"tasks" json:"tasks"`
++	// Strength is a 0..1 general-capability prior used to break ties and
++	// to pick the "strongest" worker on low-confidence fallback.
++	Strength float64 `yaml:"strength" json:"strength"`
++	// Cost is a relative cost weight (e.g. GPU-seconds proxy) used by the
++	// cost penalty. Higher = more expensive.
++	Cost float64 `yaml:"cost" json:"cost"`
++	// SecretMaxLevel is the highest request secret level this worker may
++	// process. Self-hosted workers should set this high (e.g. 5); a cloud
++	// worker added later should set it low so sensitive data never routes
++	// to it. 0 is treated as "unlimited" (on-prem default).
++	SecretMaxLevel int `yaml:"secret_max_level" json:"secret_max_level"`
++	// Tags are free-form labels (informational; surfaced in metadata).
++	Tags []string `yaml:"tags" json:"tags"`
++}
++
+ type BackendConfig struct {
+ 	ID                    string             `yaml:"id"`
+ 	Name                  string             `yaml:"name"`
+@@ -181,13 +242,13 @@ type BackendConfig struct {
+ }
+ 
+ type ModelConfig struct {
+-	Name           string            `yaml:"name"`
+-	Type           string            `yaml:"type"`
+-	Enabled        bool              `yaml:"enabled"`
+-	ContextLength  int               `yaml:"context_length"`
+-	CapabilityMode string            `yaml:"capability_mode"`
+-	Capabilities   map[string]bool   `yaml:"capabilities"`
+-	RoutingPolicy  string            `yaml:"routing_policy"`
++	Name           string          `yaml:"name"`
++	Type           string          `yaml:"type"`
++	Enabled        bool            `yaml:"enabled"`
++	ContextLength  int             `yaml:"context_length"`
++	CapabilityMode string          `yaml:"capability_mode"`
++	Capabilities   map[string]bool `yaml:"capabilities"`
++	RoutingPolicy  string          `yaml:"routing_policy"`
+ }
+ 
+ type ModelAliasConfig struct {
+@@ -198,21 +259,21 @@ type ModelAliasConfig struct {
+ }
+ 
+ type APIKeyConfig struct {
+-	ID                string                 `yaml:"id"`
+-	Name              string                 `yaml:"name"`
+-	Key               string                 `yaml:"key"`
+-	KeyPrefix         string                 `yaml:"key_prefix"`
+-	KeyHash           string                 `yaml:"key_hash"`
+-	Enabled           bool                   `yaml:"enabled"`
+-	AllowedModels     []string               `yaml:"allowed_models"`
+-	DeniedModels      []string               `yaml:"denied_models"`
+-	AllowedClientIPs  []string               `yaml:"allowed_client_ips"`
+-	DeniedClientIPs   []string               `yaml:"denied_client_ips"`
+-	RateLimit         *APIKeyRateLimit       `yaml:"rate_limit,omitempty"`
+-	Quota             *APIKeyQuota           `yaml:"quota,omitempty"`
+-	DelayMS           int                    `yaml:"delay_ms"`
+-	Logging           *APIKeyLogging         `yaml:"logging,omitempty"`
+-	ExpiresAt         string                 `yaml:"expires_at"`
++	ID               string           `yaml:"id"`
++	Name             string           `yaml:"name"`
++	Key              string           `yaml:"key"`
++	KeyPrefix        string           `yaml:"key_prefix"`
++	KeyHash          string           `yaml:"key_hash"`
++	Enabled          bool             `yaml:"enabled"`
++	AllowedModels    []string         `yaml:"allowed_models"`
++	DeniedModels     []string         `yaml:"denied_models"`
++	AllowedClientIPs []string         `yaml:"allowed_client_ips"`
++	DeniedClientIPs  []string         `yaml:"denied_client_ips"`
++	RateLimit        *APIKeyRateLimit `yaml:"rate_limit,omitempty"`
++	Quota            *APIKeyQuota     `yaml:"quota,omitempty"`
++	DelayMS          int              `yaml:"delay_ms"`
++	Logging          *APIKeyLogging   `yaml:"logging,omitempty"`
++	ExpiresAt        string           `yaml:"expires_at"`
+ }
+ 
+ type APIKeyRateLimit struct {
+@@ -301,6 +362,13 @@ func Default() *Config {
+ 		Dashboard: DashboardConfig{
+ 			Enabled: true,
+ 		},
++		Orchestration: OrchestrationConfig{
++			Enabled:             false,
++			ConfidenceThreshold: 0.55,
++			MaxSteps:            5,
++			RequestTimeoutMS:    120000,
++			SecretLevelHeader:   "X-Secret-Level",
++		},
+ 	}
+ }
+ 
+@@ -354,6 +422,55 @@ func (c *Config) Validate() error {
+ 			return fmt.Errorf("alias %s: invalid forwarding_mode %q (must be use_internal/keep_external)", a.Alias, a.ForwardingMode)
+ 		}
+ 	}
++	if err := c.Orchestration.validate(); err != nil {
++		return err
++	}
++	return nil
++}
++
++func (o *OrchestrationConfig) validate() error {
++	if !o.Enabled {
++		return nil
++	}
++	if o.RouterModel == "" && o.ConductorModel == "" {
++		return fmt.Errorf("orchestration enabled but neither router_model nor conductor_model is set")
++	}
++	if o.RouterModel != "" && o.RouterModel == o.ConductorModel {
++		return fmt.Errorf("orchestration router_model and conductor_model must differ")
++	}
++	if len(o.Workers) == 0 {
++		return fmt.Errorf("orchestration enabled but no workers configured")
++	}
++	if o.ConfidenceThreshold < 0 || o.ConfidenceThreshold > 1 {
++		return fmt.Errorf("orchestration confidence_threshold must be in [0,1], got %v", o.ConfidenceThreshold)
++	}
++	if o.MaxSteps <= 0 {
++		o.MaxSteps = 5
++	}
++	if o.MaxSteps > 5 {
++		// Section 8: ≤5 steps is a hard upper bound (latency stacks).
++		return fmt.Errorf("orchestration max_steps must be <= 5, got %d", o.MaxSteps)
++	}
++	if o.RequestTimeoutMS <= 0 {
++		o.RequestTimeoutMS = 120000
++	}
++	if o.SecretLevelHeader == "" {
++		o.SecretLevelHeader = "X-Secret-Level"
++	}
++	ids := make(map[string]struct{}, len(o.Workers))
++	for i := range o.Workers {
++		w := &o.Workers[i]
++		if w.ID == "" {
++			return fmt.Errorf("orchestration worker[%d] missing id", i)
++		}
++		if w.Model == "" {
++			return fmt.Errorf("orchestration worker %s missing model", w.ID)
++		}
++		if _, dup := ids[w.ID]; dup {
++			return fmt.Errorf("orchestration duplicate worker id %q", w.ID)
++		}
++		ids[w.ID] = struct{}{}
++	}
+ 	return nil
+ }
+ 
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index 0c2019c..d07028a 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -46,3 +46,56 @@ func TestConfigRejectsInvalidForwardingMode(t *testing.T) {
+ 		t.Fatal("expected Validate to reject invalid forwarding_mode")
+ 	}
+ }
++
++func baseOrchestrationConfig() *Config {
++	c := Default()
++	c.Backends = []BackendConfig{{ID: "b1", BaseURL: "http://b", Models: []string{"qwen3.6-27b"}}}
++	c.Orchestration = OrchestrationConfig{
++		Enabled:             true,
++		RouterModel:         "fugu-auto",
++		ConductorModel:      "fugu-ultra",
++		ConfidenceThreshold: 0.55,
++		MaxSteps:            5,
++		Workers:             []OrchestrationWorker{{ID: "qwen", Model: "qwen3.6-27b"}},
++	}
++	return c
++}
++
++func TestOrchestrationValidConfig(t *testing.T) {
++	if err := baseOrchestrationConfig().Validate(); err != nil {
++		t.Fatalf("expected valid orchestration config, got %v", err)
++	}
++}
++
++func TestOrchestrationRejectsNoWorkers(t *testing.T) {
++	c := baseOrchestrationConfig()
++	c.Orchestration.Workers = nil
++	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "no workers") {
++		t.Fatalf("expected no-workers error, got %v", err)
++	}
++}
++
++func TestOrchestrationRejectsTooManySteps(t *testing.T) {
++	c := baseOrchestrationConfig()
++	c.Orchestration.MaxSteps = 6
++	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "max_steps") {
++		t.Fatalf("expected max_steps error, got %v", err)
++	}
++}
++
++func TestOrchestrationRejectsSameVirtualModel(t *testing.T) {
++	c := baseOrchestrationConfig()
++	c.Orchestration.ConductorModel = c.Orchestration.RouterModel
++	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "must differ") {
++		t.Fatalf("expected differ error, got %v", err)
++	}
++}
++
++func TestOrchestrationDisabledSkipsValidation(t *testing.T) {
++	c := Default() // Orchestration.Enabled defaults false
++	c.Orchestration.MaxSteps = 99
++	c.Orchestration.Workers = nil
++	if err := c.Validate(); err != nil {
++		t.Fatalf("disabled orchestration should not validate, got %v", err)
++	}
++}
+diff --git a/internal/handlers/handlers.go b/internal/handlers/handlers.go
+index 68e762d..afdacfe 100644
+--- a/internal/handlers/handlers.go
++++ b/internal/handlers/handlers.go
+@@ -20,6 +20,7 @@ import (
+ 	"github.com/will-wang-88/llmgateway/internal/logging"
+ 	"github.com/will-wang-88/llmgateway/internal/logstore"
+ 	"github.com/will-wang-88/llmgateway/internal/metrics"
++	"github.com/will-wang-88/llmgateway/internal/orchestrator"
+ 	"github.com/will-wang-88/llmgateway/internal/proxy"
+ 	"github.com/will-wang-88/llmgateway/internal/queue"
+ 	"github.com/will-wang-88/llmgateway/internal/quota"
+@@ -29,18 +30,19 @@ import (
+ )
+ 
+ type Handler struct {
+-	cfg         *config.Config
+-	store       *store.Store
+-	proxy       *proxy.Proxy
+-	balancer    *balancer.Balancer
+-	limiter     ratelimit.Backend
+-	concurrency *ratelimit.Concurrency
+-	logger      *logging.Logger
+-	metrics     *metrics.Metrics
+-	logstore    logstore.Store
+-	quota       *quota.Manager
+-	queue       *queue.Manager
+-	tracer      *tracing.Tracer
++	cfg          *config.Config
++	store        *store.Store
++	proxy        *proxy.Proxy
++	balancer     *balancer.Balancer
++	limiter      ratelimit.Backend
++	concurrency  *ratelimit.Concurrency
++	logger       *logging.Logger
++	metrics      *metrics.Metrics
++	logstore     logstore.Store
++	quota        *quota.Manager
++	queue        *queue.Manager
++	tracer       *tracing.Tracer
++	orchestrator *orchestrator.Orchestrator
+ }
+ 
+ func New(
+@@ -167,6 +169,12 @@ func (h *Handler) ListModels(w http.ResponseWriter, r *http.Request) {
+ 		internal, _ := h.store.ResolveAlias(a.Alias)
+ 		addResolved(a.Alias, internal)
+ 	}
++	// Orchestration virtual models (Tier-A router / Tier-B conductor).
++	if h.orchestrator != nil {
++		for _, vm := range h.orchestrator.VirtualModels() {
++			add(vm)
++		}
++	}
+ 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+ 
+ 	resp := map[string]any{
+@@ -273,6 +281,21 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
+ 			return
+ 		}
+ 
++		// Orchestration: if the resolved model is one of the Fugu-style
++		// virtual models, hand the whole request to the orchestrator,
++		// which fans out to the worker pool. This must run before the
++		// registry / capability / backend checks below, because a virtual
++		// model has no backends of its own.
++		if h.orchestrator != nil && h.orchestrator.Handles(internalModel) {
++			if span != nil {
++				span.Attributes["model"] = peek.Model
++				span.Attributes["internal_model"] = internalModel
++				span.Attributes["orchestration"] = true
++			}
++			h.serveOrchestration(w, r, requestID, started, apiKey, clientIP, internalModel, isStream, raw)
++			return
++		}
++
+ 		// Explicit model registry: if the resolved internal model has a
+ 		// registry entry with enabled=false, reject before backend
+ 		// selection. This makes Admin disable a real kill-switch instead
+@@ -886,4 +909,3 @@ func isQuotaCode(code string) bool {
+ 	}
+ 	return false
+ }
+-
+diff --git a/internal/handlers/orchestration.go b/internal/handlers/orchestration.go
+new file mode 100644
+index 0000000..e391b73
+--- /dev/null
++++ b/internal/handlers/orchestration.go
+@@ -0,0 +1,199 @@
++package handlers
++
++import (
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"strconv"
++	"time"
++
++	"github.com/will-wang-88/llmgateway/internal/logging"
++	"github.com/will-wang-88/llmgateway/internal/metrics"
++	"github.com/will-wang-88/llmgateway/internal/orchestrator"
++	"github.com/will-wang-88/llmgateway/internal/proxy"
++	"github.com/will-wang-88/llmgateway/internal/store"
++)
++
++// WithOrchestrator attaches the Fugu-style orchestration layer. When set,
++// requests whose model resolves to one of the orchestrator's virtual models
++// are served by the orchestrator instead of being forwarded to a single
++// backend.
++func (h *Handler) WithOrchestrator(o *orchestrator.Orchestrator) *Handler {
++	h.orchestrator = o
++	return h
++}
++
++// metricsSink adapts *metrics.Metrics to orchestrator.MetricsSink.
++type metricsSink struct{ m *metrics.Metrics }
++
++func (s metricsSink) IncRoute(tier, worker, task, outcome string) {
++	s.m.OrchRoutes.WithLabelValues(tier, worker, task, outcome).Inc()
++}
++func (s metricsSink) IncEscalation(reason string) {
++	s.m.OrchEscalations.WithLabelValues(reason).Inc()
++}
++func (s metricsSink) IncStep(role, worker string) {
++	s.m.OrchSteps.WithLabelValues(role, worker).Inc()
++}
++
++// OrchestratorMetricsSink exposes the handler's metrics as a sink the
++// orchestrator can be wired with at construction time in main.
++func OrchestratorMetricsSink(m *metrics.Metrics) orchestrator.MetricsSink { return metricsSink{m: m} }
++
++// serveOrchestration runs the orchestration path for a virtual model. It
++// applies the same admission controls (rate limit / quota / concurrency /
++// queue) as the normal forward path, then hands the request to the
++// orchestrator and writes back an OpenAI-compatible response.
++func (h *Handler) serveOrchestration(w http.ResponseWriter, r *http.Request, requestID string, started time.Time,
++	apiKey *store.APIKey, clientIP, virtualModel string, isStream bool, raw []byte) {
++
++	ctx := r.Context()
++
++	// Admission: virtual models share the same per-key limits and the
++	// per-model queue (keyed on the virtual model name).
++	release, code, status := h.admit(ctx, apiKey, virtualModel)
++	if code != "" {
++		if isQuotaCode(code) {
++			h.metrics.QuotaHits.WithLabelValues(apiKeyID(apiKey), code).Inc()
++		}
++		h.recordLog(ctx, requestID, apiKey, clientIP, virtualModel, virtualModel, "orchestrator", "/chat/completions", isStream, status, code, nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil)
++		proxy.WriteError(w, status, proxy.RateLimit("Rejected: "+code, code))
++		return
++	}
++	defer release()
++
++	secretLevel := h.secretLevel(r, raw)
++
++	result, err := h.orchestrator.Handle(ctx, virtualModel, raw, secretLevel)
++	if err != nil {
++		latency := time.Since(started).Milliseconds()
++		h.recordLog(ctx, requestID, apiKey, clientIP, virtualModel, virtualModel, "orchestrator", "/chat/completions", isStream, http.StatusBadGateway, "orchestration_failed", nil, latency, 0, h.rawForLog(apiKey, raw), nil)
++		h.metrics.Requests.WithLabelValues("/chat/completions", virtualModel, "orchestrator", apiKeyLabelOf(apiKey), "502", boolLabel(isStream), "orchestration").Inc()
++		h.logger.Warn("orchestration failed", logging.F("request_id", requestID, "model", virtualModel, "error", err.Error()))
++		proxy.WriteError(w, http.StatusBadGateway, proxy.BackendUnavailable("Orchestration failed: "+err.Error(), "orchestration_failed"))
++		return
++	}
++
++	created := time.Now().Unix()
++	id := "chatcmpl-" + requestID
++	body := orchestrator.BuildChatCompletion(id, virtualModel, created, result)
++
++	if isStream {
++		writeOrchestrationStream(w, id, virtualModel, created, result.Content)
++	} else {
++		w.Header().Set("Content-Type", "application/json")
++		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
++		w.WriteHeader(http.StatusOK)
++		_, _ = w.Write(body)
++	}
++
++	latency := time.Since(started).Milliseconds()
++	apiKeyLabel := apiKeyLabelOf(apiKey)
++	h.recordUsage(&result.Usage, virtualModel, "orchestrator", apiKeyLabel, apiKey)
++	if apiKey != nil {
++		apiKey.TouchRequest()
++	}
++	h.metrics.Requests.WithLabelValues("/chat/completions", virtualModel, "orchestrator", apiKeyLabel, "200", boolLabel(isStream), "orchestration").Inc()
++	h.metrics.RequestLatency.WithLabelValues("/chat/completions", virtualModel, "orchestrator", boolLabel(isStream), "orchestration").Observe(time.Since(started).Seconds())
++
++	if h.shouldLog(apiKey, "log_metadata") {
++		h.logger.Info("orchestration completed", logging.F(
++			"request_id", requestID,
++			"model", virtualModel,
++			"tier", result.Tier,
++			"task", result.Task,
++			"confidence", result.Confidence,
++			"escalated", result.Escalated,
++			"steps", len(result.Steps),
++			"total_tokens", result.Usage.TotalTokens,
++			"latency_ms", latency,
++			"api_key_id", apiKeyLabel,
++		))
++	}
++
++	if h.logstore != nil {
++		var rawReqForLog []byte
++		if h.shouldLog(apiKey, "log_raw_request") {
++			rawReqForLog = raw
++		}
++		var rawRespForLog []byte
++		if !isStream && h.shouldLog(apiKey, "log_raw_response") {
++			rawRespForLog = body
++		}
++		h.recordLog(ctx, requestID, apiKey, clientIP, virtualModel, virtualModel, "orchestrator",
++			"/chat/completions", isStream, http.StatusOK, "", &result.Usage, latency, 0, rawReqForLog, rawRespForLog)
++	}
++}
++
++// secretLevel resolves the request data-sensitivity level used for the
++// orchestrator access list: the configured header takes precedence, falling
++// back to a top-level "secret_level" field in the request body.
++func (h *Handler) secretLevel(r *http.Request, raw []byte) int {
++	hdr := h.cfg.Orchestration.SecretLevelHeader
++	if hdr == "" {
++		hdr = "X-Secret-Level"
++	}
++	if v := r.Header.Get(hdr); v != "" {
++		if n, err := strconv.Atoi(v); err == nil {
++			return n
++		}
++	}
++	var peek struct {
++		SecretLevel *int `json:"secret_level"`
++	}
++	if err := json.Unmarshal(raw, &peek); err == nil && peek.SecretLevel != nil {
++		return *peek.SecretLevel
++	}
++	return 0
++}
++
++func apiKeyLabelOf(k *store.APIKey) string {
++	if k == nil {
++		return "anonymous"
++	}
++	return k.ID
++}
++
++// writeOrchestrationStream emits the orchestrated answer as a minimal SSE
++// stream so OpenAI streaming clients work unchanged. The orchestrated answer
++// is produced as a whole, so it is delivered as a single content chunk
++// followed by a terminating chunk and [DONE].
++func writeOrchestrationStream(w http.ResponseWriter, id, model string, created int64, content string) {
++	w.Header().Set("Content-Type", "text/event-stream")
++	w.Header().Set("Cache-Control", "no-cache")
++	w.Header().Set("Connection", "keep-alive")
++	w.WriteHeader(http.StatusOK)
++	flusher, _ := w.(http.Flusher)
++
++	type delta struct {
++		Role    string `json:"role,omitempty"`
++		Content string `json:"content,omitempty"`
++	}
++	type choice struct {
++		Index        int     `json:"index"`
++		Delta        delta   `json:"delta"`
++		FinishReason *string `json:"finish_reason"`
++	}
++	chunk := func(d delta, finish *string) {
++		obj := map[string]any{
++			"id":      id,
++			"object":  "chat.completion.chunk",
++			"created": created,
++			"model":   model,
++			"choices": []choice{{Index: 0, Delta: d, FinishReason: finish}},
++		}
++		b, _ := json.Marshal(obj)
++		_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
++		if flusher != nil {
++			flusher.Flush()
++		}
++	}
++
++	chunk(delta{Role: "assistant", Content: content}, nil)
++	stop := "stop"
++	chunk(delta{}, &stop)
++	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
++	if flusher != nil {
++		flusher.Flush()
++	}
++}
+diff --git a/internal/metrics/metrics.go b/internal/metrics/metrics.go
+index 22050d5..e8f991f 100644
+--- a/internal/metrics/metrics.go
++++ b/internal/metrics/metrics.go
+@@ -22,6 +22,11 @@ type Metrics struct {
+ 	QuotaHits        *prometheus.CounterVec
+ 	Timeouts         *prometheus.CounterVec
+ 	QueueDepth       *prometheus.GaugeVec
++
++	// Orchestration (Fugu-style model routing) metrics.
++	OrchRoutes      *prometheus.CounterVec
++	OrchEscalations *prometheus.CounterVec
++	OrchSteps       *prometheus.CounterVec
+ }
+ 
+ // New constructs a Metrics with its own private registry so multiple instances
+@@ -89,6 +94,18 @@ func New() *Metrics {
+ 			Name: "llmgw_queue_depth",
+ 			Help: "Pending requests queue depth",
+ 		}, []string{"scope"}),
++		OrchRoutes: factory.NewCounterVec(prometheus.CounterOpts{
++			Name: "llmgw_orchestration_routes_total",
++			Help: "Orchestrator routing decisions by tier, chosen worker, task class and outcome",
++		}, []string{"tier", "worker", "task", "outcome"}),
++		OrchEscalations: factory.NewCounterVec(prometheus.CounterOpts{
++			Name: "llmgw_orchestration_escalations_total",
++			Help: "Tier-A -> Tier-B escalations by reason",
++		}, []string{"reason"}),
++		OrchSteps: factory.NewCounterVec(prometheus.CounterOpts{
++			Name: "llmgw_orchestration_steps_total",
++			Help: "Conductor (Tier-B) worker steps executed by role and worker",
++		}, []string{"role", "worker"}),
+ 	}
+ }
+ 
+diff --git a/internal/orchestrator/classify.go b/internal/orchestrator/classify.go
+new file mode 100644
+index 0000000..d641cc7
+--- /dev/null
++++ b/internal/orchestrator/classify.go
+@@ -0,0 +1,114 @@
++package orchestrator
++
++import (
++	"strings"
++	"unicode"
++)
++
++// Task labels produced by the Tier-A classifier. These are matched against
++// each worker's configured `tasks` list to choose a preferred worker.
++const (
++	TaskCode      = "code"
++	TaskReasoning = "reasoning"
++	TaskZh        = "zh"      // Traditional-Chinese-heavy input
++	TaskGeneral   = "general" // default: chat / summarization / multilingual
++)
++
++// classification is the output of the rule-based Tier-A router. Confidence
++// is the dominant task's share of total signal; a low value means the
++// request is ambiguous and should be escalated.
++type classification struct {
++	Task       string
++	Confidence float64
++	Scores     map[string]float64
++	ZhRatio    float64
++}
++
++// signal keyword sets. Matching is case-insensitive substring matching over
++// the request text (English) plus literal CJK substrings (Chinese).
++var (
++	codeSignals = []string{
++		"```", "def ", "func ", "class ", "import ", "function", "return ",
++		"const ", "let ", "var ", "#include", "public static", "println",
++		"console.log", "stack trace", "traceback", "exception", "segfault",
++		"compile", "compiler", "debug", "refactor", "unit test", "npm ",
++		"pip install", "go build", "cargo ", "kubectl", "dockerfile",
++		"bug", "code", "python", "javascript", "typescript", "golang",
++		"rust", "regex", "sql", "syntax", "api endpoint",
++		"程式", "程式碼", "代碼", "除錯", "函式", "函數", "編譯", "報錯", "重構", "單元測試",
++	}
++	reasoningSignals = []string{
++		"prove", "proof", "theorem", "solve for", "calculate", "compute the",
++		"step by step", "step-by-step", "derive", "derivative", "integral",
++		"equation", "probability", "how many", "optimal", "algorithm complexity",
++		"reason through", "logic puzzle", "chain of thought",
++		"證明", "計算", "推理", "求解", "方程", "演算法", "邏輯", "逐步",
++	}
++)
++
++// classify runs the rule-based Tier-A classifier over the latest user text.
++func classify(text string) classification {
++	lower := strings.ToLower(text)
++	scores := map[string]float64{
++		TaskCode:      countSignals(lower, codeSignals),
++		TaskReasoning: countSignals(lower, reasoningSignals),
++		TaskGeneral:   1.0, // base mass so a signal-free prompt is confidently general
++	}
++
++	zhRatio := traditionalChineseRatio(text)
++	if zhRatio > 0.2 {
++		// Strong Han presence promotes the zh task; the more Han, the
++		// stronger. Capped so it can't single-handedly dominate a clear
++		// code/reasoning prompt.
++		scores[TaskZh] = 1.0 + zhRatio*3.0
++	}
++
++	// Dominant task = argmax. Confidence = its share of total mass.
++	var total, top float64
++	task := TaskGeneral
++	// Deterministic iteration order for stable tie-breaking.
++	for _, k := range []string{TaskCode, TaskReasoning, TaskZh, TaskGeneral} {
++		v := scores[k]
++		total += v
++		if v > top {
++			top = v
++			task = k
++		}
++	}
++	conf := 0.0
++	if total > 0 {
++		conf = top / total
++	}
++	return classification{Task: task, Confidence: conf, Scores: scores, ZhRatio: zhRatio}
++}
++
++func countSignals(lowerText string, signals []string) float64 {
++	var n float64
++	for _, s := range signals {
++		if strings.Contains(lowerText, s) {
++			n++
++		}
++	}
++	return n
++}
++
++// traditionalChineseRatio returns the fraction of Han (CJK) runes among all
++// non-space runes. It does not distinguish Simplified from Traditional (the
++// pool routing prior handles 繁中 via the worker's tasks list), but a high
++// Han ratio is a reliable signal that a Chinese-strong worker is preferred.
++func traditionalChineseRatio(text string) float64 {
++	var han, total float64
++	for _, r := range text {
++		if unicode.IsSpace(r) {
++			continue
++		}
++		total++
++		if unicode.Is(unicode.Han, r) {
++			han++
++		}
++	}
++	if total == 0 {
++		return 0
++	}
++	return han / total
++}
+diff --git a/internal/orchestrator/conductor.go b/internal/orchestrator/conductor.go
+new file mode 100644
+index 0000000..5144067
+--- /dev/null
++++ b/internal/orchestrator/conductor.go
+@@ -0,0 +1,221 @@
++package orchestrator
++
++import (
++	"context"
++	"fmt"
++	"strings"
++
++	"github.com/will-wang-88/llmgateway/internal/config"
++)
++
++// Conductor role names (also used as metric labels and in the route trace).
++const (
++	roleThinker     = "thinker"
++	roleWorker      = "worker"
++	roleVerifier    = "verifier"
++	roleSynthesizer = "synthesizer"
++)
++
++// runConductor executes the Tier-B bounded DAG. It implements a TRINITY-style
++// Thinker → Worker → Verifier → Synthesizer pipeline, trimmed to fit the
++// configured step budget, with the verifier forced to a different model than
++// the producer (heterogeneous cross-check) and per-step access lists gating
++// which prior outputs each worker can see.
++func (o *Orchestrator) runConductor(ctx context.Context, base []chatMessage, params genParams, eligible []*config.OrchestrationWorker, cls classification, escalated bool) (*Result, error) {
++	budget := o.cfg.MaxSteps
++	if budget <= 0 {
++		budget = 5
++	}
++
++	// Decide which optional stages fit the budget. The solver (draft) is
++	// mandatory; verifier and synthesizer are added as budget allows, and
++	// the thinker is added last because it is the most optional.
++	doVerifier := budget >= 2
++	doSynth := budget >= 3
++	doThinker := budget >= 4
++
++	res := &Result{Tier: "conductor", Task: cls.Task, Confidence: cls.Confidence, Escalated: escalated}
++	stepNo := 0
++	addStep := func(role string, c *completion) {
++		stepNo++
++		o.incStep(role, c.WorkerID)
++		res.Steps = append(res.Steps, StepInfo{
++			Step: stepNo, Role: role, WorkerID: c.WorkerID, Model: c.Model,
++			BackendID: c.BackendID, LatencyMS: c.LatencyMS,
++		})
++		res.Usage.PromptTokens += c.Usage.PromptTokens
++		res.Usage.CompletionTokens += c.Usage.CompletionTokens
++		res.Usage.TotalTokens += c.Usage.TotalTokens
++		res.Usage.ReasoningTokens += c.Usage.ReasoningTokens
++	}
++
++	solver := o.selectWorker(cls.Task, eligible)
++	if solver == nil {
++		solver = strongestWorker(eligible)
++	}
++
++	// 1. Thinker: decompose the task. Access list: user only.
++	var plan string
++	if doThinker {
++		thinker := o.selectWorker(TaskReasoning, eligible)
++		if thinker == nil {
++			thinker = solver
++		}
++		msgs := stepMessages(thinkerPrompt, base, nil)
++		c, err := o.callWorker(ctx, thinker, msgs, plannerParams(params))
++		if err != nil {
++			o.incRoute("conductor", thinker.ID, cls.Task, "error")
++			return nil, fmt.Errorf("conductor thinker step: %w", err)
++		}
++		plan = c.Text
++		addStep(roleThinker, c)
++	}
++
++	// 2. Worker: produce a draft answer. Access list: user + thinker plan.
++	var solverCtx []ctxBlock
++	if plan != "" {
++		solverCtx = append(solverCtx, ctxBlock{"DECOMPOSITION / PLAN", plan})
++	}
++	draftMsgs := stepMessages(workerPrompt, base, solverCtx)
++	draftC, err := o.callWorker(ctx, solver, draftMsgs, params)
++	if err != nil {
++		o.incRoute("conductor", solver.ID, cls.Task, "error")
++		return nil, fmt.Errorf("conductor worker step: %w", err)
++	}
++	draft := draftC.Text
++	addStep(roleWorker, draftC)
++
++	// 3. Verifier: heterogeneous cross-check. Access list: user + draft
++	//    (deliberately NOT the plan, to keep the check independent).
++	var critique string
++	if doVerifier {
++		verifier := o.selectVerifier(solver, eligible)
++		if verifier.ID == solver.ID {
++			// Only one eligible model — a same-model check is weaker but
++			// still useful; note it in the trace via the role label.
++			o.logWarn("conductor: verifier falls back to same model as worker (only one eligible worker)")
++		}
++		vMsgs := stepMessages(verifierPrompt, base, []ctxBlock{{"CANDIDATE ANSWER TO REVIEW", draft}})
++		vC, err := o.callWorker(ctx, verifier, vMsgs, plannerParams(params))
++		if err != nil {
++			// A failed verification should not sink the whole request; we
++			// degrade to the draft answer rather than erroring out.
++			o.logWarn("conductor: verifier step failed, returning unverified draft: " + err.Error())
++		} else {
++			critique = vC.Text
++			addStep(roleVerifier, vC)
++		}
++	}
++
++	// 4. Synthesizer: fold the critique into a final answer. Access list:
++	//    user + draft + critique.
++	if doSynth && critique != "" {
++		synthCtx := []ctxBlock{
++			{"DRAFT ANSWER", draft},
++			{"REVIEWER FEEDBACK", critique},
++		}
++		sMsgs := stepMessages(synthesizerPrompt, base, synthCtx)
++		sC, err := o.callWorker(ctx, solver, sMsgs, params)
++		if err != nil {
++			o.logWarn("conductor: synthesizer step failed, returning draft: " + err.Error())
++			res.Content = draft
++		} else {
++			res.Content = sC.Text
++			addStep(roleSynthesizer, sC)
++		}
++	} else {
++		res.Content = draft
++	}
++
++	outcome := "ok"
++	if res.Content == "" {
++		outcome = "empty"
++	}
++	o.incRoute("conductor", solver.ID, cls.Task, outcome)
++	return res, nil
++}
++
++// selectVerifier picks a worker for the verification step, strongly
++// preferring a model that is DIFFERENT from the producer (the spec requires
++// a heterogeneous cross-check). Workers tagged "verify" are preferred among
++// the alternatives.
++func (o *Orchestrator) selectVerifier(producer *config.OrchestrationWorker, eligible []*config.OrchestrationWorker) *config.OrchestrationWorker {
++	var bestDiff *config.OrchestrationWorker
++	bestScore := -1e18
++	for _, w := range eligible {
++		if w.ID == producer.ID {
++			continue
++		}
++		score := workerStrength(w)
++		if containsFold(w.Tasks, "verify") {
++			score += 1.0
++		}
++		if score > bestScore {
++			bestScore = score
++			bestDiff = w
++		}
++	}
++	if bestDiff != nil {
++		return bestDiff
++	}
++	return producer
++}
++
++func (o *Orchestrator) logWarn(msg string) {
++	if o.logger != nil {
++		o.logger.Warn(msg, nil)
++	}
++}
++
++// ctxBlock is a labeled piece of context injected into a step's system
++// prompt under the access-list rules.
++type ctxBlock struct {
++	Label string
++	Text  string
++}
++
++// stepMessages builds the message list for one worker call: a system message
++// carrying the role instructions plus any access-listed context blocks,
++// followed by the original conversation.
++func stepMessages(rolePrompt string, base []chatMessage, ctx []ctxBlock) []chatMessage {
++	var sys strings.Builder
++	sys.WriteString(rolePrompt)
++	for _, b := range ctx {
++		sys.WriteString("\n\n--- ")
++		sys.WriteString(b.Label)
++		sys.WriteString(" ---\n")
++		sys.WriteString(b.Text)
++	}
++	out := make([]chatMessage, 0, len(base)+1)
++	out = append(out, chatMessage{Role: "system", Content: sys.String()})
++	out = append(out, base...)
++	return out
++}
++
++// plannerParams returns params suited to planning/critique steps: it leaves
++// the caller's settings intact but drops any client max_tokens cap that is
++// too small to express a useful intermediate artifact.
++func plannerParams(p genParams) genParams {
++	out := p
++	if out.MaxTokens != nil && *out.MaxTokens < 512 {
++		out.MaxTokens = nil
++	}
++	return out
++}
++
++const (
++	thinkerPrompt = "You are the THINKER in a multi-model workflow. Do NOT answer the user's request directly. " +
++		"Instead, decompose it into a short, concrete plan (at most five steps) that another model will execute. " +
++		"Identify the key sub-problems, edge cases, and what a correct answer must contain. Be concise."
++
++	workerPrompt = "You are the WORKER in a multi-model workflow. Produce the best, complete answer to the user's request. " +
++		"If a plan is provided, follow it. Be correct and concrete."
++
++	verifierPrompt = "You are the VERIFIER in a multi-model workflow, and you are a DIFFERENT model from the one that wrote the candidate answer. " +
++		"Critically review the candidate answer for correctness, missing cases, and mistakes. " +
++		"List concrete problems and corrections. If the answer is fully correct, say so explicitly. Do NOT rewrite the whole answer."
++
++	synthesizerPrompt = "You are the SYNTHESIZER in a multi-model workflow. Using the draft answer and the reviewer feedback, " +
++		"produce the final, corrected answer for the user. Incorporate valid corrections and ignore incorrect feedback. " +
++		"Output only the final answer, with no meta-commentary about the process."
++)
+diff --git a/internal/orchestrator/orchestrator.go b/internal/orchestrator/orchestrator.go
+new file mode 100644
+index 0000000..a05952a
+--- /dev/null
++++ b/internal/orchestrator/orchestrator.go
+@@ -0,0 +1,369 @@
++// Package orchestrator implements a Fugu-style, behaviour-level model
++// orchestration layer on top of the gateway's existing routing machinery.
++//
++// It does NOT merge model weights (the pool is architecturally
++// heterogeneous — MoE + two dense models with different tokenizers, so
++// weight merges are impossible). Instead it treats each model as a black
++// box and decides, at inference time, which worker(s) should answer a
++// request:
++//
++//   - Tier-A "router" (low latency): a rule-based classifier inspects the
++//     request and dispatches it to the single best-suited worker. This is
++//     the default, cheap path. When the classifier is not confident the
++//     request escalates to Tier-B (or to the strongest worker).
++//
++//   - Tier-B "conductor" (high quality): a bounded (≤5 step) DAG that
++//     decomposes the task across workers in Thinker → Worker → Verifier →
++//     Synthesizer roles, enforcing that the verifier is a *different*
++//     model from the producer (heterogeneous cross-check), and gating
++//     cross-step visibility through an access list.
++//
++// Both tiers are exposed as ordinary OpenAI-compatible virtual models, so
++// clients keep calling a single endpoint.
++package orchestrator
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"net"
++	"net/http"
++	"strings"
++	"time"
++
++	"github.com/will-wang-88/llmgateway/internal/balancer"
++	"github.com/will-wang-88/llmgateway/internal/config"
++	"github.com/will-wang-88/llmgateway/internal/logging"
++	"github.com/will-wang-88/llmgateway/internal/proxy"
++	"github.com/will-wang-88/llmgateway/internal/store"
++)
++
++// MetricsSink receives orchestration telemetry. A nil sink is tolerated
++// (see the nil-guards in the call sites).
++type MetricsSink interface {
++	IncRoute(tier, worker, task, outcome string)
++	IncEscalation(reason string)
++	IncStep(role, worker string)
++}
++
++// Orchestrator coordinates the worker pool. It reuses the shared store and
++// balancer so worker selection honors the same health/capacity rules as the
++// main request path.
++type Orchestrator struct {
++	cfg      config.OrchestrationConfig
++	store    *store.Store
++	balancer *balancer.Balancer
++	logger   *logging.Logger
++	metrics  MetricsSink
++	client   *http.Client
++}
++
++// New constructs an Orchestrator. cfg is assumed already validated by
++// config.Validate.
++func New(cfg config.OrchestrationConfig, s *store.Store, b *balancer.Balancer, log *logging.Logger) *Orchestrator {
++	transport := &http.Transport{
++		Proxy:                 http.ProxyFromEnvironment,
++		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
++		ForceAttemptHTTP2:     true,
++		MaxIdleConns:          100,
++		MaxIdleConnsPerHost:   20,
++		IdleConnTimeout:       90 * time.Second,
++		TLSHandshakeTimeout:   10 * time.Second,
++		ExpectContinueTimeout: 1 * time.Second,
++		DisableCompression:    true,
++		ResponseHeaderTimeout: 60 * time.Second,
++	}
++	return &Orchestrator{
++		cfg:      cfg,
++		store:    s,
++		balancer: b,
++		logger:   log,
++		client:   &http.Client{Transport: transport},
++	}
++}
++
++// WithMetrics attaches a metrics sink.
++func (o *Orchestrator) WithMetrics(m MetricsSink) *Orchestrator { o.metrics = m; return o }
++
++// Handles reports whether the given model name is one of the virtual models
++// this orchestrator owns.
++func (o *Orchestrator) Handles(model string) bool {
++	if o == nil || !o.cfg.Enabled {
++		return false
++	}
++	return model == o.cfg.RouterModel || (o.cfg.ConductorModel != "" && model == o.cfg.ConductorModel)
++}
++
++// VirtualModels returns the configured virtual model names (for /v1/models).
++func (o *Orchestrator) VirtualModels() []string {
++	if o == nil || !o.cfg.Enabled {
++		return nil
++	}
++	var out []string
++	if o.cfg.RouterModel != "" {
++		out = append(out, o.cfg.RouterModel)
++	}
++	if o.cfg.ConductorModel != "" {
++		out = append(out, o.cfg.ConductorModel)
++	}
++	return out
++}
++
++// StepInfo records one node in the route trace, surfaced to clients in the
++// response's x_orchestration extension.
++type StepInfo struct {
++	Step      int    `json:"step"`
++	Role      string `json:"role"`
++	WorkerID  string `json:"worker"`
++	Model     string `json:"model"`
++	BackendID string `json:"backend,omitempty"`
++	LatencyMS int64  `json:"latency_ms"`
++}
++
++// Result is the orchestrated outcome.
++type Result struct {
++	Content    string
++	Usage      proxy.Usage
++	Tier       string
++	Task       string
++	Confidence float64
++	Escalated  bool
++	Steps      []StepInfo
++}
++
++// Handle runs the orchestration for one request. virtualModel selects the
++// tier; rawBody is the client's OpenAI chat-completions body; secretLevel is
++// the request data-sensitivity used for access-list filtering.
++func (o *Orchestrator) Handle(ctx context.Context, virtualModel string, rawBody []byte, secretLevel int) (*Result, error) {
++	msgs, params, err := parseRequest(rawBody)
++	if err != nil {
++		return nil, err
++	}
++	if len(msgs) == 0 {
++		return nil, fmt.Errorf("orchestration requires at least one message")
++	}
++
++	eligible := o.eligibleWorkers(secretLevel)
++	if len(eligible) == 0 {
++		return nil, fmt.Errorf("no worker is permitted to process a secret level %d request", secretLevel)
++	}
++
++	conductorRequested := o.cfg.ConductorModel != "" && virtualModel == o.cfg.ConductorModel
++	if conductorRequested {
++		return o.runConductor(ctx, msgs, params, eligible, classify(lastUserText(msgs)), false)
++	}
++
++	// Tier-A router path.
++	cls := classify(lastUserText(msgs))
++	if cls.Confidence < o.cfg.ConfidenceThreshold {
++		// Low confidence: escalate. Prefer Tier-B if available, else fall
++		// back to the strongest eligible worker (section 8).
++		o.incEscalation("low_confidence")
++		if o.cfg.ConductorModel != "" {
++			return o.runConductor(ctx, msgs, params, eligible, cls, true)
++		}
++		w := strongestWorker(eligible)
++		return o.single(ctx, w, msgs, params, cls, "router", true)
++	}
++
++	w := o.selectWorker(cls.Task, eligible)
++	if w == nil {
++		w = strongestWorker(eligible)
++	}
++	return o.single(ctx, w, msgs, params, cls, "router", false)
++}
++
++// single dispatches to one worker and wraps the result (Tier-A).
++func (o *Orchestrator) single(ctx context.Context, w *config.OrchestrationWorker, msgs []chatMessage, params genParams, cls classification, tier string, escalated bool) (*Result, error) {
++	c, err := o.callWorker(ctx, w, msgs, params)
++	if err != nil {
++		o.incRoute(tier, w.ID, cls.Task, "error")
++		return nil, err
++	}
++	o.incRoute(tier, w.ID, cls.Task, "ok")
++	return &Result{
++		Content:    c.Text,
++		Usage:      c.Usage,
++		Tier:       tier,
++		Task:       cls.Task,
++		Confidence: cls.Confidence,
++		Escalated:  escalated,
++		Steps: []StepInfo{{
++			Step: 1, Role: "route", WorkerID: w.ID, Model: w.Model,
++			BackendID: c.BackendID, LatencyMS: c.LatencyMS,
++		}},
++	}, nil
++}
++
++// eligibleWorkers filters the pool by the access list: a worker may process
++// the request only if its SecretMaxLevel admits the request's secret level.
++// SecretMaxLevel 0 means "unlimited" (an on-prem worker).
++func (o *Orchestrator) eligibleWorkers(secretLevel int) []*config.OrchestrationWorker {
++	out := make([]*config.OrchestrationWorker, 0, len(o.cfg.Workers))
++	for i := range o.cfg.Workers {
++		w := &o.cfg.Workers[i]
++		if w.SecretMaxLevel > 0 && secretLevel > w.SecretMaxLevel {
++			continue
++		}
++		out = append(out, w)
++	}
++	return out
++}
++
++// selectWorker chooses the best worker for a task: workers that declare the
++// task get a large preference bonus; ties break on strength minus cost
++// penalty.
++func (o *Orchestrator) selectWorker(task string, eligible []*config.OrchestrationWorker) *config.OrchestrationWorker {
++	var best *config.OrchestrationWorker
++	bestScore := -1e18
++	for _, w := range eligible {
++		score := workerStrength(w) - o.cfg.CostPenalty*w.Cost
++		if containsFold(w.Tasks, task) {
++			score += 1.0
++		}
++		if score > bestScore {
++			bestScore = score
++			best = w
++		}
++	}
++	return best
++}
++
++func strongestWorker(eligible []*config.OrchestrationWorker) *config.OrchestrationWorker {
++	var best *config.OrchestrationWorker
++	bestScore := -1e18
++	for _, w := range eligible {
++		if s := workerStrength(w); s > bestScore {
++			bestScore = s
++			best = w
++		}
++	}
++	return best
++}
++
++func workerStrength(w *config.OrchestrationWorker) float64 {
++	if w.Strength == 0 {
++		return 0.5
++	}
++	return w.Strength
++}
++
++func (o *Orchestrator) incRoute(tier, worker, task, outcome string) {
++	if o.metrics != nil {
++		o.metrics.IncRoute(tier, worker, task, outcome)
++	}
++}
++
++func (o *Orchestrator) incEscalation(reason string) {
++	if o.metrics != nil {
++		o.metrics.IncEscalation(reason)
++	}
++}
++
++func (o *Orchestrator) incStep(role, worker string) {
++	if o.metrics != nil {
++		o.metrics.IncStep(role, worker)
++	}
++}
++
++func containsFold(list []string, v string) bool {
++	for _, s := range list {
++		if strings.EqualFold(s, v) {
++			return true
++		}
++	}
++	return false
++}
++
++// lastUserText returns the content of the last user message, or the last
++// message if no user message is present.
++func lastUserText(msgs []chatMessage) string {
++	for i := len(msgs) - 1; i >= 0; i-- {
++		if strings.EqualFold(msgs[i].Role, "user") {
++			return msgs[i].Content
++		}
++	}
++	return msgs[len(msgs)-1].Content
++}
++
++// parseRequest extracts messages and generation params from an OpenAI
++// chat-completions body, flattening multimodal content parts to text.
++func parseRequest(raw []byte) ([]chatMessage, genParams, error) {
++	var in struct {
++		Messages []struct {
++			Role    string          `json:"role"`
++			Content json.RawMessage `json:"content"`
++		} `json:"messages"`
++		Temperature *float64 `json:"temperature"`
++		TopP        *float64 `json:"top_p"`
++		MaxTokens   *int64   `json:"max_tokens"`
++	}
++	if err := json.Unmarshal(raw, &in); err != nil {
++		return nil, genParams{}, fmt.Errorf("invalid orchestration request: %w", err)
++	}
++	msgs := make([]chatMessage, 0, len(in.Messages))
++	for _, m := range in.Messages {
++		msgs = append(msgs, chatMessage{Role: m.Role, Content: flattenContent(m.Content)})
++	}
++	return msgs, genParams{Temperature: in.Temperature, TopP: in.TopP, MaxTokens: in.MaxTokens}, nil
++}
++
++// flattenContent reduces OpenAI message content (a string or an array of
++// typed parts) to plain text.
++func flattenContent(raw json.RawMessage) string {
++	if len(raw) == 0 {
++		return ""
++	}
++	var s string
++	if err := json.Unmarshal(raw, &s); err == nil {
++		return s
++	}
++	var parts []struct {
++		Type string `json:"type"`
++		Text string `json:"text"`
++	}
++	if err := json.Unmarshal(raw, &parts); err == nil {
++		var b strings.Builder
++		for _, p := range parts {
++			if p.Text != "" {
++				if b.Len() > 0 {
++					b.WriteByte('\n')
++				}
++				b.WriteString(p.Text)
++			}
++		}
++		return b.String()
++	}
++	return ""
++}
++
++// BuildChatCompletion renders a Result as an OpenAI chat.completion object,
++// attaching an x_orchestration extension with the route trace.
++func BuildChatCompletion(id, model string, created int64, r *Result) []byte {
++	type choice struct {
++		Index        int         `json:"index"`
++		Message      chatMessage `json:"message"`
++		FinishReason string      `json:"finish_reason"`
++	}
++	resp := map[string]any{
++		"id":      id,
++		"object":  "chat.completion",
++		"created": created,
++		"model":   model,
++		"choices": []choice{{
++			Index:        0,
++			Message:      chatMessage{Role: "assistant", Content: r.Content},
++			FinishReason: "stop",
++		}},
++		"usage": r.Usage,
++		"x_orchestration": map[string]any{
++			"tier":       r.Tier,
++			"task":       r.Task,
++			"confidence": r.Confidence,
++			"escalated":  r.Escalated,
++			"route":      r.Steps,
++		},
++	}
++	out, _ := json.Marshal(resp)
++	return out
++}
+diff --git a/internal/orchestrator/orchestrator_test.go b/internal/orchestrator/orchestrator_test.go
+new file mode 100644
+index 0000000..6e4f386
+--- /dev/null
++++ b/internal/orchestrator/orchestrator_test.go
+@@ -0,0 +1,258 @@
++package orchestrator
++
++import (
++	"context"
++	"encoding/json"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/will-wang-88/llmgateway/internal/balancer"
++	"github.com/will-wang-88/llmgateway/internal/config"
++	"github.com/will-wang-88/llmgateway/internal/store"
++)
++
++// newTestOrchestrator wires an orchestrator to a single mock upstream that
++// echoes the requested model in the completion content, so tests can assert
++// which worker was actually dispatched to.
++func newTestOrchestrator(t *testing.T, oc config.OrchestrationConfig) (*Orchestrator, *recordingServer) {
++	t.Helper()
++	srv := &recordingServer{}
++	ts := httptest.NewServer(http.HandlerFunc(srv.handle))
++	t.Cleanup(ts.Close)
++
++	cfg := &config.Config{
++		Backends: []config.BackendConfig{
++			{ID: "be-gptoss", BaseURL: ts.URL, Enabled: true, Models: []string{"gpt-oss-120b"}, Weight: 1},
++			{ID: "be-gemma", BaseURL: ts.URL, Enabled: true, Models: []string{"gemma-4-26b"}, Weight: 1},
++			{ID: "be-qwen", BaseURL: ts.URL, Enabled: true, Models: []string{"qwen3.6-27b"}, Weight: 1},
++		},
++		Orchestration: oc,
++	}
++	s := store.New("")
++	if err := s.LoadFromConfig(cfg); err != nil {
++		t.Fatalf("load store: %v", err)
++	}
++	o := New(oc, s, balancer.New(), nil)
++	return o, srv
++}
++
++type recordingServer struct {
++	models []string // models seen, in order
++}
++
++func (s *recordingServer) handle(w http.ResponseWriter, r *http.Request) {
++	body, _ := io.ReadAll(r.Body)
++	var req struct {
++		Model string `json:"model"`
++	}
++	_ = json.Unmarshal(body, &req)
++	s.models = append(s.models, req.Model)
++	resp := map[string]any{
++		"choices": []map[string]any{{
++			"message":       map[string]string{"role": "assistant", "content": "answer from " + req.Model},
++			"finish_reason": "stop",
++		}},
++		"usage": map[string]int{"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
++	}
++	w.Header().Set("Content-Type", "application/json")
++	_ = json.NewEncoder(w).Encode(resp)
++}
++
++func defaultWorkers() []config.OrchestrationWorker {
++	return []config.OrchestrationWorker{
++		{ID: "qwen", Model: "qwen3.6-27b", Tasks: []string{"code", "zh", "verify"}, Strength: 0.82, Cost: 2},
++		{ID: "gptoss", Model: "gpt-oss-120b", Tasks: []string{"reasoning", "verify"}, Strength: 0.90, Cost: 5},
++		{ID: "gemma", Model: "gemma-4-26b", Tasks: []string{"general"}, Strength: 0.70, Cost: 1},
++	}
++}
++
++func baseConfig() config.OrchestrationConfig {
++	return config.OrchestrationConfig{
++		Enabled:             true,
++		RouterModel:         "fugu-auto",
++		ConductorModel:      "fugu-ultra",
++		ConfidenceThreshold: 0.55,
++		MaxSteps:            5,
++		RequestTimeoutMS:    5000,
++		SecretLevelHeader:   "X-Secret-Level",
++		Workers:             defaultWorkers(),
++	}
++}
++
++func chatBody(content string) []byte {
++	b, _ := json.Marshal(map[string]any{
++		"model":    "fugu-auto",
++		"messages": []map[string]string{{"role": "user", "content": content}},
++	})
++	return b
++}
++
++func TestClassify(t *testing.T) {
++	cases := []struct {
++		name string
++		text string
++		want string
++	}{
++		{"code", "Please write a Go function to reverse a slice and debug this stack trace", TaskCode},
++		{"reasoning", "Prove that the sum is optimal and calculate the probability step by step", TaskReasoning},
++		{"zh", "請幫我把這段文字翻譯成英文並做摘要整理", TaskZh},
++		{"general", "Hi there, how are you today?", TaskGeneral},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			got := classify(c.text)
++			if got.Task != c.want {
++				t.Fatalf("classify(%q).Task = %q, want %q (scores=%v)", c.text, got.Task, c.want, got.Scores)
++			}
++		})
++	}
++}
++
++func TestClassifyAmbiguousLowConfidence(t *testing.T) {
++	// Mixed code + reasoning signals → no single task dominates → low conf.
++	got := classify("Write a function to prove this theorem and calculate the derivative, debug the compiler error")
++	if got.Confidence >= 0.55 {
++		t.Fatalf("expected low confidence for mixed prompt, got %v (scores=%v)", got.Confidence, got.Scores)
++	}
++}
++
++func TestTierARoutesCodeToQwen(t *testing.T) {
++	o, srv := newTestOrchestrator(t, baseConfig())
++	res, err := o.Handle(context.Background(), "fugu-auto", chatBody("write a python function and fix the bug in this code"), 0)
++	if err != nil {
++		t.Fatalf("handle: %v", err)
++	}
++	if res.Tier != "router" {
++		t.Fatalf("tier = %q, want router", res.Tier)
++	}
++	if len(res.Steps) != 1 || res.Steps[0].WorkerID != "qwen" {
++		t.Fatalf("expected single qwen step, got %+v", res.Steps)
++	}
++	if !strings.Contains(res.Content, "qwen3.6-27b") {
++		t.Fatalf("content not from qwen: %q", res.Content)
++	}
++	if srv.models[0] != "qwen3.6-27b" {
++		t.Fatalf("dispatched to %q, want qwen3.6-27b", srv.models[0])
++	}
++}
++
++func TestTierARoutesReasoningToGptoss(t *testing.T) {
++	o, _ := newTestOrchestrator(t, baseConfig())
++	res, err := o.Handle(context.Background(), "fugu-auto", chatBody("prove this theorem and calculate the integral step by step"), 0)
++	if err != nil {
++		t.Fatalf("handle: %v", err)
++	}
++	if res.Steps[0].WorkerID != "gptoss" {
++		t.Fatalf("reasoning should route to gptoss, got %q", res.Steps[0].WorkerID)
++	}
++}
++
++func TestTierALowConfidenceEscalatesToConductor(t *testing.T) {
++	o, _ := newTestOrchestrator(t, baseConfig())
++	res, err := o.Handle(context.Background(), "fugu-auto",
++		chatBody("write a function to prove this theorem and calculate the derivative, debug the compiler error"), 0)
++	if err != nil {
++		t.Fatalf("handle: %v", err)
++	}
++	if !res.Escalated {
++		t.Fatalf("expected escalation on low confidence")
++	}
++	if res.Tier != "conductor" {
++		t.Fatalf("expected escalation to conductor tier, got %q", res.Tier)
++	}
++}
++
++func TestTierBConductorRunsTrinity(t *testing.T) {
++	o, _ := newTestOrchestrator(t, baseConfig())
++	res, err := o.Handle(context.Background(), "fugu-ultra", chatBody("write a python function to fix this bug"), 0)
++	if err != nil {
++		t.Fatalf("handle: %v", err)
++	}
++	if res.Tier != "conductor" {
++		t.Fatalf("tier = %q, want conductor", res.Tier)
++	}
++	if len(res.Steps) < 3 {
++		t.Fatalf("expected at least 3 conductor steps, got %d: %+v", len(res.Steps), res.Steps)
++	}
++	if len(res.Steps) > o.cfg.MaxSteps {
++		t.Fatalf("steps %d exceed max_steps %d", len(res.Steps), o.cfg.MaxSteps)
++	}
++	// Verifier must be a different model than the worker (heterogeneous check).
++	var worker, verifier string
++	for _, s := range res.Steps {
++		switch s.Role {
++		case roleWorker:
++			worker = s.WorkerID
++		case roleVerifier:
++			verifier = s.WorkerID
++		}
++	}
++	if verifier == "" {
++		t.Fatalf("no verifier step ran: %+v", res.Steps)
++	}
++	if verifier == worker {
++		t.Fatalf("verifier (%s) must differ from worker (%s)", verifier, worker)
++	}
++	// Usage is aggregated across all steps.
++	if res.Usage.TotalTokens != int64(15*len(res.Steps)) {
++		t.Fatalf("usage not aggregated: got %d for %d steps", res.Usage.TotalTokens, len(res.Steps))
++	}
++}
++
++func TestAccessListExcludesBySecretLevel(t *testing.T) {
++	oc := baseConfig()
++	// Make gemma a "cloud" worker that may only see secret level <= 1.
++	for i := range oc.Workers {
++		if oc.Workers[i].ID == "gemma" {
++			oc.Workers[i].SecretMaxLevel = 1
++		}
++	}
++	o, _ := newTestOrchestrator(t, oc)
++
++	eligLow := o.eligibleWorkers(0)
++	if len(eligLow) != 3 {
++		t.Fatalf("secret 0 should admit all workers, got %d", len(eligLow))
++	}
++	eligHigh := o.eligibleWorkers(3)
++	if len(eligHigh) != 2 {
++		t.Fatalf("secret 3 should exclude gemma, got %d", len(eligHigh))
++	}
++	for _, w := range eligHigh {
++		if w.ID == "gemma" {
++			t.Fatalf("gemma must be excluded at secret level 3")
++		}
++	}
++}
++
++func TestMaxStepsBudgetTrims(t *testing.T) {
++	oc := baseConfig()
++	oc.MaxSteps = 2 // only solver + verifier; final = draft
++	o, _ := newTestOrchestrator(t, oc)
++	res, err := o.Handle(context.Background(), "fugu-ultra", chatBody("write a function"), 0)
++	if err != nil {
++		t.Fatalf("handle: %v", err)
++	}
++	if len(res.Steps) > 2 {
++		t.Fatalf("max_steps=2 should cap steps, got %d", len(res.Steps))
++	}
++	if res.Content == "" {
++		t.Fatalf("expected a final answer even with trimmed budget")
++	}
++}
++
++func TestHandlesAndVirtualModels(t *testing.T) {
++	o, _ := newTestOrchestrator(t, baseConfig())
++	if !o.Handles("fugu-auto") || !o.Handles("fugu-ultra") {
++		t.Fatalf("Handles should recognize both virtual models")
++	}
++	if o.Handles("gpt-oss-120b") {
++		t.Fatalf("Handles must not claim a real worker model")
++	}
++	vm := o.VirtualModels()
++	if len(vm) != 2 {
++		t.Fatalf("expected 2 virtual models, got %v", vm)
++	}
++}
+diff --git a/internal/orchestrator/worker.go b/internal/orchestrator/worker.go
+new file mode 100644
+index 0000000..62c8c2d
+--- /dev/null
++++ b/internal/orchestrator/worker.go
+@@ -0,0 +1,180 @@
++package orchestrator
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"time"
++
++	"github.com/will-wang-88/llmgateway/internal/balancer"
++	"github.com/will-wang-88/llmgateway/internal/config"
++	"github.com/will-wang-88/llmgateway/internal/proxy"
++	"github.com/will-wang-88/llmgateway/internal/store"
++)
++
++// chatMessage is the minimal OpenAI chat message shape the orchestrator
++// emits to workers and returns to clients.
++type chatMessage struct {
++	Role    string `json:"role"`
++	Content string `json:"content"`
++}
++
++// genParams carries the optional generation knobs the orchestrator passes
++// through to workers. They are copied from the inbound request so callers
++// keep control over sampling.
++type genParams struct {
++	Temperature *float64 `json:"temperature,omitempty"`
++	TopP        *float64 `json:"top_p,omitempty"`
++	MaxTokens   *int64   `json:"max_tokens,omitempty"`
++}
++
++// completion is the result of a single worker call.
++type completion struct {
++	Text      string
++	Usage     proxy.Usage
++	WorkerID  string
++	Model     string
++	BackendID string
++	LatencyMS int64
++}
++
++// chatRequest is what we POST to a worker backend.
++type chatRequest struct {
++	Model       string        `json:"model"`
++	Messages    []chatMessage `json:"messages"`
++	Stream      bool          `json:"stream"`
++	Temperature *float64      `json:"temperature,omitempty"`
++	TopP        *float64      `json:"top_p,omitempty"`
++	MaxTokens   *int64        `json:"max_tokens,omitempty"`
++}
++
++// chatResponse is the subset of the worker response we read.
++type chatResponse struct {
++	Choices []struct {
++		Message      chatMessage `json:"message"`
++		FinishReason string      `json:"finish_reason"`
++	} `json:"choices"`
++	Usage *proxy.Usage `json:"usage"`
++	Error *struct {
++		Message string `json:"message"`
++		Type    string `json:"type"`
++		Code    string `json:"code"`
++	} `json:"error"`
++}
++
++// callWorker dispatches a single non-streaming chat completion to the named
++// worker, picking a healthy backend via the shared balancer, and returns the
++// assistant text plus usage. It enforces the worker's concurrency slot and
++// the configured per-call timeout.
++func (o *Orchestrator) callWorker(ctx context.Context, w *config.OrchestrationWorker, msgs []chatMessage, p genParams) (*completion, error) {
++	be, err := o.pickBackend(w.Model)
++	if err != nil {
++		return nil, err
++	}
++	if !be.AcquireSlot() {
++		return nil, fmt.Errorf("worker %s: backend %s at capacity", w.ID, be.ID)
++	}
++
++	body, _ := json.Marshal(chatRequest{
++		Model:       w.Model,
++		Messages:    msgs,
++		Stream:      false,
++		Temperature: p.Temperature,
++		TopP:        p.TopP,
++		MaxTokens:   p.MaxTokens,
++	})
++
++	timeout := time.Duration(o.cfg.RequestTimeoutMS) * time.Millisecond
++	if be.TimeoutMS > 0 && time.Duration(be.TimeoutMS)*time.Millisecond < timeout {
++		timeout = time.Duration(be.TimeoutMS) * time.Millisecond
++	}
++	reqCtx, cancel := context.WithTimeout(ctx, timeout)
++	defer cancel()
++
++	start := time.Now()
++	url := be.BaseURL + "/chat/completions"
++	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, bytes.NewReader(body))
++	if err != nil {
++		be.ReleaseSlot(false)
++		return nil, fmt.Errorf("worker %s: build request: %w", w.ID, err)
++	}
++	req.Header.Set("Content-Type", "application/json")
++	req.Header.Set("Accept", "application/json")
++	req.Header.Set("Accept-Encoding", "identity")
++	if be.APIKey != "" {
++		req.Header.Set("Authorization", "Bearer "+be.APIKey)
++	}
++
++	resp, err := o.client.Do(req)
++	if err != nil {
++		be.ReleaseSlot(false)
++		return nil, fmt.Errorf("worker %s: backend %s unreachable: %w", w.ID, be.ID, err)
++	}
++	defer resp.Body.Close()
++
++	var parsed chatResponse
++	dec := json.NewDecoder(resp.Body)
++	if err := dec.Decode(&parsed); err != nil {
++		be.ReleaseSlot(false)
++		return nil, fmt.Errorf("worker %s: decode backend response: %w", w.ID, err)
++	}
++	success := resp.StatusCode >= 200 && resp.StatusCode < 300
++	be.ReleaseSlot(success)
++
++	if !success {
++		msg := fmt.Sprintf("status %d", resp.StatusCode)
++		if parsed.Error != nil && parsed.Error.Message != "" {
++			msg = parsed.Error.Message
++		}
++		return nil, fmt.Errorf("worker %s: backend %s error: %s", w.ID, be.ID, msg)
++	}
++	if len(parsed.Choices) == 0 {
++		return nil, fmt.Errorf("worker %s: backend %s returned no choices", w.ID, be.ID)
++	}
++
++	c := &completion{
++		Text:      parsed.Choices[0].Message.Content,
++		WorkerID:  w.ID,
++		Model:     w.Model,
++		BackendID: be.ID,
++		LatencyMS: time.Since(start).Milliseconds(),
++	}
++	if parsed.Usage != nil {
++		c.Usage = *parsed.Usage
++	}
++	return c, nil
++}
++
++// pickBackend selects one routable backend for an internal model name using
++// the same health/capacity rules as the main request path.
++func (o *Orchestrator) pickBackend(model string) (*store.Backend, error) {
++	candidates := o.store.BackendsForModel(model)
++	ready := make([]*store.Backend, 0, len(candidates))
++	for _, b := range candidates {
++		if !b.Enabled {
++			continue
++		}
++		switch b.Status() {
++		case store.StatusHealthy, store.StatusUnknown:
++		default:
++			continue
++		}
++		if b.Weight == 0 {
++			continue
++		}
++		if b.MaxConcurrentRequests > 0 && b.ActiveRequests() >= int64(b.MaxConcurrentRequests) {
++			continue
++		}
++		ready = append(ready, b)
++	}
++	if len(ready) == 0 {
++		return nil, fmt.Errorf("no healthy backend for worker model %q", model)
++	}
++	picked := o.balancer.Choose(model, balancer.PolicyWeightedRoundRobin, ready, balancer.Hint{})
++	if picked == nil {
++		return nil, fmt.Errorf("no healthy backend for worker model %q", model)
++	}
++	return picked, nil
++}
+-- 
+2.43.0
+
+
+From 930fc08d9f63b1c94c2ca82cf62a10c2146d70f4 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 25 Jun 2026 03:39:01 +0000
+Subject: [PATCH 2/2] Address review findings in orchestration layer
+
+Correctness / billing:
+- Charge token usage on the orchestration path with the same conservative
+  estimate fallback the direct path uses when a worker omits the usage block
+  (closes a token-quota/limit bypass).
+- Tier-B returns partial usage on a mid-DAG failure so already-consumed
+  tokens are still charged.
+
+Control plane / config:
+- Reject virtual-model names that collide with a real model/alias/backend
+  model (would silently shadow the real model via the Handles() early
+  return); validate that every worker model is served by a backend.
+- Worker dispatch honors the model-registry enabled kill-switch and the
+  routing allow_degraded_backends flag (shared store.FilterRoutable).
+
+Logic / governance:
+- Conductor pairs verifier+synthesizer on one budget gate so the verifier is
+  never run only to discard its critique; thinker fills budget==2.
+- Clamp negative/out-of-range secret levels so the access list can't be
+  bypassed.
+- Per-call timeout honors a backend TimeoutMS larger than the global default
+  (matches the direct path), not only smaller.
+
+Observability:
+- Emit ActiveRequests gauge for orchestrated requests and per-backend
+  BackendErrors / Timeouts counters from worker calls.
+- Status is checked before decoding so a non-JSON error page surfaces the
+  real status; empty-choices responses are counted as backend errors.
+- Slot acquisition retries on a lost race instead of hard-failing.
+- Streaming responses carry usage and x_orchestration in the final chunk.
+
+Cleanup:
+- Share proxy.DefaultTransport and store.FilterRoutable; remove duplicate
+  apiKeyLabelOf; parse the request body one fewer time (secret_level read
+  from the handler's existing peek).
+
+Tests: collision/reachability validation, verifier/synth pairing, partial
+usage on failure, secret-level clamp, kill-switch, backend-timeout honoring,
+omitted-usage contract, and a sample-config load test.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZkEu6Lfy9sZke6vyJYdx9
+---
+ README.md                                  |  11 +-
+ cmd/gateway/main.go                        |   1 +
+ internal/config/config.go                  |  47 ++++++++
+ internal/config/config_test.go             |  17 +++
+ internal/config/sample_load_test.go        |  15 +++
+ internal/handlers/handlers.go              |  64 +++++------
+ internal/handlers/orchestration.go         | 124 ++++++++++++++-------
+ internal/orchestrator/conductor.go         |  18 ++-
+ internal/orchestrator/orchestrator.go      |  59 ++++++----
+ internal/orchestrator/orchestrator_test.go | 114 ++++++++++++++++++-
+ internal/orchestrator/worker.go            |  88 +++++++++------
+ internal/proxy/proxy.go                    |  63 ++++++-----
+ internal/store/store.go                    |  44 +++++++-
+ 13 files changed, 493 insertions(+), 172 deletions(-)
+ create mode 100644 internal/config/sample_load_test.go
+
+diff --git a/README.md b/README.md
+index ee55f26..efac4ae 100644
+--- a/README.md
++++ b/README.md
+@@ -414,8 +414,15 @@ Responses are standard `chat.completion` objects with an extra
+ ```
+ 
+ Streaming (`stream: true`) is supported: the orchestrated answer is produced
+-whole and delivered as a single SSE content chunk plus `[DONE]`, so OpenAI
+-streaming clients work unchanged.
++whole and delivered as a content chunk followed by a terminating chunk that
++carries `usage` and `x_orchestration` (so streaming and non-streaming expose
++the same metadata) plus `[DONE]`, so OpenAI streaming clients work unchanged.
++
++Virtual model names are validated at startup against the real catalog (a
++name collision is rejected rather than silently shadowing a real model), and
++worker dispatch honors the model registry kill-switch, the
++`allow_degraded_backends` routing flag, and per-backend timeouts — the same
++rules as the direct path.
+ 
+ ### Metrics
+ 
+diff --git a/cmd/gateway/main.go b/cmd/gateway/main.go
+index c4a6a7c..4db31a2 100644
+--- a/cmd/gateway/main.go
++++ b/cmd/gateway/main.go
+@@ -222,6 +222,7 @@ func main() {
+ 		WithTracer(tr)
+ 	if cfg.Orchestration.Enabled {
+ 		orch := orchestrator.New(cfg.Orchestration, s, bal, logger).
++			WithRouting(cfg.Routing.AllowDegradedBackends).
+ 			WithMetrics(handlers.OrchestratorMetricsSink(m))
+ 		h = h.WithOrchestrator(orch)
+ 		logger.Info("orchestration enabled", logging.F(
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 0daaeca..6239ae2 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -425,6 +425,53 @@ func (c *Config) Validate() error {
+ 	if err := c.Orchestration.validate(); err != nil {
+ 		return err
+ 	}
++	if err := c.validateOrchestrationRefs(); err != nil {
++		return err
++	}
++	return nil
++}
++
++// validateOrchestrationRefs cross-checks the orchestration config against the
++// rest of the catalog: a virtual model name must not collide with a real
++// model / alias / backend-advertised model (else it would silently shadow
++// it via the Handles() early-return in the request path), and every worker
++// model must resolve to at least one backend.
++func (c *Config) validateOrchestrationRefs() error {
++	o := &c.Orchestration
++	if !o.Enabled {
++		return nil
++	}
++	realModels := make(map[string]struct{})
++	for _, m := range c.Models {
++		realModels[m.Name] = struct{}{}
++	}
++	for _, a := range c.ModelAliases {
++		realModels[a.Alias] = struct{}{}
++	}
++	backendModels := make(map[string]struct{})
++	for _, b := range c.Backends {
++		for _, m := range b.Models {
++			backendModels[m] = struct{}{}
++			realModels[m] = struct{}{}
++		}
++	}
++	for _, vm := range []struct{ kind, name string }{
++		{"router_model", o.RouterModel},
++		{"conductor_model", o.ConductorModel},
++	} {
++		if vm.name == "" {
++			continue
++		}
++		if _, clash := realModels[vm.name]; clash {
++			return fmt.Errorf("orchestration %s %q collides with a real model/alias/backend model; pick a distinct virtual name", vm.kind, vm.name)
++		}
++	}
++	for i := range o.Workers {
++		w := &o.Workers[i]
++		if _, ok := backendModels[w.Model]; !ok {
++			return fmt.Errorf("orchestration worker %s references model %q that no backend serves", w.ID, w.Model)
++		}
++	}
+ 	return nil
+ }
+ 
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index d07028a..bda1dd2 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -99,3 +99,20 @@ func TestOrchestrationDisabledSkipsValidation(t *testing.T) {
+ 		t.Fatalf("disabled orchestration should not validate, got %v", err)
+ 	}
+ }
++
++func TestOrchestrationRejectsVirtualModelCollision(t *testing.T) {
++	c := baseOrchestrationConfig()
++	// router_model collides with the worker's real backend model name.
++	c.Orchestration.RouterModel = "qwen3.6-27b"
++	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "collides") {
++		t.Fatalf("expected collision error, got %v", err)
++	}
++}
++
++func TestOrchestrationRejectsUnservedWorkerModel(t *testing.T) {
++	c := baseOrchestrationConfig()
++	c.Orchestration.Workers = []OrchestrationWorker{{ID: "w", Model: "model-no-backend"}}
++	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "no backend serves") {
++		t.Fatalf("expected unserved-worker-model error, got %v", err)
++	}
++}
+diff --git a/internal/config/sample_load_test.go b/internal/config/sample_load_test.go
+new file mode 100644
+index 0000000..513d012
+--- /dev/null
++++ b/internal/config/sample_load_test.go
+@@ -0,0 +1,15 @@
++package config
++
++import "testing"
++
++// Ensures the shipped sample config validates under all cross-checks
++// (orchestration collision + worker reachability included).
++func TestSampleGatewayConfigLoads(t *testing.T) {
++	c, err := Load("../../config/gateway.yaml")
++	if err != nil {
++		t.Fatalf("sample config failed to load/validate: %v", err)
++	}
++	if len(c.Backends) == 0 {
++		t.Fatal("expected backends in sample config")
++	}
++}
+diff --git a/internal/handlers/handlers.go b/internal/handlers/handlers.go
+index afdacfe..141b258 100644
+--- a/internal/handlers/handlers.go
++++ b/internal/handlers/handlers.go
+@@ -243,10 +243,12 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
+ 			return
+ 		}
+ 
+-		// Decode just enough to find "model" and "stream"; preserve every other field.
++		// Decode just enough to find "model", "stream" and the optional
++		// orchestration "secret_level"; preserve every other field.
+ 		var peek struct {
+-			Model  string `json:"model"`
+-			Stream *bool  `json:"stream"`
++			Model       string `json:"model"`
++			Stream      *bool  `json:"stream"`
++			SecretLevel *int   `json:"secret_level"`
+ 		}
+ 		if err := json.Unmarshal(raw, &peek); err != nil {
+ 			h.recordLog(r.Context(), requestID, apiKey, clientIP, "", "", "", upstreamPath, false, http.StatusBadRequest, "invalid_json", nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil)
+@@ -287,12 +289,28 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
+ 		// registry / capability / backend checks below, because a virtual
+ 		// model has no backends of its own.
+ 		if h.orchestrator != nil && h.orchestrator.Handles(internalModel) {
++			// Honor a capability descriptor declared on the virtual model
++			// (e.g. vision=false) before fanning out — the conductor
++			// flattens content to text, so capabilities the pool can't
++			// satisfy should be rejected up front rather than silently
++			// dropped.
++			if m, ok := h.store.Model(internalModel); ok {
++				if reason := capability.Check(m.CapabilityMode, m.Capabilities, raw); reason != "" {
++					h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusBadRequest, reason, nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil)
++					proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest(
++						fmt.Sprintf("Model %s does not support this capability: %s", peek.Model, reason),
++						reason,
++					))
++					return
++				}
++			}
+ 			if span != nil {
+ 				span.Attributes["model"] = peek.Model
+ 				span.Attributes["internal_model"] = internalModel
+ 				span.Attributes["orchestration"] = true
+ 			}
+-			h.serveOrchestration(w, r, requestID, started, apiKey, clientIP, internalModel, isStream, raw)
++			secretLevel := h.secretLevel(r, peek.SecretLevel)
++			h.serveOrchestration(w, r, requestID, started, apiKey, clientIP, internalModel, isStream, raw, secretLevel)
+ 			return
+ 		}
+ 
+@@ -827,41 +845,11 @@ func (h *Handler) shouldLog(k *store.APIKey, field string) bool {
+ 	return def
+ }
+ 
+-// filterRoutable returns backends that are admissible for routing.
+-//
+-// Routable states: healthy, unknown (just-started). Degraded is routable
+-// only when allowDegraded is true (off by default), because the health
+-// probe has already observed a 4xx from the backend - sending real
+-// traffic to it would surface the same failure to the client.
+-// Excluded states: disabled, unhealthy, maintenance.
+-// Excluded: backends at max concurrency.
+-// Excluded: backends with weight 0 (drain mode).
++// filterRoutable returns backends admissible for routing. It delegates to
++// store.FilterRoutable so the main path and the orchestrator share one
++// definition of "routable" (see store.FilterRoutable for the rules).
+ func filterRoutable(in []*store.Backend, allowDegraded bool) []*store.Backend {
+-	out := make([]*store.Backend, 0, len(in))
+-	for _, b := range in {
+-		if !b.Enabled {
+-			continue
+-		}
+-		switch b.Status() {
+-		case store.StatusHealthy, store.StatusUnknown:
+-			// admissible
+-		case store.StatusDegraded:
+-			if !allowDegraded {
+-				continue
+-			}
+-		default:
+-			continue
+-		}
+-		if b.Weight == 0 {
+-			// 0 weight is interpreted as "drain": registered but no new traffic.
+-			continue
+-		}
+-		if b.MaxConcurrentRequests > 0 && b.ActiveRequests() >= int64(b.MaxConcurrentRequests) {
+-			continue
+-		}
+-		out = append(out, b)
+-	}
+-	return out
++	return store.FilterRoutable(in, allowDegraded)
+ }
+ 
+ // rewriteModelInBody replaces the top-level "model" field with the new name,
+diff --git a/internal/handlers/orchestration.go b/internal/handlers/orchestration.go
+index e391b73..2959951 100644
+--- a/internal/handlers/orchestration.go
++++ b/internal/handlers/orchestration.go
+@@ -35,6 +35,12 @@ func (s metricsSink) IncEscalation(reason string) {
+ func (s metricsSink) IncStep(role, worker string) {
+ 	s.m.OrchSteps.WithLabelValues(role, worker).Inc()
+ }
++func (s metricsSink) IncBackendError(backend, code string) {
++	s.m.BackendErrors.WithLabelValues(backend, code).Inc()
++}
++func (s metricsSink) IncTimeout(backend, kind string) {
++	s.m.Timeouts.WithLabelValues(backend, kind).Inc()
++}
+ 
+ // OrchestratorMetricsSink exposes the handler's metrics as a sink the
+ // orchestrator can be wired with at construction time in main.
+@@ -45,16 +51,17 @@ func OrchestratorMetricsSink(m *metrics.Metrics) orchestrator.MetricsSink { retu
+ // queue) as the normal forward path, then hands the request to the
+ // orchestrator and writes back an OpenAI-compatible response.
+ func (h *Handler) serveOrchestration(w http.ResponseWriter, r *http.Request, requestID string, started time.Time,
+-	apiKey *store.APIKey, clientIP, virtualModel string, isStream bool, raw []byte) {
++	apiKey *store.APIKey, clientIP, virtualModel string, isStream bool, raw []byte, secretLevel int) {
+ 
+ 	ctx := r.Context()
++	apiKeyLabel := apiKeyID(apiKey)
+ 
+ 	// Admission: virtual models share the same per-key limits and the
+ 	// per-model queue (keyed on the virtual model name).
+ 	release, code, status := h.admit(ctx, apiKey, virtualModel)
+ 	if code != "" {
+ 		if isQuotaCode(code) {
+-			h.metrics.QuotaHits.WithLabelValues(apiKeyID(apiKey), code).Inc()
++			h.metrics.QuotaHits.WithLabelValues(apiKeyLabel, code).Inc()
+ 		}
+ 		h.recordLog(ctx, requestID, apiKey, clientIP, virtualModel, virtualModel, "orchestrator", "/chat/completions", isStream, status, code, nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil)
+ 		proxy.WriteError(w, status, proxy.RateLimit("Rejected: "+code, code))
+@@ -62,25 +69,46 @@ func (h *Handler) serveOrchestration(w http.ResponseWriter, r *http.Request, req
+ 	}
+ 	defer release()
+ 
+-	secretLevel := h.secretLevel(r, raw)
++	// Track in-flight orchestration requests on the same gauge the direct
++	// path uses (backend label "orchestrator").
++	h.metrics.ActiveRequests.WithLabelValues(virtualModel, "orchestrator").Inc()
++	defer h.metrics.ActiveRequests.WithLabelValues(virtualModel, "orchestrator").Dec()
+ 
+ 	result, err := h.orchestrator.Handle(ctx, virtualModel, raw, secretLevel)
+ 	if err != nil {
+ 		latency := time.Since(started).Milliseconds()
+-		h.recordLog(ctx, requestID, apiKey, clientIP, virtualModel, virtualModel, "orchestrator", "/chat/completions", isStream, http.StatusBadGateway, "orchestration_failed", nil, latency, 0, h.rawForLog(apiKey, raw), nil)
+-		h.metrics.Requests.WithLabelValues("/chat/completions", virtualModel, "orchestrator", apiKeyLabelOf(apiKey), "502", boolLabel(isStream), "orchestration").Inc()
++		// Even on failure, charge tokens already consumed by completed
++		// steps (Tier-B returns partial usage) so quota isn't bypassed.
++		var usage *proxy.Usage
++		if result != nil {
++			h.chargeUsage(result, virtualModel, apiKeyLabel, apiKey, raw, false)
++			usage = &result.Usage
++			if apiKey != nil {
++				apiKey.TouchRequest()
++			}
++		}
++		h.recordLog(ctx, requestID, apiKey, clientIP, virtualModel, virtualModel, "orchestrator", "/chat/completions", isStream, http.StatusBadGateway, "orchestration_failed", usage, latency, 0, h.rawForLog(apiKey, raw), nil)
++		h.metrics.Requests.WithLabelValues("/chat/completions", virtualModel, "orchestrator", apiKeyLabel, "502", boolLabel(isStream), "orchestration").Inc()
+ 		h.logger.Warn("orchestration failed", logging.F("request_id", requestID, "model", virtualModel, "error", err.Error()))
+ 		proxy.WriteError(w, http.StatusBadGateway, proxy.BackendUnavailable("Orchestration failed: "+err.Error(), "orchestration_failed"))
+ 		return
+ 	}
+ 
++	// Charge usage (with the same conservative estimate fallback the direct
++	// path uses when the backend omits a usage block). chargeUsage mutates
++	// result.Usage so the response/log reflect what was charged.
++	h.chargeUsage(result, virtualModel, apiKeyLabel, apiKey, raw, true)
++	if apiKey != nil {
++		apiKey.TouchRequest()
++	}
++
+ 	created := time.Now().Unix()
+ 	id := "chatcmpl-" + requestID
+-	body := orchestrator.BuildChatCompletion(id, virtualModel, created, result)
+-
++	var body []byte
+ 	if isStream {
+-		writeOrchestrationStream(w, id, virtualModel, created, result.Content)
++		writeOrchestrationStream(w, id, virtualModel, created, result)
+ 	} else {
++		body = orchestrator.BuildChatCompletion(id, virtualModel, created, result)
+ 		w.Header().Set("Content-Type", "application/json")
+ 		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+ 		w.WriteHeader(http.StatusOK)
+@@ -88,11 +116,6 @@ func (h *Handler) serveOrchestration(w http.ResponseWriter, r *http.Request, req
+ 	}
+ 
+ 	latency := time.Since(started).Milliseconds()
+-	apiKeyLabel := apiKeyLabelOf(apiKey)
+-	h.recordUsage(&result.Usage, virtualModel, "orchestrator", apiKeyLabel, apiKey)
+-	if apiKey != nil {
+-		apiKey.TouchRequest()
+-	}
+ 	h.metrics.Requests.WithLabelValues("/chat/completions", virtualModel, "orchestrator", apiKeyLabel, "200", boolLabel(isStream), "orchestration").Inc()
+ 	h.metrics.RequestLatency.WithLabelValues("/chat/completions", virtualModel, "orchestrator", boolLabel(isStream), "orchestration").Observe(time.Since(started).Seconds())
+ 
+@@ -118,6 +141,9 @@ func (h *Handler) serveOrchestration(w http.ResponseWriter, r *http.Request, req
+ 		}
+ 		var rawRespForLog []byte
+ 		if !isStream && h.shouldLog(apiKey, "log_raw_response") {
++			if body == nil {
++				body = orchestrator.BuildChatCompletion(id, virtualModel, created, result)
++			}
+ 			rawRespForLog = body
+ 		}
+ 		h.recordLog(ctx, requestID, apiKey, clientIP, virtualModel, virtualModel, "orchestrator",
+@@ -125,10 +151,23 @@ func (h *Handler) serveOrchestration(w http.ResponseWriter, r *http.Request, req
+ 	}
+ }
+ 
+-// secretLevel resolves the request data-sensitivity level used for the
+-// orchestrator access list: the configured header takes precedence, falling
+-// back to a top-level "secret_level" field in the request body.
+-func (h *Handler) secretLevel(r *http.Request, raw []byte) int {
++// chargeUsage records token usage for an orchestrated request. On a
++// successful request that returned no token counts (worker omitted the
++// usage block), it falls back to the same conservative estimate the direct
++// path uses so token-based limits/quotas still see a signal. It mutates
++// result.Usage in place so the response and logs reflect the charged total.
++func (h *Handler) chargeUsage(result *orchestrator.Result, model, apiKeyLabel string, apiKey *store.APIKey, raw []byte, success bool) {
++	if success && result.Usage.TotalTokens == 0 && apiKey != nil {
++		result.Usage.TotalTokens = estimateTokens(raw, extractMaxTokens(raw))
++	}
++	h.recordUsage(&result.Usage, model, "orchestrator", apiKeyLabel, apiKey)
++}
++
++// secretLevel resolves the request data-sensitivity level for the
++// orchestrator access list: the configured header takes precedence, then a
++// top-level "secret_level" field already parsed from the body. Negative
++// values are clamped to 0 by the orchestrator's access-list check.
++func (h *Handler) secretLevel(r *http.Request, bodySecretLevel *int) int {
+ 	hdr := h.cfg.Orchestration.SecretLevelHeader
+ 	if hdr == "" {
+ 		hdr = "X-Secret-Level"
+@@ -138,27 +177,19 @@ func (h *Handler) secretLevel(r *http.Request, raw []byte) int {
+ 			return n
+ 		}
+ 	}
+-	var peek struct {
+-		SecretLevel *int `json:"secret_level"`
+-	}
+-	if err := json.Unmarshal(raw, &peek); err == nil && peek.SecretLevel != nil {
+-		return *peek.SecretLevel
++	if bodySecretLevel != nil {
++		return *bodySecretLevel
+ 	}
+ 	return 0
+ }
+ 
+-func apiKeyLabelOf(k *store.APIKey) string {
+-	if k == nil {
+-		return "anonymous"
+-	}
+-	return k.ID
+-}
+-
+ // writeOrchestrationStream emits the orchestrated answer as a minimal SSE
+ // stream so OpenAI streaming clients work unchanged. The orchestrated answer
+ // is produced as a whole, so it is delivered as a single content chunk
+-// followed by a terminating chunk and [DONE].
+-func writeOrchestrationStream(w http.ResponseWriter, id, model string, created int64, content string) {
++// followed by a terminating chunk that carries usage and the x_orchestration
++// route trace (so streaming and non-streaming expose the same metadata),
++// then [DONE].
++func writeOrchestrationStream(w http.ResponseWriter, id, model string, created int64, result *orchestrator.Result) {
+ 	w.Header().Set("Content-Type", "text/event-stream")
+ 	w.Header().Set("Cache-Control", "no-cache")
+ 	w.Header().Set("Connection", "keep-alive")
+@@ -174,24 +205,35 @@ func writeOrchestrationStream(w http.ResponseWriter, id, model string, created i
+ 		Delta        delta   `json:"delta"`
+ 		FinishReason *string `json:"finish_reason"`
+ 	}
+-	chunk := func(d delta, finish *string) {
+-		obj := map[string]any{
+-			"id":      id,
+-			"object":  "chat.completion.chunk",
+-			"created": created,
+-			"model":   model,
+-			"choices": []choice{{Index: 0, Delta: d, FinishReason: finish}},
+-		}
++	write := func(obj map[string]any) {
+ 		b, _ := json.Marshal(obj)
+ 		_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
+ 		if flusher != nil {
+ 			flusher.Flush()
+ 		}
+ 	}
++	base := func(choices []choice) map[string]any {
++		return map[string]any{
++			"id":      id,
++			"object":  "chat.completion.chunk",
++			"created": created,
++			"model":   model,
++			"choices": choices,
++		}
++	}
+ 
+-	chunk(delta{Role: "assistant", Content: content}, nil)
++	write(base([]choice{{Index: 0, Delta: delta{Role: "assistant", Content: result.Content}}}))
+ 	stop := "stop"
+-	chunk(delta{}, &stop)
++	final := base([]choice{{Index: 0, Delta: delta{}, FinishReason: &stop}})
++	final["usage"] = result.Usage
++	final["x_orchestration"] = map[string]any{
++		"tier":       result.Tier,
++		"task":       result.Task,
++		"confidence": result.Confidence,
++		"escalated":  result.Escalated,
++		"route":      result.Steps,
++	}
++	write(final)
+ 	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+ 	if flusher != nil {
+ 		flusher.Flush()
+diff --git a/internal/orchestrator/conductor.go b/internal/orchestrator/conductor.go
+index 5144067..3ee2c0f 100644
+--- a/internal/orchestrator/conductor.go
++++ b/internal/orchestrator/conductor.go
+@@ -28,11 +28,15 @@ func (o *Orchestrator) runConductor(ctx context.Context, base []chatMessage, par
+ 	}
+ 
+ 	// Decide which optional stages fit the budget. The solver (draft) is
+-	// mandatory; verifier and synthesizer are added as budget allows, and
+-	// the thinker is added last because it is the most optional.
+-	doVerifier := budget >= 2
++	// mandatory. Verifier and synthesizer are a PAIR: a critique is only
++	// worth producing if a synthesizer step can consume it, so they share
++	// one gate (budget>=3) — never run the verifier just to discard its
++	// output. The thinker is the most optional stage; it is added at the
++	// top end (budget>=4), and also at budget==2 where it is the single
++	// useful extra step that fits.
+ 	doSynth := budget >= 3
+-	doThinker := budget >= 4
++	doVerifier := doSynth
++	doThinker := budget >= 4 || budget == 2
+ 
+ 	res := &Result{Tier: "conductor", Task: cls.Task, Confidence: cls.Confidence, Escalated: escalated}
+ 	stepNo := 0
+@@ -65,7 +69,9 @@ func (o *Orchestrator) runConductor(ctx context.Context, base []chatMessage, par
+ 		c, err := o.callWorker(ctx, thinker, msgs, plannerParams(params))
+ 		if err != nil {
+ 			o.incRoute("conductor", thinker.ID, cls.Task, "error")
+-			return nil, fmt.Errorf("conductor thinker step: %w", err)
++			// Return res (not nil) so partial usage from prior steps is
++			// still charged to the caller's quota.
++			return res, fmt.Errorf("conductor thinker step: %w", err)
+ 		}
+ 		plan = c.Text
+ 		addStep(roleThinker, c)
+@@ -80,7 +86,7 @@ func (o *Orchestrator) runConductor(ctx context.Context, base []chatMessage, par
+ 	draftC, err := o.callWorker(ctx, solver, draftMsgs, params)
+ 	if err != nil {
+ 		o.incRoute("conductor", solver.ID, cls.Task, "error")
+-		return nil, fmt.Errorf("conductor worker step: %w", err)
++		return res, fmt.Errorf("conductor worker step: %w", err)
+ 	}
+ 	draft := draftC.Text
+ 	addStep(roleWorker, draftC)
+diff --git a/internal/orchestrator/orchestrator.go b/internal/orchestrator/orchestrator.go
+index a05952a..376fbdd 100644
+--- a/internal/orchestrator/orchestrator.go
++++ b/internal/orchestrator/orchestrator.go
+@@ -26,10 +26,8 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
+-	"net"
+ 	"net/http"
+ 	"strings"
+-	"time"
+ 
+ 	"github.com/will-wang-88/llmgateway/internal/balancer"
+ 	"github.com/will-wang-88/llmgateway/internal/config"
+@@ -44,47 +42,49 @@ type MetricsSink interface {
+ 	IncRoute(tier, worker, task, outcome string)
+ 	IncEscalation(reason string)
+ 	IncStep(role, worker string)
++	// IncBackendError / IncTimeout mirror the direct path's per-backend
++	// error and timeout counters so worker-pool failures are visible on the
++	// same dashboards/alerts as normal backend traffic.
++	IncBackendError(backend, code string)
++	IncTimeout(backend, kind string)
+ }
+ 
+ // Orchestrator coordinates the worker pool. It reuses the shared store and
+ // balancer so worker selection honors the same health/capacity rules as the
+ // main request path.
+ type Orchestrator struct {
+-	cfg      config.OrchestrationConfig
+-	store    *store.Store
+-	balancer *balancer.Balancer
+-	logger   *logging.Logger
+-	metrics  MetricsSink
+-	client   *http.Client
++	cfg           config.OrchestrationConfig
++	store         *store.Store
++	balancer      *balancer.Balancer
++	logger        *logging.Logger
++	metrics       MetricsSink
++	client        *http.Client
++	allowDegraded bool
+ }
+ 
+ // New constructs an Orchestrator. cfg is assumed already validated by
+ // config.Validate.
+ func New(cfg config.OrchestrationConfig, s *store.Store, b *balancer.Balancer, log *logging.Logger) *Orchestrator {
+-	transport := &http.Transport{
+-		Proxy:                 http.ProxyFromEnvironment,
+-		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+-		ForceAttemptHTTP2:     true,
+-		MaxIdleConns:          100,
+-		MaxIdleConnsPerHost:   20,
+-		IdleConnTimeout:       90 * time.Second,
+-		TLSHandshakeTimeout:   10 * time.Second,
+-		ExpectContinueTimeout: 1 * time.Second,
+-		DisableCompression:    true,
+-		ResponseHeaderTimeout: 60 * time.Second,
+-	}
+ 	return &Orchestrator{
+ 		cfg:      cfg,
+ 		store:    s,
+ 		balancer: b,
+ 		logger:   log,
+-		client:   &http.Client{Transport: transport},
++		client:   &http.Client{Transport: proxy.DefaultTransport()},
+ 	}
+ }
+ 
+ // WithMetrics attaches a metrics sink.
+ func (o *Orchestrator) WithMetrics(m MetricsSink) *Orchestrator { o.metrics = m; return o }
+ 
++// WithRouting copies the relevant gateway routing defaults so the
++// orchestrator's worker dispatch agrees with the direct path (notably
++// whether degraded backends are routable).
++func (o *Orchestrator) WithRouting(allowDegraded bool) *Orchestrator {
++	o.allowDegraded = allowDegraded
++	return o
++}
++
+ // Handles reports whether the given model name is one of the virtual models
+ // this orchestrator owns.
+ func (o *Orchestrator) Handles(model string) bool {
+@@ -199,6 +199,11 @@ func (o *Orchestrator) single(ctx context.Context, w *config.OrchestrationWorker
+ // the request only if its SecretMaxLevel admits the request's secret level.
+ // SecretMaxLevel 0 means "unlimited" (an on-prem worker).
+ func (o *Orchestrator) eligibleWorkers(secretLevel int) []*config.OrchestrationWorker {
++	// A negative (or junk-parsed) level must never widen eligibility: clamp
++	// to 0 so an out-of-range header can't defeat the access list.
++	if secretLevel < 0 {
++		secretLevel = 0
++	}
+ 	out := make([]*config.OrchestrationWorker, 0, len(o.cfg.Workers))
+ 	for i := range o.cfg.Workers {
+ 		w := &o.cfg.Workers[i]
+@@ -266,6 +271,18 @@ func (o *Orchestrator) incStep(role, worker string) {
+ 	}
+ }
+ 
++func (o *Orchestrator) incBackendError(backend, code string) {
++	if o.metrics != nil {
++		o.metrics.IncBackendError(backend, code)
++	}
++}
++
++func (o *Orchestrator) incTimeout(backend, kind string) {
++	if o.metrics != nil {
++		o.metrics.IncTimeout(backend, kind)
++	}
++}
++
+ func containsFold(list []string, v string) bool {
+ 	for _, s := range list {
+ 		if strings.EqualFold(s, v) {
+diff --git a/internal/orchestrator/orchestrator_test.go b/internal/orchestrator/orchestrator_test.go
+index 6e4f386..3d23967 100644
+--- a/internal/orchestrator/orchestrator_test.go
++++ b/internal/orchestrator/orchestrator_test.go
+@@ -41,6 +41,13 @@ func newTestOrchestrator(t *testing.T, oc config.OrchestrationConfig) (*Orchestr
+ 
+ type recordingServer struct {
+ 	models []string // models seen, in order
++	// failAfter, when > 0, makes the server return HTTP 500 for the
++	// (failAfter+1)-th request onward, so tests can fail a later
++	// conductor step while earlier steps succeed.
++	failAfter int
++	// omitUsage, when true, returns a successful completion without a
++	// usage block (mimics backends that don't report usage).
++	omitUsage bool
+ }
+ 
+ func (s *recordingServer) handle(w http.ResponseWriter, r *http.Request) {
+@@ -50,12 +57,19 @@ func (s *recordingServer) handle(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	_ = json.Unmarshal(body, &req)
+ 	s.models = append(s.models, req.Model)
++	if s.failAfter > 0 && len(s.models) > s.failAfter {
++		w.WriteHeader(http.StatusInternalServerError)
++		_, _ = w.Write([]byte(`{"error":{"message":"boom"}}`))
++		return
++	}
+ 	resp := map[string]any{
+ 		"choices": []map[string]any{{
+ 			"message":       map[string]string{"role": "assistant", "content": "answer from " + req.Model},
+ 			"finish_reason": "stop",
+ 		}},
+-		"usage": map[string]int{"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
++	}
++	if !s.omitUsage {
++		resp["usage"] = map[string]int{"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+ 	}
+ 	w.Header().Set("Content-Type", "application/json")
+ 	_ = json.NewEncoder(w).Encode(resp)
+@@ -256,3 +270,101 @@ func TestHandlesAndVirtualModels(t *testing.T) {
+ 		t.Fatalf("expected 2 virtual models, got %v", vm)
+ 	}
+ }
++
++func TestConductorVerifierPairedWithSynth(t *testing.T) {
++	// max_steps=2 must NOT run a verifier (its critique can't be consumed
++	// without a synthesizer step) — no wasted worker call.
++	oc := baseConfig()
++	oc.MaxSteps = 2
++	o, srv := newTestOrchestrator(t, oc)
++	res, err := o.Handle(context.Background(), "fugu-ultra", chatBody("write a function"), 0)
++	if err != nil {
++		t.Fatalf("handle: %v", err)
++	}
++	for _, s := range res.Steps {
++		if s.Role == roleVerifier {
++			t.Fatalf("verifier ran under max_steps=2 but its output is discarded: %+v", res.Steps)
++		}
++	}
++	if len(srv.models) > 2 {
++		t.Fatalf("expected <=2 backend calls for max_steps=2, got %d", len(srv.models))
++	}
++}
++
++func TestConductorPartialUsageOnError(t *testing.T) {
++	o, srv := newTestOrchestrator(t, baseConfig())
++	srv.failAfter = 1 // first step (thinker) ok, second (worker) 500s
++	res, err := o.Handle(context.Background(), "fugu-ultra", chatBody("write a function"), 0)
++	if err == nil {
++		t.Fatalf("expected an error when a conductor step fails")
++	}
++	if res == nil {
++		t.Fatalf("expected partial result (non-nil) so consumed tokens can be charged")
++	}
++	if res.Usage.TotalTokens != 15 {
++		t.Fatalf("expected partial usage of 15 (thinker step), got %d", res.Usage.TotalTokens)
++	}
++}
++
++func TestSecretLevelNegativeClamped(t *testing.T) {
++	oc := baseConfig()
++	for i := range oc.Workers {
++		if oc.Workers[i].ID == "gemma" {
++			oc.Workers[i].SecretMaxLevel = 1
++		}
++	}
++	o, _ := newTestOrchestrator(t, oc)
++	// A negative level must not widen eligibility beyond level 0.
++	if got := len(o.eligibleWorkers(-1)); got != 3 {
++		t.Fatalf("negative secret level should clamp to 0 (all 3 eligible), got %d", got)
++	}
++}
++
++func TestWorkerModelDisabledKillSwitch(t *testing.T) {
++	o, _ := newTestOrchestrator(t, baseConfig())
++	// Operator disables the coding worker's model in the registry.
++	o.store.UpsertModel(&store.Model{Name: "qwen3.6-27b", Enabled: false})
++	_, err := o.Handle(context.Background(), "fugu-auto", chatBody("write a python function and fix the bug"), 0)
++	if err == nil {
++		t.Fatalf("expected error: disabled worker model must not receive orchestrated traffic")
++	}
++	if !strings.Contains(err.Error(), "disabled") {
++		t.Fatalf("expected 'disabled' in error, got %v", err)
++	}
++}
++
++func TestWorkerUsesBackendTimeoutWhenLarger(t *testing.T) {
++	// Regression: per-call timeout must honor a backend TimeoutMS larger
++	// than the global default, not only shrink it.
++	oc := baseConfig()
++	oc.RequestTimeoutMS = 50 // tiny global
++	o, srv := newTestOrchestrator(t, oc)
++	// Bump the backends' timeout well above the global; pickBackend should
++	// then use the backend value so a normal call still succeeds.
++	for _, b := range o.store.Backends() {
++		b.TimeoutMS = 5000
++	}
++	_ = srv
++	res, err := o.Handle(context.Background(), "fugu-auto", chatBody("hello"), 0)
++	if err != nil {
++		t.Fatalf("call should succeed using backend timeout: %v", err)
++	}
++	if res.Content == "" {
++		t.Fatalf("expected content")
++	}
++}
++
++func TestWorkerOmittedUsageYieldsZero(t *testing.T) {
++	// When a worker omits the usage block, the orchestrator reports zero
++	// tokens (it does not fabricate counts); the handler is responsible for
++	// the conservative estimate fallback that keeps quotas charged.
++	o, srv := newTestOrchestrator(t, baseConfig())
++	srv.omitUsage = true
++	res, err := o.Handle(context.Background(), "fugu-auto", chatBody("hello there"), 0)
++	if err != nil {
++		t.Fatalf("handle: %v", err)
++	}
++	if res.Usage.TotalTokens != 0 {
++		t.Fatalf("expected zero usage when worker omits it, got %d", res.Usage.TotalTokens)
++	}
++}
+diff --git a/internal/orchestrator/worker.go b/internal/orchestrator/worker.go
+index 62c8c2d..5cbc2bc 100644
+--- a/internal/orchestrator/worker.go
++++ b/internal/orchestrator/worker.go
+@@ -4,7 +4,9 @@ import (
+ 	"bytes"
+ 	"context"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
++	"io"
+ 	"net/http"
+ 	"time"
+ 
+@@ -69,12 +71,21 @@ type chatResponse struct {
+ // assistant text plus usage. It enforces the worker's concurrency slot and
+ // the configured per-call timeout.
+ func (o *Orchestrator) callWorker(ctx context.Context, w *config.OrchestrationWorker, msgs []chatMessage, p genParams) (*completion, error) {
+-	be, err := o.pickBackend(w.Model)
+-	if err != nil {
+-		return nil, err
++	// Acquire a concurrency slot, re-picking if we lose the race for the
++	// chosen backend (mirrors the direct path's retry in handlers.Forward).
++	var be *store.Backend
++	for attempts := 0; attempts < 3; attempts++ {
++		picked, err := o.pickBackend(w.Model)
++		if err != nil {
++			return nil, err
++		}
++		if picked.AcquireSlot() {
++			be = picked
++			break
++		}
+ 	}
+-	if !be.AcquireSlot() {
+-		return nil, fmt.Errorf("worker %s: backend %s at capacity", w.ID, be.ID)
++	if be == nil {
++		return nil, fmt.Errorf("worker %s: all backends for model %q at capacity", w.ID, w.Model)
+ 	}
+ 
+ 	body, _ := json.Marshal(chatRequest{
+@@ -86,8 +97,12 @@ func (o *Orchestrator) callWorker(ctx context.Context, w *config.OrchestrationWo
+ 		MaxTokens:   p.MaxTokens,
+ 	})
+ 
++	// Per-call timeout: the backend's own TimeoutMS is authoritative when
++	// set (matching the direct proxy path), otherwise the orchestration
++	// default applies. This lets a slow MoE worker be given more time than
++	// the global default, not only less.
+ 	timeout := time.Duration(o.cfg.RequestTimeoutMS) * time.Millisecond
+-	if be.TimeoutMS > 0 && time.Duration(be.TimeoutMS)*time.Millisecond < timeout {
++	if be.TimeoutMS > 0 {
+ 		timeout = time.Duration(be.TimeoutMS) * time.Millisecond
+ 	}
+ 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+@@ -110,27 +125,39 @@ func (o *Orchestrator) callWorker(ctx context.Context, w *config.OrchestrationWo
+ 	resp, err := o.client.Do(req)
+ 	if err != nil {
+ 		be.ReleaseSlot(false)
++		if errors.Is(err, context.DeadlineExceeded) {
++			o.incTimeout(be.ID, "backend")
++			return nil, fmt.Errorf("worker %s: backend %s timed out: %w", w.ID, be.ID, err)
++		}
++		o.incBackendError(be.ID, "unreachable")
+ 		return nil, fmt.Errorf("worker %s: backend %s unreachable: %w", w.ID, be.ID, err)
+ 	}
+ 	defer resp.Body.Close()
+ 
+-	var parsed chatResponse
+-	dec := json.NewDecoder(resp.Body)
+-	if err := dec.Decode(&parsed); err != nil {
+-		be.ReleaseSlot(false)
+-		return nil, fmt.Errorf("worker %s: decode backend response: %w", w.ID, err)
+-	}
++	respBody, _ := io.ReadAll(resp.Body)
+ 	success := resp.StatusCode >= 200 && resp.StatusCode < 300
+ 	be.ReleaseSlot(success)
+ 
++	// Status is checked before parsing so a non-JSON error page (e.g. a 503
++	// HTML body from a fronting proxy) surfaces the real status instead of a
++	// misleading "decode failed".
+ 	if !success {
++		o.incBackendError(be.ID, statusLabel(resp.StatusCode))
+ 		msg := fmt.Sprintf("status %d", resp.StatusCode)
+-		if parsed.Error != nil && parsed.Error.Message != "" {
+-			msg = parsed.Error.Message
++		var errEnv chatResponse
++		if json.Unmarshal(respBody, &errEnv) == nil && errEnv.Error != nil && errEnv.Error.Message != "" {
++			msg = errEnv.Error.Message
+ 		}
+ 		return nil, fmt.Errorf("worker %s: backend %s error: %s", w.ID, be.ID, msg)
+ 	}
++
++	var parsed chatResponse
++	if err := json.Unmarshal(respBody, &parsed); err != nil {
++		o.incBackendError(be.ID, "decode")
++		return nil, fmt.Errorf("worker %s: decode backend response: %w", w.ID, err)
++	}
+ 	if len(parsed.Choices) == 0 {
++		o.incBackendError(be.ID, "empty_response")
+ 		return nil, fmt.Errorf("worker %s: backend %s returned no choices", w.ID, be.ID)
+ 	}
+ 
+@@ -148,27 +175,15 @@ func (o *Orchestrator) callWorker(ctx context.Context, w *config.OrchestrationWo
+ }
+ 
+ // pickBackend selects one routable backend for an internal model name using
+-// the same health/capacity rules as the main request path.
++// the same routability rules as the direct path (store.FilterRoutable,
++// honoring allow_degraded), and refuses models disabled in the registry so
++// the admin kill-switch also covers orchestrated traffic.
+ func (o *Orchestrator) pickBackend(model string) (*store.Backend, error) {
+-	candidates := o.store.BackendsForModel(model)
+-	ready := make([]*store.Backend, 0, len(candidates))
+-	for _, b := range candidates {
+-		if !b.Enabled {
+-			continue
+-		}
+-		switch b.Status() {
+-		case store.StatusHealthy, store.StatusUnknown:
+-		default:
+-			continue
+-		}
+-		if b.Weight == 0 {
+-			continue
+-		}
+-		if b.MaxConcurrentRequests > 0 && b.ActiveRequests() >= int64(b.MaxConcurrentRequests) {
+-			continue
+-		}
+-		ready = append(ready, b)
++	if m, ok := o.store.Model(model); ok && !m.Enabled {
++		return nil, fmt.Errorf("worker model %q is disabled", model)
+ 	}
++	candidates := o.store.BackendsForModel(model)
++	ready := store.FilterRoutable(candidates, o.allowDegraded)
+ 	if len(ready) == 0 {
+ 		return nil, fmt.Errorf("no healthy backend for worker model %q", model)
+ 	}
+@@ -178,3 +193,10 @@ func (o *Orchestrator) pickBackend(model string) (*store.Backend, error) {
+ 	}
+ 	return picked, nil
+ }
++
++func statusLabel(code int) string {
++	if code <= 0 {
++		return "unknown"
++	}
++	return fmt.Sprintf("%d", code)
++}
+diff --git a/internal/proxy/proxy.go b/internal/proxy/proxy.go
+index a65cbe1..86e89b9 100644
+--- a/internal/proxy/proxy.go
++++ b/internal/proxy/proxy.go
+@@ -24,14 +24,33 @@ import (
+ //   - response body is forwarded byte-for-byte for non-streaming.
+ //   - streaming responses are flushed chunk-by-chunk without parsing.
+ type Proxy struct {
+-	client            *http.Client
+-	streamingClient   *http.Client
+-	logger            *logging.Logger
+-	metrics           *metrics.Metrics
++	client          *http.Client
++	streamingClient *http.Client
++	logger          *logging.Logger
++	metrics         *metrics.Metrics
+ }
+ 
+ func New(logger *logging.Logger, m *metrics.Metrics) *Proxy {
+-	transport := &http.Transport{
++	transport := DefaultTransport()
++	return &Proxy{
++		client: &http.Client{
++			Transport: transport,
++			Timeout:   0, // request-level timeout is enforced via context
++		},
++		streamingClient: &http.Client{
++			Transport: transport,
++			Timeout:   0,
++		},
++		logger:  logger,
++		metrics: m,
++	}
++}
++
++// DefaultTransport builds the tuned HTTP transport used for all upstream
++// backend calls (both the direct proxy path and the orchestrator's worker
++// calls), so connection-pool and timeout tuning lives in one place.
++func DefaultTransport() *http.Transport {
++	return &http.Transport{
+ 		Proxy: http.ProxyFromEnvironment,
+ 		DialContext: (&net.Dialer{
+ 			Timeout:   30 * time.Second,
+@@ -44,35 +63,23 @@ func New(logger *logging.Logger, m *metrics.Metrics) *Proxy {
+ 		TLSHandshakeTimeout:   10 * time.Second,
+ 		ExpectContinueTimeout: 1 * time.Second,
+ 		// DisableCompression is important - gzip would buffer the stream.
+-		DisableCompression:    true,
++		DisableCompression: true,
+ 		// Detect upstream that accepts the TCP connection but never returns
+ 		// response headers. Without this a hung backend wedges the request
+ 		// until the client disconnects.
+ 		ResponseHeaderTimeout: 60 * time.Second,
+ 	}
+-	return &Proxy{
+-		client: &http.Client{
+-			Transport: transport,
+-			Timeout:   0, // request-level timeout is enforced via context
+-		},
+-		streamingClient: &http.Client{
+-			Transport: transport,
+-			Timeout:   0,
+-		},
+-		logger:  logger,
+-		metrics: m,
+-	}
+ }
+ 
+ // ForwardOptions describes how to forward a single request.
+ type ForwardOptions struct {
+-	Method        string
+-	Backend       *store.Backend
+-	UpstreamPath  string // e.g. "/chat/completions"
+-	Body          []byte // raw body to forward (already rewritten if needed)
+-	IsStream      bool
++	Method              string
++	Backend             *store.Backend
++	UpstreamPath        string // e.g. "/chat/completions"
++	Body                []byte // raw body to forward (already rewritten if needed)
++	IsStream            bool
+ 	StreamIdleTimeoutMS int
+-	TimeoutMS     int
++	TimeoutMS           int
+ 
+ 	// Labels for metrics/logging.
+ 	Model        string
+@@ -87,10 +94,10 @@ type ForwardOptions struct {
+ 
+ 	// Optional callbacks.
+ 	OnTTFT        func(d time.Duration)
+-	OnUsage       func(usage *Usage)       // called for non-streaming once response is parsed
+-	OnStreamUsage func(usage *Usage)       // called for streaming if usage block found in final chunk
+-	OnRawResponse func(body []byte)        // called for non-streaming, raw bytes
+-	OnStreamChunk func(line []byte)        // called once per streamed chunk
++	OnUsage       func(usage *Usage) // called for non-streaming once response is parsed
++	OnStreamUsage func(usage *Usage) // called for streaming if usage block found in final chunk
++	OnRawResponse func(body []byte)  // called for non-streaming, raw bytes
++	OnStreamChunk func(line []byte)  // called once per streamed chunk
+ }
+ 
+ type Usage struct {
+diff --git a/internal/store/store.go b/internal/store/store.go
+index fda0690..61fd1cb 100644
+--- a/internal/store/store.go
++++ b/internal/store/store.go
+@@ -214,8 +214,8 @@ type APIKey struct {
+ 	Logging          *config.APIKeyLogging
+ 	ExpiresAt        time.Time
+ 
+-	mu          sync.RWMutex
+-	lastUsedAt  time.Time
++	mu            sync.RWMutex
++	lastUsedAt    time.Time
+ 	totalRequests int64
+ 	totalTokens   int64
+ }
+@@ -525,6 +525,46 @@ func (s *Store) BackendsForModel(model string) []*Backend {
+ 	return out
+ }
+ 
++// FilterRoutable returns the subset of backends admissible for routing.
++//
++// Routable states: healthy, unknown (just-started). Degraded is routable
++// only when allowDegraded is true (off by default), because the health
++// probe has already observed a 4xx from the backend - sending real traffic
++// to it would surface the same failure to the client.
++// Excluded states: disabled, unhealthy, maintenance.
++// Excluded: backends at max concurrency.
++// Excluded: backends with weight 0 (drain mode).
++//
++// This is the single definition of "routable" shared by the direct proxy
++// path and the orchestrator's worker dispatch.
++func FilterRoutable(in []*Backend, allowDegraded bool) []*Backend {
++	out := make([]*Backend, 0, len(in))
++	for _, b := range in {
++		if !b.Enabled {
++			continue
++		}
++		switch b.Status() {
++		case StatusHealthy, StatusUnknown:
++			// admissible
++		case StatusDegraded:
++			if !allowDegraded {
++				continue
++			}
++		default:
++			continue
++		}
++		if b.Weight == 0 {
++			// 0 weight is interpreted as "drain": registered but no new traffic.
++			continue
++		}
++		if b.MaxConcurrentRequests > 0 && b.ActiveRequests() >= int64(b.MaxConcurrentRequests) {
++			continue
++		}
++		out = append(out, b)
++	}
++	return out
++}
++
+ func (s *Store) Models() []*Model {
+ 	s.mu.RLock()
+ 	defer s.mu.RUnlock()
+-- 
+2.43.0
+

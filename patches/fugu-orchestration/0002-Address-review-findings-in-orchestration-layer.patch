@@ -1,0 +1,1132 @@
+From 930fc08d9f63b1c94c2ca82cf62a10c2146d70f4 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 25 Jun 2026 03:39:01 +0000
+Subject: [PATCH 2/2] Address review findings in orchestration layer
+
+Correctness / billing:
+- Charge token usage on the orchestration path with the same conservative
+  estimate fallback the direct path uses when a worker omits the usage block
+  (closes a token-quota/limit bypass).
+- Tier-B returns partial usage on a mid-DAG failure so already-consumed
+  tokens are still charged.
+
+Control plane / config:
+- Reject virtual-model names that collide with a real model/alias/backend
+  model (would silently shadow the real model via the Handles() early
+  return); validate that every worker model is served by a backend.
+- Worker dispatch honors the model-registry enabled kill-switch and the
+  routing allow_degraded_backends flag (shared store.FilterRoutable).
+
+Logic / governance:
+- Conductor pairs verifier+synthesizer on one budget gate so the verifier is
+  never run only to discard its critique; thinker fills budget==2.
+- Clamp negative/out-of-range secret levels so the access list can't be
+  bypassed.
+- Per-call timeout honors a backend TimeoutMS larger than the global default
+  (matches the direct path), not only smaller.
+
+Observability:
+- Emit ActiveRequests gauge for orchestrated requests and per-backend
+  BackendErrors / Timeouts counters from worker calls.
+- Status is checked before decoding so a non-JSON error page surfaces the
+  real status; empty-choices responses are counted as backend errors.
+- Slot acquisition retries on a lost race instead of hard-failing.
+- Streaming responses carry usage and x_orchestration in the final chunk.
+
+Cleanup:
+- Share proxy.DefaultTransport and store.FilterRoutable; remove duplicate
+  apiKeyLabelOf; parse the request body one fewer time (secret_level read
+  from the handler's existing peek).
+
+Tests: collision/reachability validation, verifier/synth pairing, partial
+usage on failure, secret-level clamp, kill-switch, backend-timeout honoring,
+omitted-usage contract, and a sample-config load test.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZkEu6Lfy9sZke6vyJYdx9
+---
+ README.md                                  |  11 +-
+ cmd/gateway/main.go                        |   1 +
+ internal/config/config.go                  |  47 ++++++++
+ internal/config/config_test.go             |  17 +++
+ internal/config/sample_load_test.go        |  15 +++
+ internal/handlers/handlers.go              |  64 +++++------
+ internal/handlers/orchestration.go         | 124 ++++++++++++++-------
+ internal/orchestrator/conductor.go         |  18 ++-
+ internal/orchestrator/orchestrator.go      |  59 ++++++----
+ internal/orchestrator/orchestrator_test.go | 114 ++++++++++++++++++-
+ internal/orchestrator/worker.go            |  88 +++++++++------
+ internal/proxy/proxy.go                    |  63 ++++++-----
+ internal/store/store.go                    |  44 +++++++-
+ 13 files changed, 493 insertions(+), 172 deletions(-)
+ create mode 100644 internal/config/sample_load_test.go
+
+diff --git a/README.md b/README.md
+index ee55f26..efac4ae 100644
+--- a/README.md
++++ b/README.md
+@@ -414,8 +414,15 @@ Responses are standard `chat.completion` objects with an extra
+ ```
+ 
+ Streaming (`stream: true`) is supported: the orchestrated answer is produced
+-whole and delivered as a single SSE content chunk plus `[DONE]`, so OpenAI
+-streaming clients work unchanged.
++whole and delivered as a content chunk followed by a terminating chunk that
++carries `usage` and `x_orchestration` (so streaming and non-streaming expose
++the same metadata) plus `[DONE]`, so OpenAI streaming clients work unchanged.
++
++Virtual model names are validated at startup against the real catalog (a
++name collision is rejected rather than silently shadowing a real model), and
++worker dispatch honors the model registry kill-switch, the
++`allow_degraded_backends` routing flag, and per-backend timeouts — the same
++rules as the direct path.
+ 
+ ### Metrics
+ 
+diff --git a/cmd/gateway/main.go b/cmd/gateway/main.go
+index c4a6a7c..4db31a2 100644
+--- a/cmd/gateway/main.go
++++ b/cmd/gateway/main.go
+@@ -222,6 +222,7 @@ func main() {
+ 		WithTracer(tr)
+ 	if cfg.Orchestration.Enabled {
+ 		orch := orchestrator.New(cfg.Orchestration, s, bal, logger).
++			WithRouting(cfg.Routing.AllowDegradedBackends).
+ 			WithMetrics(handlers.OrchestratorMetricsSink(m))
+ 		h = h.WithOrchestrator(orch)
+ 		logger.Info("orchestration enabled", logging.F(
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 0daaeca..6239ae2 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -425,6 +425,53 @@ func (c *Config) Validate() error {
+ 	if err := c.Orchestration.validate(); err != nil {
+ 		return err
+ 	}
++	if err := c.validateOrchestrationRefs(); err != nil {
++		return err
++	}
++	return nil
++}
++
++// validateOrchestrationRefs cross-checks the orchestration config against the
++// rest of the catalog: a virtual model name must not collide with a real
++// model / alias / backend-advertised model (else it would silently shadow
++// it via the Handles() early-return in the request path), and every worker
++// model must resolve to at least one backend.
++func (c *Config) validateOrchestrationRefs() error {
++	o := &c.Orchestration
++	if !o.Enabled {
++		return nil
++	}
++	realModels := make(map[string]struct{})
++	for _, m := range c.Models {
++		realModels[m.Name] = struct{}{}
++	}
++	for _, a := range c.ModelAliases {
++		realModels[a.Alias] = struct{}{}
++	}
++	backendModels := make(map[string]struct{})
++	for _, b := range c.Backends {
++		for _, m := range b.Models {
++			backendModels[m] = struct{}{}
++			realModels[m] = struct{}{}
++		}
++	}
++	for _, vm := range []struct{ kind, name string }{
++		{"router_model", o.RouterModel},
++		{"conductor_model", o.ConductorModel},
++	} {
++		if vm.name == "" {
++			continue
++		}
++		if _, clash := realModels[vm.name]; clash {
++			return fmt.Errorf("orchestration %s %q collides with a real model/alias/backend model; pick a distinct virtual name", vm.kind, vm.name)
++		}
++	}
++	for i := range o.Workers {
++		w := &o.Workers[i]
++		if _, ok := backendModels[w.Model]; !ok {
++			return fmt.Errorf("orchestration worker %s references model %q that no backend serves", w.ID, w.Model)
++		}
++	}
+ 	return nil
+ }
+ 
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index d07028a..bda1dd2 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -99,3 +99,20 @@ func TestOrchestrationDisabledSkipsValidation(t *testing.T) {
+ 		t.Fatalf("disabled orchestration should not validate, got %v", err)
+ 	}
+ }
++
++func TestOrchestrationRejectsVirtualModelCollision(t *testing.T) {
++	c := baseOrchestrationConfig()
++	// router_model collides with the worker's real backend model name.
++	c.Orchestration.RouterModel = "qwen3.6-27b"
++	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "collides") {
++		t.Fatalf("expected collision error, got %v", err)
++	}
++}
++
++func TestOrchestrationRejectsUnservedWorkerModel(t *testing.T) {
++	c := baseOrchestrationConfig()
++	c.Orchestration.Workers = []OrchestrationWorker{{ID: "w", Model: "model-no-backend"}}
++	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "no backend serves") {
++		t.Fatalf("expected unserved-worker-model error, got %v", err)
++	}
++}
+diff --git a/internal/config/sample_load_test.go b/internal/config/sample_load_test.go
+new file mode 100644
+index 0000000..513d012
+--- /dev/null
++++ b/internal/config/sample_load_test.go
+@@ -0,0 +1,15 @@
++package config
++
++import "testing"
++
++// Ensures the shipped sample config validates under all cross-checks
++// (orchestration collision + worker reachability included).
++func TestSampleGatewayConfigLoads(t *testing.T) {
++	c, err := Load("../../config/gateway.yaml")
++	if err != nil {
++		t.Fatalf("sample config failed to load/validate: %v", err)
++	}
++	if len(c.Backends) == 0 {
++		t.Fatal("expected backends in sample config")
++	}
++}
+diff --git a/internal/handlers/handlers.go b/internal/handlers/handlers.go
+index afdacfe..141b258 100644
+--- a/internal/handlers/handlers.go
++++ b/internal/handlers/handlers.go
+@@ -243,10 +243,12 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
+ 			return
+ 		}
+ 
+-		// Decode just enough to find "model" and "stream"; preserve every other field.
++		// Decode just enough to find "model", "stream" and the optional
++		// orchestration "secret_level"; preserve every other field.
+ 		var peek struct {
+-			Model  string `json:"model"`
+-			Stream *bool  `json:"stream"`
++			Model       string `json:"model"`
++			Stream      *bool  `json:"stream"`
++			SecretLevel *int   `json:"secret_level"`
+ 		}
+ 		if err := json.Unmarshal(raw, &peek); err != nil {
+ 			h.recordLog(r.Context(), requestID, apiKey, clientIP, "", "", "", upstreamPath, false, http.StatusBadRequest, "invalid_json", nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil)
+@@ -287,12 +289,28 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
+ 		// registry / capability / backend checks below, because a virtual
+ 		// model has no backends of its own.
+ 		if h.orchestrator != nil && h.orchestrator.Handles(internalModel) {
++			// Honor a capability descriptor declared on the virtual model
++			// (e.g. vision=false) before fanning out — the conductor
++			// flattens content to text, so capabilities the pool can't
++			// satisfy should be rejected up front rather than silently
++			// dropped.
++			if m, ok := h.store.Model(internalModel); ok {
++				if reason := capability.Check(m.CapabilityMode, m.Capabilities, raw); reason != "" {
++					h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusBadRequest, reason, nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil)
++					proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest(
++						fmt.Sprintf("Model %s does not support this capability: %s", peek.Model, reason),
++						reason,
++					))
++					return
++				}
++			}
+ 			if span != nil {
+ 				span.Attributes["model"] = peek.Model
+ 				span.Attributes["internal_model"] = internalModel
+ 				span.Attributes["orchestration"] = true
+ 			}
+-			h.serveOrchestration(w, r, requestID, started, apiKey, clientIP, internalModel, isStream, raw)
++			secretLevel := h.secretLevel(r, peek.SecretLevel)
++			h.serveOrchestration(w, r, requestID, started, apiKey, clientIP, internalModel, isStream, raw, secretLevel)
+ 			return
+ 		}
+ 
+@@ -827,41 +845,11 @@ func (h *Handler) shouldLog(k *store.APIKey, field string) bool {
+ 	return def
+ }
+ 
+-// filterRoutable returns backends that are admissible for routing.
+-//
+-// Routable states: healthy, unknown (just-started). Degraded is routable
+-// only when allowDegraded is true (off by default), because the health
+-// probe has already observed a 4xx from the backend - sending real
+-// traffic to it would surface the same failure to the client.
+-// Excluded states: disabled, unhealthy, maintenance.
+-// Excluded: backends at max concurrency.
+-// Excluded: backends with weight 0 (drain mode).
++// filterRoutable returns backends admissible for routing. It delegates to
++// store.FilterRoutable so the main path and the orchestrator share one
++// definition of "routable" (see store.FilterRoutable for the rules).
+ func filterRoutable(in []*store.Backend, allowDegraded bool) []*store.Backend {
+-	out := make([]*store.Backend, 0, len(in))
+-	for _, b := range in {
+-		if !b.Enabled {
+-			continue
+-		}
+-		switch b.Status() {
+-		case store.StatusHealthy, store.StatusUnknown:
+-			// admissible
+-		case store.StatusDegraded:
+-			if !allowDegraded {
+-				continue
+-			}
+-		default:
+-			continue
+-		}
+-		if b.Weight == 0 {
+-			// 0 weight is interpreted as "drain": registered but no new traffic.
+-			continue
+-		}
+-		if b.MaxConcurrentRequests > 0 && b.ActiveRequests() >= int64(b.MaxConcurrentRequests) {
+-			continue
+-		}
+-		out = append(out, b)
+-	}
+-	return out
++	return store.FilterRoutable(in, allowDegraded)
+ }
+ 
+ // rewriteModelInBody replaces the top-level "model" field with the new name,
+diff --git a/internal/handlers/orchestration.go b/internal/handlers/orchestration.go
+index e391b73..2959951 100644
+--- a/internal/handlers/orchestration.go
++++ b/internal/handlers/orchestration.go
+@@ -35,6 +35,12 @@ func (s metricsSink) IncEscalation(reason string) {
+ func (s metricsSink) IncStep(role, worker string) {
+ 	s.m.OrchSteps.WithLabelValues(role, worker).Inc()
+ }
++func (s metricsSink) IncBackendError(backend, code string) {
++	s.m.BackendErrors.WithLabelValues(backend, code).Inc()
++}
++func (s metricsSink) IncTimeout(backend, kind string) {
++	s.m.Timeouts.WithLabelValues(backend, kind).Inc()
++}
+ 
+ // OrchestratorMetricsSink exposes the handler's metrics as a sink the
+ // orchestrator can be wired with at construction time in main.
+@@ -45,16 +51,17 @@ func OrchestratorMetricsSink(m *metrics.Metrics) orchestrator.MetricsSink { retu
+ // queue) as the normal forward path, then hands the request to the
+ // orchestrator and writes back an OpenAI-compatible response.
+ func (h *Handler) serveOrchestration(w http.ResponseWriter, r *http.Request, requestID string, started time.Time,
+-	apiKey *store.APIKey, clientIP, virtualModel string, isStream bool, raw []byte) {
++	apiKey *store.APIKey, clientIP, virtualModel string, isStream bool, raw []byte, secretLevel int) {
+ 
+ 	ctx := r.Context()
++	apiKeyLabel := apiKeyID(apiKey)
+ 
+ 	// Admission: virtual models share the same per-key limits and the
+ 	// per-model queue (keyed on the virtual model name).
+ 	release, code, status := h.admit(ctx, apiKey, virtualModel)
+ 	if code != "" {
+ 		if isQuotaCode(code) {
+-			h.metrics.QuotaHits.WithLabelValues(apiKeyID(apiKey), code).Inc()
++			h.metrics.QuotaHits.WithLabelValues(apiKeyLabel, code).Inc()
+ 		}
+ 		h.recordLog(ctx, requestID, apiKey, clientIP, virtualModel, virtualModel, "orchestrator", "/chat/completions", isStream, status, code, nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil)
+ 		proxy.WriteError(w, status, proxy.RateLimit("Rejected: "+code, code))
+@@ -62,25 +69,46 @@ func (h *Handler) serveOrchestration(w http.ResponseWriter, r *http.Request, req
+ 	}
+ 	defer release()
+ 
+-	secretLevel := h.secretLevel(r, raw)
++	// Track in-flight orchestration requests on the same gauge the direct
++	// path uses (backend label "orchestrator").
++	h.metrics.ActiveRequests.WithLabelValues(virtualModel, "orchestrator").Inc()
++	defer h.metrics.ActiveRequests.WithLabelValues(virtualModel, "orchestrator").Dec()
+ 
+ 	result, err := h.orchestrator.Handle(ctx, virtualModel, raw, secretLevel)
+ 	if err != nil {
+ 		latency := time.Since(started).Milliseconds()
+-		h.recordLog(ctx, requestID, apiKey, clientIP, virtualModel, virtualModel, "orchestrator", "/chat/completions", isStream, http.StatusBadGateway, "orchestration_failed", nil, latency, 0, h.rawForLog(apiKey, raw), nil)
+-		h.metrics.Requests.WithLabelValues("/chat/completions", virtualModel, "orchestrator", apiKeyLabelOf(apiKey), "502", boolLabel(isStream), "orchestration").Inc()
++		// Even on failure, charge tokens already consumed by completed
++		// steps (Tier-B returns partial usage) so quota isn't bypassed.
++		var usage *proxy.Usage
++		if result != nil {
++			h.chargeUsage(result, virtualModel, apiKeyLabel, apiKey, raw, false)
++			usage = &result.Usage
++			if apiKey != nil {
++				apiKey.TouchRequest()
++			}
++		}
++		h.recordLog(ctx, requestID, apiKey, clientIP, virtualModel, virtualModel, "orchestrator", "/chat/completions", isStream, http.StatusBadGateway, "orchestration_failed", usage, latency, 0, h.rawForLog(apiKey, raw), nil)
++		h.metrics.Requests.WithLabelValues("/chat/completions", virtualModel, "orchestrator", apiKeyLabel, "502", boolLabel(isStream), "orchestration").Inc()
+ 		h.logger.Warn("orchestration failed", logging.F("request_id", requestID, "model", virtualModel, "error", err.Error()))
+ 		proxy.WriteError(w, http.StatusBadGateway, proxy.BackendUnavailable("Orchestration failed: "+err.Error(), "orchestration_failed"))
+ 		return
+ 	}
+ 
++	// Charge usage (with the same conservative estimate fallback the direct
++	// path uses when the backend omits a usage block). chargeUsage mutates
++	// result.Usage so the response/log reflect what was charged.
++	h.chargeUsage(result, virtualModel, apiKeyLabel, apiKey, raw, true)
++	if apiKey != nil {
++		apiKey.TouchRequest()
++	}
++
+ 	created := time.Now().Unix()
+ 	id := "chatcmpl-" + requestID
+-	body := orchestrator.BuildChatCompletion(id, virtualModel, created, result)
+-
++	var body []byte
+ 	if isStream {
+-		writeOrchestrationStream(w, id, virtualModel, created, result.Content)
++		writeOrchestrationStream(w, id, virtualModel, created, result)
+ 	} else {
++		body = orchestrator.BuildChatCompletion(id, virtualModel, created, result)
+ 		w.Header().Set("Content-Type", "application/json")
+ 		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+ 		w.WriteHeader(http.StatusOK)
+@@ -88,11 +116,6 @@ func (h *Handler) serveOrchestration(w http.ResponseWriter, r *http.Request, req
+ 	}
+ 
+ 	latency := time.Since(started).Milliseconds()
+-	apiKeyLabel := apiKeyLabelOf(apiKey)
+-	h.recordUsage(&result.Usage, virtualModel, "orchestrator", apiKeyLabel, apiKey)
+-	if apiKey != nil {
+-		apiKey.TouchRequest()
+-	}
+ 	h.metrics.Requests.WithLabelValues("/chat/completions", virtualModel, "orchestrator", apiKeyLabel, "200", boolLabel(isStream), "orchestration").Inc()
+ 	h.metrics.RequestLatency.WithLabelValues("/chat/completions", virtualModel, "orchestrator", boolLabel(isStream), "orchestration").Observe(time.Since(started).Seconds())
+ 
+@@ -118,6 +141,9 @@ func (h *Handler) serveOrchestration(w http.ResponseWriter, r *http.Request, req
+ 		}
+ 		var rawRespForLog []byte
+ 		if !isStream && h.shouldLog(apiKey, "log_raw_response") {
++			if body == nil {
++				body = orchestrator.BuildChatCompletion(id, virtualModel, created, result)
++			}
+ 			rawRespForLog = body
+ 		}
+ 		h.recordLog(ctx, requestID, apiKey, clientIP, virtualModel, virtualModel, "orchestrator",
+@@ -125,10 +151,23 @@ func (h *Handler) serveOrchestration(w http.ResponseWriter, r *http.Request, req
+ 	}
+ }
+ 
+-// secretLevel resolves the request data-sensitivity level used for the
+-// orchestrator access list: the configured header takes precedence, falling
+-// back to a top-level "secret_level" field in the request body.
+-func (h *Handler) secretLevel(r *http.Request, raw []byte) int {
++// chargeUsage records token usage for an orchestrated request. On a
++// successful request that returned no token counts (worker omitted the
++// usage block), it falls back to the same conservative estimate the direct
++// path uses so token-based limits/quotas still see a signal. It mutates
++// result.Usage in place so the response and logs reflect the charged total.
++func (h *Handler) chargeUsage(result *orchestrator.Result, model, apiKeyLabel string, apiKey *store.APIKey, raw []byte, success bool) {
++	if success && result.Usage.TotalTokens == 0 && apiKey != nil {
++		result.Usage.TotalTokens = estimateTokens(raw, extractMaxTokens(raw))
++	}
++	h.recordUsage(&result.Usage, model, "orchestrator", apiKeyLabel, apiKey)
++}
++
++// secretLevel resolves the request data-sensitivity level for the
++// orchestrator access list: the configured header takes precedence, then a
++// top-level "secret_level" field already parsed from the body. Negative
++// values are clamped to 0 by the orchestrator's access-list check.
++func (h *Handler) secretLevel(r *http.Request, bodySecretLevel *int) int {
+ 	hdr := h.cfg.Orchestration.SecretLevelHeader
+ 	if hdr == "" {
+ 		hdr = "X-Secret-Level"
+@@ -138,27 +177,19 @@ func (h *Handler) secretLevel(r *http.Request, raw []byte) int {
+ 			return n
+ 		}
+ 	}
+-	var peek struct {
+-		SecretLevel *int `json:"secret_level"`
+-	}
+-	if err := json.Unmarshal(raw, &peek); err == nil && peek.SecretLevel != nil {
+-		return *peek.SecretLevel
++	if bodySecretLevel != nil {
++		return *bodySecretLevel
+ 	}
+ 	return 0
+ }
+ 
+-func apiKeyLabelOf(k *store.APIKey) string {
+-	if k == nil {
+-		return "anonymous"
+-	}
+-	return k.ID
+-}
+-
+ // writeOrchestrationStream emits the orchestrated answer as a minimal SSE
+ // stream so OpenAI streaming clients work unchanged. The orchestrated answer
+ // is produced as a whole, so it is delivered as a single content chunk
+-// followed by a terminating chunk and [DONE].
+-func writeOrchestrationStream(w http.ResponseWriter, id, model string, created int64, content string) {
++// followed by a terminating chunk that carries usage and the x_orchestration
++// route trace (so streaming and non-streaming expose the same metadata),
++// then [DONE].
++func writeOrchestrationStream(w http.ResponseWriter, id, model string, created int64, result *orchestrator.Result) {
+ 	w.Header().Set("Content-Type", "text/event-stream")
+ 	w.Header().Set("Cache-Control", "no-cache")
+ 	w.Header().Set("Connection", "keep-alive")
+@@ -174,24 +205,35 @@ func writeOrchestrationStream(w http.ResponseWriter, id, model string, created i
+ 		Delta        delta   `json:"delta"`
+ 		FinishReason *string `json:"finish_reason"`
+ 	}
+-	chunk := func(d delta, finish *string) {
+-		obj := map[string]any{
+-			"id":      id,
+-			"object":  "chat.completion.chunk",
+-			"created": created,
+-			"model":   model,
+-			"choices": []choice{{Index: 0, Delta: d, FinishReason: finish}},
+-		}
++	write := func(obj map[string]any) {
+ 		b, _ := json.Marshal(obj)
+ 		_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
+ 		if flusher != nil {
+ 			flusher.Flush()
+ 		}
+ 	}
++	base := func(choices []choice) map[string]any {
++		return map[string]any{
++			"id":      id,
++			"object":  "chat.completion.chunk",
++			"created": created,
++			"model":   model,
++			"choices": choices,
++		}
++	}
+ 
+-	chunk(delta{Role: "assistant", Content: content}, nil)
++	write(base([]choice{{Index: 0, Delta: delta{Role: "assistant", Content: result.Content}}}))
+ 	stop := "stop"
+-	chunk(delta{}, &stop)
++	final := base([]choice{{Index: 0, Delta: delta{}, FinishReason: &stop}})
++	final["usage"] = result.Usage
++	final["x_orchestration"] = map[string]any{
++		"tier":       result.Tier,
++		"task":       result.Task,
++		"confidence": result.Confidence,
++		"escalated":  result.Escalated,
++		"route":      result.Steps,
++	}
++	write(final)
+ 	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+ 	if flusher != nil {
+ 		flusher.Flush()
+diff --git a/internal/orchestrator/conductor.go b/internal/orchestrator/conductor.go
+index 5144067..3ee2c0f 100644
+--- a/internal/orchestrator/conductor.go
++++ b/internal/orchestrator/conductor.go
+@@ -28,11 +28,15 @@ func (o *Orchestrator) runConductor(ctx context.Context, base []chatMessage, par
+ 	}
+ 
+ 	// Decide which optional stages fit the budget. The solver (draft) is
+-	// mandatory; verifier and synthesizer are added as budget allows, and
+-	// the thinker is added last because it is the most optional.
+-	doVerifier := budget >= 2
++	// mandatory. Verifier and synthesizer are a PAIR: a critique is only
++	// worth producing if a synthesizer step can consume it, so they share
++	// one gate (budget>=3) — never run the verifier just to discard its
++	// output. The thinker is the most optional stage; it is added at the
++	// top end (budget>=4), and also at budget==2 where it is the single
++	// useful extra step that fits.
+ 	doSynth := budget >= 3
+-	doThinker := budget >= 4
++	doVerifier := doSynth
++	doThinker := budget >= 4 || budget == 2
+ 
+ 	res := &Result{Tier: "conductor", Task: cls.Task, Confidence: cls.Confidence, Escalated: escalated}
+ 	stepNo := 0
+@@ -65,7 +69,9 @@ func (o *Orchestrator) runConductor(ctx context.Context, base []chatMessage, par
+ 		c, err := o.callWorker(ctx, thinker, msgs, plannerParams(params))
+ 		if err != nil {
+ 			o.incRoute("conductor", thinker.ID, cls.Task, "error")
+-			return nil, fmt.Errorf("conductor thinker step: %w", err)
++			// Return res (not nil) so partial usage from prior steps is
++			// still charged to the caller's quota.
++			return res, fmt.Errorf("conductor thinker step: %w", err)
+ 		}
+ 		plan = c.Text
+ 		addStep(roleThinker, c)
+@@ -80,7 +86,7 @@ func (o *Orchestrator) runConductor(ctx context.Context, base []chatMessage, par
+ 	draftC, err := o.callWorker(ctx, solver, draftMsgs, params)
+ 	if err != nil {
+ 		o.incRoute("conductor", solver.ID, cls.Task, "error")
+-		return nil, fmt.Errorf("conductor worker step: %w", err)
++		return res, fmt.Errorf("conductor worker step: %w", err)
+ 	}
+ 	draft := draftC.Text
+ 	addStep(roleWorker, draftC)
+diff --git a/internal/orchestrator/orchestrator.go b/internal/orchestrator/orchestrator.go
+index a05952a..376fbdd 100644
+--- a/internal/orchestrator/orchestrator.go
++++ b/internal/orchestrator/orchestrator.go
+@@ -26,10 +26,8 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
+-	"net"
+ 	"net/http"
+ 	"strings"
+-	"time"
+ 
+ 	"github.com/will-wang-88/llmgateway/internal/balancer"
+ 	"github.com/will-wang-88/llmgateway/internal/config"
+@@ -44,47 +42,49 @@ type MetricsSink interface {
+ 	IncRoute(tier, worker, task, outcome string)
+ 	IncEscalation(reason string)
+ 	IncStep(role, worker string)
++	// IncBackendError / IncTimeout mirror the direct path's per-backend
++	// error and timeout counters so worker-pool failures are visible on the
++	// same dashboards/alerts as normal backend traffic.
++	IncBackendError(backend, code string)
++	IncTimeout(backend, kind string)
+ }
+ 
+ // Orchestrator coordinates the worker pool. It reuses the shared store and
+ // balancer so worker selection honors the same health/capacity rules as the
+ // main request path.
+ type Orchestrator struct {
+-	cfg      config.OrchestrationConfig
+-	store    *store.Store
+-	balancer *balancer.Balancer
+-	logger   *logging.Logger
+-	metrics  MetricsSink
+-	client   *http.Client
++	cfg           config.OrchestrationConfig
++	store         *store.Store
++	balancer      *balancer.Balancer
++	logger        *logging.Logger
++	metrics       MetricsSink
++	client        *http.Client
++	allowDegraded bool
+ }
+ 
+ // New constructs an Orchestrator. cfg is assumed already validated by
+ // config.Validate.
+ func New(cfg config.OrchestrationConfig, s *store.Store, b *balancer.Balancer, log *logging.Logger) *Orchestrator {
+-	transport := &http.Transport{
+-		Proxy:                 http.ProxyFromEnvironment,
+-		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+-		ForceAttemptHTTP2:     true,
+-		MaxIdleConns:          100,
+-		MaxIdleConnsPerHost:   20,
+-		IdleConnTimeout:       90 * time.Second,
+-		TLSHandshakeTimeout:   10 * time.Second,
+-		ExpectContinueTimeout: 1 * time.Second,
+-		DisableCompression:    true,
+-		ResponseHeaderTimeout: 60 * time.Second,
+-	}
+ 	return &Orchestrator{
+ 		cfg:      cfg,
+ 		store:    s,
+ 		balancer: b,
+ 		logger:   log,
+-		client:   &http.Client{Transport: transport},
++		client:   &http.Client{Transport: proxy.DefaultTransport()},
+ 	}
+ }
+ 
+ // WithMetrics attaches a metrics sink.
+ func (o *Orchestrator) WithMetrics(m MetricsSink) *Orchestrator { o.metrics = m; return o }
+ 
++// WithRouting copies the relevant gateway routing defaults so the
++// orchestrator's worker dispatch agrees with the direct path (notably
++// whether degraded backends are routable).
++func (o *Orchestrator) WithRouting(allowDegraded bool) *Orchestrator {
++	o.allowDegraded = allowDegraded
++	return o
++}
++
+ // Handles reports whether the given model name is one of the virtual models
+ // this orchestrator owns.
+ func (o *Orchestrator) Handles(model string) bool {
+@@ -199,6 +199,11 @@ func (o *Orchestrator) single(ctx context.Context, w *config.OrchestrationWorker
+ // the request only if its SecretMaxLevel admits the request's secret level.
+ // SecretMaxLevel 0 means "unlimited" (an on-prem worker).
+ func (o *Orchestrator) eligibleWorkers(secretLevel int) []*config.OrchestrationWorker {
++	// A negative (or junk-parsed) level must never widen eligibility: clamp
++	// to 0 so an out-of-range header can't defeat the access list.
++	if secretLevel < 0 {
++		secretLevel = 0
++	}
+ 	out := make([]*config.OrchestrationWorker, 0, len(o.cfg.Workers))
+ 	for i := range o.cfg.Workers {
+ 		w := &o.cfg.Workers[i]
+@@ -266,6 +271,18 @@ func (o *Orchestrator) incStep(role, worker string) {
+ 	}
+ }
+ 
++func (o *Orchestrator) incBackendError(backend, code string) {
++	if o.metrics != nil {
++		o.metrics.IncBackendError(backend, code)
++	}
++}
++
++func (o *Orchestrator) incTimeout(backend, kind string) {
++	if o.metrics != nil {
++		o.metrics.IncTimeout(backend, kind)
++	}
++}
++
+ func containsFold(list []string, v string) bool {
+ 	for _, s := range list {
+ 		if strings.EqualFold(s, v) {
+diff --git a/internal/orchestrator/orchestrator_test.go b/internal/orchestrator/orchestrator_test.go
+index 6e4f386..3d23967 100644
+--- a/internal/orchestrator/orchestrator_test.go
++++ b/internal/orchestrator/orchestrator_test.go
+@@ -41,6 +41,13 @@ func newTestOrchestrator(t *testing.T, oc config.OrchestrationConfig) (*Orchestr
+ 
+ type recordingServer struct {
+ 	models []string // models seen, in order
++	// failAfter, when > 0, makes the server return HTTP 500 for the
++	// (failAfter+1)-th request onward, so tests can fail a later
++	// conductor step while earlier steps succeed.
++	failAfter int
++	// omitUsage, when true, returns a successful completion without a
++	// usage block (mimics backends that don't report usage).
++	omitUsage bool
+ }
+ 
+ func (s *recordingServer) handle(w http.ResponseWriter, r *http.Request) {
+@@ -50,12 +57,19 @@ func (s *recordingServer) handle(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	_ = json.Unmarshal(body, &req)
+ 	s.models = append(s.models, req.Model)
++	if s.failAfter > 0 && len(s.models) > s.failAfter {
++		w.WriteHeader(http.StatusInternalServerError)
++		_, _ = w.Write([]byte(`{"error":{"message":"boom"}}`))
++		return
++	}
+ 	resp := map[string]any{
+ 		"choices": []map[string]any{{
+ 			"message":       map[string]string{"role": "assistant", "content": "answer from " + req.Model},
+ 			"finish_reason": "stop",
+ 		}},
+-		"usage": map[string]int{"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
++	}
++	if !s.omitUsage {
++		resp["usage"] = map[string]int{"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+ 	}
+ 	w.Header().Set("Content-Type", "application/json")
+ 	_ = json.NewEncoder(w).Encode(resp)
+@@ -256,3 +270,101 @@ func TestHandlesAndVirtualModels(t *testing.T) {
+ 		t.Fatalf("expected 2 virtual models, got %v", vm)
+ 	}
+ }
++
++func TestConductorVerifierPairedWithSynth(t *testing.T) {
++	// max_steps=2 must NOT run a verifier (its critique can't be consumed
++	// without a synthesizer step) — no wasted worker call.
++	oc := baseConfig()
++	oc.MaxSteps = 2
++	o, srv := newTestOrchestrator(t, oc)
++	res, err := o.Handle(context.Background(), "fugu-ultra", chatBody("write a function"), 0)
++	if err != nil {
++		t.Fatalf("handle: %v", err)
++	}
++	for _, s := range res.Steps {
++		if s.Role == roleVerifier {
++			t.Fatalf("verifier ran under max_steps=2 but its output is discarded: %+v", res.Steps)
++		}
++	}
++	if len(srv.models) > 2 {
++		t.Fatalf("expected <=2 backend calls for max_steps=2, got %d", len(srv.models))
++	}
++}
++
++func TestConductorPartialUsageOnError(t *testing.T) {
++	o, srv := newTestOrchestrator(t, baseConfig())
++	srv.failAfter = 1 // first step (thinker) ok, second (worker) 500s
++	res, err := o.Handle(context.Background(), "fugu-ultra", chatBody("write a function"), 0)
++	if err == nil {
++		t.Fatalf("expected an error when a conductor step fails")
++	}
++	if res == nil {
++		t.Fatalf("expected partial result (non-nil) so consumed tokens can be charged")
++	}
++	if res.Usage.TotalTokens != 15 {
++		t.Fatalf("expected partial usage of 15 (thinker step), got %d", res.Usage.TotalTokens)
++	}
++}
++
++func TestSecretLevelNegativeClamped(t *testing.T) {
++	oc := baseConfig()
++	for i := range oc.Workers {
++		if oc.Workers[i].ID == "gemma" {
++			oc.Workers[i].SecretMaxLevel = 1
++		}
++	}
++	o, _ := newTestOrchestrator(t, oc)
++	// A negative level must not widen eligibility beyond level 0.
++	if got := len(o.eligibleWorkers(-1)); got != 3 {
++		t.Fatalf("negative secret level should clamp to 0 (all 3 eligible), got %d", got)
++	}
++}
++
++func TestWorkerModelDisabledKillSwitch(t *testing.T) {
++	o, _ := newTestOrchestrator(t, baseConfig())
++	// Operator disables the coding worker's model in the registry.
++	o.store.UpsertModel(&store.Model{Name: "qwen3.6-27b", Enabled: false})
++	_, err := o.Handle(context.Background(), "fugu-auto", chatBody("write a python function and fix the bug"), 0)
++	if err == nil {
++		t.Fatalf("expected error: disabled worker model must not receive orchestrated traffic")
++	}
++	if !strings.Contains(err.Error(), "disabled") {
++		t.Fatalf("expected 'disabled' in error, got %v", err)
++	}
++}
++
++func TestWorkerUsesBackendTimeoutWhenLarger(t *testing.T) {
++	// Regression: per-call timeout must honor a backend TimeoutMS larger
++	// than the global default, not only shrink it.
++	oc := baseConfig()
++	oc.RequestTimeoutMS = 50 // tiny global
++	o, srv := newTestOrchestrator(t, oc)
++	// Bump the backends' timeout well above the global; pickBackend should
++	// then use the backend value so a normal call still succeeds.
++	for _, b := range o.store.Backends() {
++		b.TimeoutMS = 5000
++	}
++	_ = srv
++	res, err := o.Handle(context.Background(), "fugu-auto", chatBody("hello"), 0)
++	if err != nil {
++		t.Fatalf("call should succeed using backend timeout: %v", err)
++	}
++	if res.Content == "" {
++		t.Fatalf("expected content")
++	}
++}
++
++func TestWorkerOmittedUsageYieldsZero(t *testing.T) {
++	// When a worker omits the usage block, the orchestrator reports zero
++	// tokens (it does not fabricate counts); the handler is responsible for
++	// the conservative estimate fallback that keeps quotas charged.
++	o, srv := newTestOrchestrator(t, baseConfig())
++	srv.omitUsage = true
++	res, err := o.Handle(context.Background(), "fugu-auto", chatBody("hello there"), 0)
++	if err != nil {
++		t.Fatalf("handle: %v", err)
++	}
++	if res.Usage.TotalTokens != 0 {
++		t.Fatalf("expected zero usage when worker omits it, got %d", res.Usage.TotalTokens)
++	}
++}
+diff --git a/internal/orchestrator/worker.go b/internal/orchestrator/worker.go
+index 62c8c2d..5cbc2bc 100644
+--- a/internal/orchestrator/worker.go
++++ b/internal/orchestrator/worker.go
+@@ -4,7 +4,9 @@ import (
+ 	"bytes"
+ 	"context"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
++	"io"
+ 	"net/http"
+ 	"time"
+ 
+@@ -69,12 +71,21 @@ type chatResponse struct {
+ // assistant text plus usage. It enforces the worker's concurrency slot and
+ // the configured per-call timeout.
+ func (o *Orchestrator) callWorker(ctx context.Context, w *config.OrchestrationWorker, msgs []chatMessage, p genParams) (*completion, error) {
+-	be, err := o.pickBackend(w.Model)
+-	if err != nil {
+-		return nil, err
++	// Acquire a concurrency slot, re-picking if we lose the race for the
++	// chosen backend (mirrors the direct path's retry in handlers.Forward).
++	var be *store.Backend
++	for attempts := 0; attempts < 3; attempts++ {
++		picked, err := o.pickBackend(w.Model)
++		if err != nil {
++			return nil, err
++		}
++		if picked.AcquireSlot() {
++			be = picked
++			break
++		}
+ 	}
+-	if !be.AcquireSlot() {
+-		return nil, fmt.Errorf("worker %s: backend %s at capacity", w.ID, be.ID)
++	if be == nil {
++		return nil, fmt.Errorf("worker %s: all backends for model %q at capacity", w.ID, w.Model)
+ 	}
+ 
+ 	body, _ := json.Marshal(chatRequest{
+@@ -86,8 +97,12 @@ func (o *Orchestrator) callWorker(ctx context.Context, w *config.OrchestrationWo
+ 		MaxTokens:   p.MaxTokens,
+ 	})
+ 
++	// Per-call timeout: the backend's own TimeoutMS is authoritative when
++	// set (matching the direct proxy path), otherwise the orchestration
++	// default applies. This lets a slow MoE worker be given more time than
++	// the global default, not only less.
+ 	timeout := time.Duration(o.cfg.RequestTimeoutMS) * time.Millisecond
+-	if be.TimeoutMS > 0 && time.Duration(be.TimeoutMS)*time.Millisecond < timeout {
++	if be.TimeoutMS > 0 {
+ 		timeout = time.Duration(be.TimeoutMS) * time.Millisecond
+ 	}
+ 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+@@ -110,27 +125,39 @@ func (o *Orchestrator) callWorker(ctx context.Context, w *config.OrchestrationWo
+ 	resp, err := o.client.Do(req)
+ 	if err != nil {
+ 		be.ReleaseSlot(false)
++		if errors.Is(err, context.DeadlineExceeded) {
++			o.incTimeout(be.ID, "backend")
++			return nil, fmt.Errorf("worker %s: backend %s timed out: %w", w.ID, be.ID, err)
++		}
++		o.incBackendError(be.ID, "unreachable")
+ 		return nil, fmt.Errorf("worker %s: backend %s unreachable: %w", w.ID, be.ID, err)
+ 	}
+ 	defer resp.Body.Close()
+ 
+-	var parsed chatResponse
+-	dec := json.NewDecoder(resp.Body)
+-	if err := dec.Decode(&parsed); err != nil {
+-		be.ReleaseSlot(false)
+-		return nil, fmt.Errorf("worker %s: decode backend response: %w", w.ID, err)
+-	}
++	respBody, _ := io.ReadAll(resp.Body)
+ 	success := resp.StatusCode >= 200 && resp.StatusCode < 300
+ 	be.ReleaseSlot(success)
+ 
++	// Status is checked before parsing so a non-JSON error page (e.g. a 503
++	// HTML body from a fronting proxy) surfaces the real status instead of a
++	// misleading "decode failed".
+ 	if !success {
++		o.incBackendError(be.ID, statusLabel(resp.StatusCode))
+ 		msg := fmt.Sprintf("status %d", resp.StatusCode)
+-		if parsed.Error != nil && parsed.Error.Message != "" {
+-			msg = parsed.Error.Message
++		var errEnv chatResponse
++		if json.Unmarshal(respBody, &errEnv) == nil && errEnv.Error != nil && errEnv.Error.Message != "" {
++			msg = errEnv.Error.Message
+ 		}
+ 		return nil, fmt.Errorf("worker %s: backend %s error: %s", w.ID, be.ID, msg)
+ 	}
++
++	var parsed chatResponse
++	if err := json.Unmarshal(respBody, &parsed); err != nil {
++		o.incBackendError(be.ID, "decode")
++		return nil, fmt.Errorf("worker %s: decode backend response: %w", w.ID, err)
++	}
+ 	if len(parsed.Choices) == 0 {
++		o.incBackendError(be.ID, "empty_response")
+ 		return nil, fmt.Errorf("worker %s: backend %s returned no choices", w.ID, be.ID)
+ 	}
+ 
+@@ -148,27 +175,15 @@ func (o *Orchestrator) callWorker(ctx context.Context, w *config.OrchestrationWo
+ }
+ 
+ // pickBackend selects one routable backend for an internal model name using
+-// the same health/capacity rules as the main request path.
++// the same routability rules as the direct path (store.FilterRoutable,
++// honoring allow_degraded), and refuses models disabled in the registry so
++// the admin kill-switch also covers orchestrated traffic.
+ func (o *Orchestrator) pickBackend(model string) (*store.Backend, error) {
+-	candidates := o.store.BackendsForModel(model)
+-	ready := make([]*store.Backend, 0, len(candidates))
+-	for _, b := range candidates {
+-		if !b.Enabled {
+-			continue
+-		}
+-		switch b.Status() {
+-		case store.StatusHealthy, store.StatusUnknown:
+-		default:
+-			continue
+-		}
+-		if b.Weight == 0 {
+-			continue
+-		}
+-		if b.MaxConcurrentRequests > 0 && b.ActiveRequests() >= int64(b.MaxConcurrentRequests) {
+-			continue
+-		}
+-		ready = append(ready, b)
++	if m, ok := o.store.Model(model); ok && !m.Enabled {
++		return nil, fmt.Errorf("worker model %q is disabled", model)
+ 	}
++	candidates := o.store.BackendsForModel(model)
++	ready := store.FilterRoutable(candidates, o.allowDegraded)
+ 	if len(ready) == 0 {
+ 		return nil, fmt.Errorf("no healthy backend for worker model %q", model)
+ 	}
+@@ -178,3 +193,10 @@ func (o *Orchestrator) pickBackend(model string) (*store.Backend, error) {
+ 	}
+ 	return picked, nil
+ }
++
++func statusLabel(code int) string {
++	if code <= 0 {
++		return "unknown"
++	}
++	return fmt.Sprintf("%d", code)
++}
+diff --git a/internal/proxy/proxy.go b/internal/proxy/proxy.go
+index a65cbe1..86e89b9 100644
+--- a/internal/proxy/proxy.go
++++ b/internal/proxy/proxy.go
+@@ -24,14 +24,33 @@ import (
+ //   - response body is forwarded byte-for-byte for non-streaming.
+ //   - streaming responses are flushed chunk-by-chunk without parsing.
+ type Proxy struct {
+-	client            *http.Client
+-	streamingClient   *http.Client
+-	logger            *logging.Logger
+-	metrics           *metrics.Metrics
++	client          *http.Client
++	streamingClient *http.Client
++	logger          *logging.Logger
++	metrics         *metrics.Metrics
+ }
+ 
+ func New(logger *logging.Logger, m *metrics.Metrics) *Proxy {
+-	transport := &http.Transport{
++	transport := DefaultTransport()
++	return &Proxy{
++		client: &http.Client{
++			Transport: transport,
++			Timeout:   0, // request-level timeout is enforced via context
++		},
++		streamingClient: &http.Client{
++			Transport: transport,
++			Timeout:   0,
++		},
++		logger:  logger,
++		metrics: m,
++	}
++}
++
++// DefaultTransport builds the tuned HTTP transport used for all upstream
++// backend calls (both the direct proxy path and the orchestrator's worker
++// calls), so connection-pool and timeout tuning lives in one place.
++func DefaultTransport() *http.Transport {
++	return &http.Transport{
+ 		Proxy: http.ProxyFromEnvironment,
+ 		DialContext: (&net.Dialer{
+ 			Timeout:   30 * time.Second,
+@@ -44,35 +63,23 @@ func New(logger *logging.Logger, m *metrics.Metrics) *Proxy {
+ 		TLSHandshakeTimeout:   10 * time.Second,
+ 		ExpectContinueTimeout: 1 * time.Second,
+ 		// DisableCompression is important - gzip would buffer the stream.
+-		DisableCompression:    true,
++		DisableCompression: true,
+ 		// Detect upstream that accepts the TCP connection but never returns
+ 		// response headers. Without this a hung backend wedges the request
+ 		// until the client disconnects.
+ 		ResponseHeaderTimeout: 60 * time.Second,
+ 	}
+-	return &Proxy{
+-		client: &http.Client{
+-			Transport: transport,
+-			Timeout:   0, // request-level timeout is enforced via context
+-		},
+-		streamingClient: &http.Client{
+-			Transport: transport,
+-			Timeout:   0,
+-		},
+-		logger:  logger,
+-		metrics: m,
+-	}
+ }
+ 
+ // ForwardOptions describes how to forward a single request.
+ type ForwardOptions struct {
+-	Method        string
+-	Backend       *store.Backend
+-	UpstreamPath  string // e.g. "/chat/completions"
+-	Body          []byte // raw body to forward (already rewritten if needed)
+-	IsStream      bool
++	Method              string
++	Backend             *store.Backend
++	UpstreamPath        string // e.g. "/chat/completions"
++	Body                []byte // raw body to forward (already rewritten if needed)
++	IsStream            bool
+ 	StreamIdleTimeoutMS int
+-	TimeoutMS     int
++	TimeoutMS           int
+ 
+ 	// Labels for metrics/logging.
+ 	Model        string
+@@ -87,10 +94,10 @@ type ForwardOptions struct {
+ 
+ 	// Optional callbacks.
+ 	OnTTFT        func(d time.Duration)
+-	OnUsage       func(usage *Usage)       // called for non-streaming once response is parsed
+-	OnStreamUsage func(usage *Usage)       // called for streaming if usage block found in final chunk
+-	OnRawResponse func(body []byte)        // called for non-streaming, raw bytes
+-	OnStreamChunk func(line []byte)        // called once per streamed chunk
++	OnUsage       func(usage *Usage) // called for non-streaming once response is parsed
++	OnStreamUsage func(usage *Usage) // called for streaming if usage block found in final chunk
++	OnRawResponse func(body []byte)  // called for non-streaming, raw bytes
++	OnStreamChunk func(line []byte)  // called once per streamed chunk
+ }
+ 
+ type Usage struct {
+diff --git a/internal/store/store.go b/internal/store/store.go
+index fda0690..61fd1cb 100644
+--- a/internal/store/store.go
++++ b/internal/store/store.go
+@@ -214,8 +214,8 @@ type APIKey struct {
+ 	Logging          *config.APIKeyLogging
+ 	ExpiresAt        time.Time
+ 
+-	mu          sync.RWMutex
+-	lastUsedAt  time.Time
++	mu            sync.RWMutex
++	lastUsedAt    time.Time
+ 	totalRequests int64
+ 	totalTokens   int64
+ }
+@@ -525,6 +525,46 @@ func (s *Store) BackendsForModel(model string) []*Backend {
+ 	return out
+ }
+ 
++// FilterRoutable returns the subset of backends admissible for routing.
++//
++// Routable states: healthy, unknown (just-started). Degraded is routable
++// only when allowDegraded is true (off by default), because the health
++// probe has already observed a 4xx from the backend - sending real traffic
++// to it would surface the same failure to the client.
++// Excluded states: disabled, unhealthy, maintenance.
++// Excluded: backends at max concurrency.
++// Excluded: backends with weight 0 (drain mode).
++//
++// This is the single definition of "routable" shared by the direct proxy
++// path and the orchestrator's worker dispatch.
++func FilterRoutable(in []*Backend, allowDegraded bool) []*Backend {
++	out := make([]*Backend, 0, len(in))
++	for _, b := range in {
++		if !b.Enabled {
++			continue
++		}
++		switch b.Status() {
++		case StatusHealthy, StatusUnknown:
++			// admissible
++		case StatusDegraded:
++			if !allowDegraded {
++				continue
++			}
++		default:
++			continue
++		}
++		if b.Weight == 0 {
++			// 0 weight is interpreted as "drain": registered but no new traffic.
++			continue
++		}
++		if b.MaxConcurrentRequests > 0 && b.ActiveRequests() >= int64(b.MaxConcurrentRequests) {
++			continue
++		}
++		out = append(out, b)
++	}
++	return out
++}
++
+ func (s *Store) Models() []*Model {
+ 	s.mu.RLock()
+ 	defer s.mu.RUnlock()
+-- 
+2.43.0
+
