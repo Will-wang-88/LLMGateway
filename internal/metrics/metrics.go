@@ -22,6 +22,11 @@ type Metrics struct {
 	QuotaHits        *prometheus.CounterVec
 	Timeouts         *prometheus.CounterVec
 	QueueDepth       *prometheus.GaugeVec
+
+	// Orchestration (Fugu-style model routing) metrics.
+	OrchRoutes      *prometheus.CounterVec
+	OrchEscalations *prometheus.CounterVec
+	OrchSteps       *prometheus.CounterVec
 }
 
 // New constructs a Metrics with its own private registry so multiple instances
@@ -89,6 +94,18 @@ func New() *Metrics {
 			Name: "llmgw_queue_depth",
 			Help: "Pending requests queue depth",
 		}, []string{"scope"}),
+		OrchRoutes: factory.NewCounterVec(prometheus.CounterOpts{
+			Name: "llmgw_orchestration_routes_total",
+			Help: "Orchestrator routing decisions by tier, chosen worker, task class and outcome",
+		}, []string{"tier", "worker", "task", "outcome"}),
+		OrchEscalations: factory.NewCounterVec(prometheus.CounterOpts{
+			Name: "llmgw_orchestration_escalations_total",
+			Help: "Tier-A -> Tier-B escalations by reason",
+		}, []string{"reason"}),
+		OrchSteps: factory.NewCounterVec(prometheus.CounterOpts{
+			Name: "llmgw_orchestration_steps_total",
+			Help: "Conductor (Tier-B) worker steps executed by role and worker",
+		}, []string{"role", "worker"}),
 	}
 }
 

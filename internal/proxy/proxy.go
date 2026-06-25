@@ -24,32 +24,14 @@ import (
 //   - response body is forwarded byte-for-byte for non-streaming.
 //   - streaming responses are flushed chunk-by-chunk without parsing.
 type Proxy struct {
-	client            *http.Client
-	streamingClient   *http.Client
-	logger            *logging.Logger
-	metrics           *metrics.Metrics
+	client          *http.Client
+	streamingClient *http.Client
+	logger          *logging.Logger
+	metrics         *metrics.Metrics
 }
 
 func New(logger *logging.Logger, m *metrics.Metrics) *Proxy {
-	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          200,
-		MaxIdleConnsPerHost:   50,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		// DisableCompression is important - gzip would buffer the stream.
-		DisableCompression:    true,
-		// Detect upstream that accepts the TCP connection but never returns
-		// response headers. Without this a hung backend wedges the request
-		// until the client disconnects.
-		ResponseHeaderTimeout: 60 * time.Second,
-	}
+	transport := DefaultTransport()
 	return &Proxy{
 		client: &http.Client{
 			Transport: transport,
@@ -64,15 +46,40 @@ func New(logger *logging.Logger, m *metrics.Metrics) *Proxy {
 	}
 }
 
+// DefaultTransport builds the tuned HTTP transport used for all upstream
+// backend calls (both the direct proxy path and the orchestrator's worker
+// calls), so connection-pool and timeout tuning lives in one place.
+func DefaultTransport() *http.Transport {
+	return &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          200,
+		MaxIdleConnsPerHost:   50,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		// DisableCompression is important - gzip would buffer the stream.
+		DisableCompression: true,
+		// Detect upstream that accepts the TCP connection but never returns
+		// response headers. Without this a hung backend wedges the request
+		// until the client disconnects.
+		ResponseHeaderTimeout: 60 * time.Second,
+	}
+}
+
 // ForwardOptions describes how to forward a single request.
 type ForwardOptions struct {
-	Method        string
-	Backend       *store.Backend
-	UpstreamPath  string // e.g. "/chat/completions"
-	Body          []byte // raw body to forward (already rewritten if needed)
-	IsStream      bool
+	Method              string
+	Backend             *store.Backend
+	UpstreamPath        string // e.g. "/chat/completions"
+	Body                []byte // raw body to forward (already rewritten if needed)
+	IsStream            bool
 	StreamIdleTimeoutMS int
-	TimeoutMS     int
+	TimeoutMS           int
 
 	// Labels for metrics/logging.
 	Model        string
@@ -87,10 +94,10 @@ type ForwardOptions struct {
 
 	// Optional callbacks.
 	OnTTFT        func(d time.Duration)
-	OnUsage       func(usage *Usage)       // called for non-streaming once response is parsed
-	OnStreamUsage func(usage *Usage)       // called for streaming if usage block found in final chunk
-	OnRawResponse func(body []byte)        // called for non-streaming, raw bytes
-	OnStreamChunk func(line []byte)        // called once per streamed chunk
+	OnUsage       func(usage *Usage) // called for non-streaming once response is parsed
+	OnStreamUsage func(usage *Usage) // called for streaming if usage block found in final chunk
+	OnRawResponse func(body []byte)  // called for non-streaming, raw bytes
+	OnStreamChunk func(line []byte)  // called once per streamed chunk
 }
 
 type Usage struct {

@@ -17,6 +17,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/will-wang-88/llmgateway/internal/admin"
 	"github.com/will-wang-88/llmgateway/internal/auth"
 	"github.com/will-wang-88/llmgateway/internal/backend"
@@ -28,8 +29,8 @@ import (
 	"github.com/will-wang-88/llmgateway/internal/metrics"
 	"github.com/will-wang-88/llmgateway/internal/netutil"
 	"github.com/will-wang-88/llmgateway/internal/notify"
+	"github.com/will-wang-88/llmgateway/internal/orchestrator"
 	"github.com/will-wang-88/llmgateway/internal/proxy"
-	"github.com/redis/go-redis/v9"
 
 	"github.com/will-wang-88/llmgateway/internal/queue"
 	"github.com/will-wang-88/llmgateway/internal/quota"
@@ -219,6 +220,17 @@ func main() {
 		WithQuota(qm).
 		WithQueue(qq).
 		WithTracer(tr)
+	if cfg.Orchestration.Enabled {
+		orch := orchestrator.New(cfg.Orchestration, s, bal, logger).
+			WithRouting(cfg.Routing.AllowDegradedBackends).
+			WithMetrics(handlers.OrchestratorMetricsSink(m))
+		h = h.WithOrchestrator(orch)
+		logger.Info("orchestration enabled", logging.F(
+			"router_model", cfg.Orchestration.RouterModel,
+			"conductor_model", cfg.Orchestration.ConductorModel,
+			"workers", len(cfg.Orchestration.Workers),
+		))
+	}
 	ipExtractor := netutil.NewExtractor(cfg.Server.TrustedProxies)
 	adminSrv := admin.NewServer(cfg, s, hc, logger).
 		WithLogStore(ls).

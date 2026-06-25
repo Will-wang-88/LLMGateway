@@ -177,6 +177,41 @@ backends:
     stream_idle_timeout_ms: 60000
     tags: [gpu, reasoning]
 
+  # --- Fugu-style orchestration worker pool (self-hosted) ---
+  - id: gpu-fugu-gptoss
+    name: gpt-oss-120b (vLLM, MoE, TP=4)
+    base_url: http://localhost:8010/v1
+    enabled: true
+    models:
+      - gpt-oss-120b
+    weight: 1
+    max_concurrent_requests: 8
+    timeout_ms: 300000
+    stream_idle_timeout_ms: 60000
+    tags: [gpu, h200, moe, reasoning]
+  - id: gpu-fugu-gemma
+    name: Gemma 4 26B (SGLang, TP=2, low latency)
+    base_url: http://localhost:8011/v1
+    enabled: true
+    models:
+      - gemma-4-26b
+    weight: 1
+    max_concurrent_requests: 32
+    timeout_ms: 120000
+    stream_idle_timeout_ms: 30000
+    tags: [gpu, dense, general]
+  - id: gpu-fugu-qwen
+    name: Qwen3.6 27B (vLLM, TP=2, prefix caching)
+    base_url: http://localhost:8012/v1
+    enabled: true
+    models:
+      - qwen3.6-27b
+    weight: 1
+    max_concurrent_requests: 24
+    timeout_ms: 180000
+    stream_idle_timeout_ms: 45000
+    tags: [gpu, dense, coding, zh]
+
 models:
   - name: llama-3.1-70b
     type: chat
@@ -200,6 +235,23 @@ models:
   - name: qwen-thinking
     type: chat
     enabled: true
+    capability_mode: passthrough
+  # Fugu worker models (direct access still possible; orchestration
+  # virtual models below fan out across them).
+  - name: gpt-oss-120b
+    type: chat
+    enabled: true
+    context_length: 131072
+    capability_mode: passthrough
+  - name: gemma-4-26b
+    type: chat
+    enabled: true
+    context_length: 131072
+    capability_mode: passthrough
+  - name: qwen3.6-27b
+    type: chat
+    enabled: true
+    context_length: 131072
     capability_mode: passthrough
 
 model_aliases:
@@ -261,3 +313,45 @@ api_keys:
       requests_per_minute: 30
       concurrent_requests: 2
     delay_ms: 500
+
+# --- Fugu-style model orchestration (behaviour-level fusion) ---
+# Exposes single OpenAI-compatible virtual models that route/decompose a
+# request across the self-hosted worker pool. No model weights are merged;
+# each worker is treated as a black box.
+orchestration:
+  enabled: false            # set true to activate the virtual models below
+  router_model: fugu-auto   # Tier-A: low-latency, single best worker
+  conductor_model: fugu-ultra  # Tier-B: ≤5-step Thinker/Worker/Verifier DAG
+  # When the Tier-A classifier's confidence is below this, the request is
+  # escalated to Tier-B (or, if no conductor, to the strongest worker).
+  confidence_threshold: 0.55
+  max_steps: 5              # hard upper bound on Tier-B worker calls
+  # effective_score = strength - cost_penalty * cost. 0 disables cost bias.
+  cost_penalty: 0.0
+  request_timeout_ms: 120000
+  # Inbound header carrying request data sensitivity. Workers whose
+  # secret_max_level is below the request level are excluded (access list /
+  # data governance). 0 = unlimited (on-prem).
+  secret_level_header: X-Secret-Level
+  workers:
+    - id: qwen
+      model: qwen3.6-27b
+      tasks: [code, zh, verify]   # strong at coding, tool use, 繁中
+      strength: 0.82
+      cost: 2
+      secret_max_level: 0         # self-hosted: any sensitivity
+      tags: [coding, tool_use, zh-tw]
+    - id: gptoss
+      model: gpt-oss-120b
+      tasks: [reasoning, verify]  # MoE capacity, deep reasoning / math
+      strength: 0.90
+      cost: 5
+      secret_max_level: 0
+      tags: [reasoning, math, long_context]
+    - id: gemma
+      model: gemma-4-26b
+      tasks: [general]            # general chat / summarization / multilingual
+      strength: 0.70
+      cost: 1
+      secret_max_level: 0
+      tags: [general, multilingual, summarization]
