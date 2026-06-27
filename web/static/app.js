@@ -436,11 +436,19 @@
       <td>${statusBadge(l.status_code)}</td>
       <td>${l.stream ? '<span class="badge stream">stream</span>' : ''}</td>
       <td>${fmt(l.total_tokens)}</td>
+      <td>${compressionCell(l)}</td>
       <td>${l.latency_ms}ms</td>
       <td>${l.ttft_ms || 0}ms</td>
       <td class="mono small">${escapeHTML(l.request_id || '')}</td>
     </tr>`).join('');
-    document.querySelector('#logs-table tbody').innerHTML = rows || '<tr><td colspan="12" class="small">No logs match.</td></tr>';
+    document.querySelector('#logs-table tbody').innerHTML = rows || '<tr><td colspan="13" class="small">No logs match.</td></tr>';
+  }
+  // compressionCell shows the percentage of input tokens saved for a request,
+  // or "-" when compression did not run. compression_ratio is after/before.
+  function compressionCell(l) {
+    if (!l.compression_applied) return '<span class="small">-</span>';
+    const saved = Math.max(0, Math.round((1 - (l.compression_ratio || 0)) * 100));
+    return `<span class="badge ok" title="${fmt(l.original_tokens || 0)} → ${fmt(l.compressed_tokens || 0)} tokens">${saved}% saved</span>`;
   }
   function statusBadge(c) {
     if (!c) return '<span class="badge unknown">?</span>';
@@ -459,6 +467,9 @@
       { l: 'Prompt tokens', v: fmt(stats.prompt_tokens || 0) },
       { l: 'Completion tokens', v: fmt(stats.completion_tokens || 0) },
       { l: 'Total tokens', v: fmt(stats.total_tokens || 0) },
+      { l: 'Compressed reqs', v: fmt(stats.compressed_requests || 0) },
+      { l: 'Tokens saved', v: fmt(stats.tokens_saved || 0), k: (stats.tokens_saved || 0) > 0 ? 'ok' : '' },
+      { l: 'Avg compression', v: stats.avg_compression_ratio ? Math.round((1 - stats.avg_compression_ratio) * 100) + '% saved' : '-' },
     ].map(c => `<div class="card ${c.k || ''}"><div class="l">${escapeHTML(c.l)}</div><div class="v">${escapeHTML(String(c.v))}</div></div>`).join('');
     renderTop('#analytics-models tbody', stats.by_model || {});
     renderTop('#analytics-backends tbody', stats.by_backend || {});

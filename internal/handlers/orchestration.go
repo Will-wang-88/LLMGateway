@@ -63,7 +63,7 @@ func (h *Handler) serveOrchestration(w http.ResponseWriter, r *http.Request, req
 		if isQuotaCode(code) {
 			h.metrics.QuotaHits.WithLabelValues(apiKeyLabel, code).Inc()
 		}
-		h.recordLog(ctx, requestID, apiKey, clientIP, virtualModel, virtualModel, "orchestrator", "/chat/completions", isStream, status, code, nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil)
+		h.recordLog(ctx, requestID, apiKey, clientIP, virtualModel, virtualModel, "orchestrator", "/chat/completions", isStream, status, code, nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil, nil)
 		proxy.WriteError(w, status, proxy.RateLimit("Rejected: "+code, code))
 		return
 	}
@@ -87,7 +87,7 @@ func (h *Handler) serveOrchestration(w http.ResponseWriter, r *http.Request, req
 				apiKey.TouchRequest()
 			}
 		}
-		h.recordLog(ctx, requestID, apiKey, clientIP, virtualModel, virtualModel, "orchestrator", "/chat/completions", isStream, http.StatusBadGateway, "orchestration_failed", usage, latency, 0, h.rawForLog(apiKey, raw), nil)
+		h.recordLog(ctx, requestID, apiKey, clientIP, virtualModel, virtualModel, "orchestrator", "/chat/completions", isStream, http.StatusBadGateway, "orchestration_failed", usage, latency, 0, h.rawForLog(apiKey, raw), nil, nil)
 		h.metrics.Requests.WithLabelValues("/chat/completions", virtualModel, "orchestrator", apiKeyLabel, "502", boolLabel(isStream), "orchestration").Inc()
 		h.logger.Warn("orchestration failed", logging.F("request_id", requestID, "model", virtualModel, "error", err.Error()))
 		proxy.WriteError(w, http.StatusBadGateway, proxy.BackendUnavailable("Orchestration failed: "+err.Error(), "orchestration_failed"))
@@ -147,7 +147,7 @@ func (h *Handler) serveOrchestration(w http.ResponseWriter, r *http.Request, req
 			rawRespForLog = body
 		}
 		h.recordLog(ctx, requestID, apiKey, clientIP, virtualModel, virtualModel, "orchestrator",
-			"/chat/completions", isStream, http.StatusOK, "", &result.Usage, latency, 0, rawReqForLog, rawRespForLog)
+			"/chat/completions", isStream, http.StatusOK, "", &result.Usage, latency, 0, rawReqForLog, rawRespForLog, nil)
 	}
 }
 

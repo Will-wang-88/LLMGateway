@@ -375,7 +375,7 @@ func TestGatewayErrorsPersistRawRequestWhenEnabled(t *testing.T) {
 	r := newReviewRig(t, []string{"m1"})
 	k, _ := r.store.APIKey("k1")
 	k.Logging = &config.APIKeyLogging{LogMetadata: true, LogRawRequest: true}
-	r.do(t, []byte(`{"messages":[]}`), nil)            // missing_model
+	r.do(t, []byte(`{"messages":[]}`), nil)                   // missing_model
 	r.do(t, []byte(`{"model":"unknown","messages":[]}`), nil) // model_not_found
 	time.Sleep(80 * time.Millisecond)
 	rows, _ := r.logstore.QueryRequests(context.Background(), logstore.LogQuery{Limit: 20})

@@ -60,11 +60,19 @@ func (s *SQLite) migrate() error {
 			raw_request TEXT,
 			raw_response TEXT,
 			metadata TEXT,
-			created_at INTEGER NOT NULL
+			created_at INTEGER NOT NULL,
+			compression_applied INTEGER NOT NULL DEFAULT 0,
+			original_tokens INTEGER NOT NULL DEFAULT 0,
+			compressed_tokens INTEGER NOT NULL DEFAULT 0,
+			compression_ratio REAL NOT NULL DEFAULT 0
 		)`,
 		// Best-effort add for existing databases that pre-date client_ip.
 		// Ignored if the column already exists.
 		`ALTER TABLE request_logs ADD COLUMN client_ip TEXT`,
+		`ALTER TABLE request_logs ADD COLUMN compression_applied INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE request_logs ADD COLUMN original_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE request_logs ADD COLUMN compressed_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE request_logs ADD COLUMN compression_ratio REAL NOT NULL DEFAULT 0`,
 		`CREATE INDEX IF NOT EXISTS idx_request_logs_created ON request_logs(created_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_request_logs_api_key ON request_logs(api_key_id, created_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_request_logs_client_ip ON request_logs(client_ip, created_at)`,
@@ -110,14 +118,15 @@ func (s *SQLite) AppendRequest(ctx context.Context, r *RequestLog) error {
 		(id, request_id, api_key_id, api_key_name, client_ip, model, internal_model, backend_id,
 		 endpoint, stream, status_code, error_code, prompt_tokens, completion_tokens,
 		 total_tokens, reasoning_tokens, latency_ms, ttft_ms, raw_request, raw_response,
-		 metadata, created_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 metadata, created_at, compression_applied, original_tokens, compressed_tokens, compression_ratio)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.RequestID, nullable(r.APIKeyID), nullable(r.APIKeyName), nullable(r.ClientIP),
 		r.Model, nullable(r.InternalModel), nullable(r.BackendID), r.Endpoint, boolInt(r.Stream),
 		r.StatusCode, nullable(r.ErrorCode), r.PromptTokens, r.CompletionTokens,
 		r.TotalTokens, r.ReasoningTokens, r.LatencyMS, r.TTFTMS,
 		nullable(r.RawRequest), nullable(r.RawResponse), string(meta),
-		r.CreatedAt.UTC().UnixMilli())
+		r.CreatedAt.UTC().UnixMilli(), boolInt(r.CompressionApplied), r.OriginalTokens,
+		r.CompressedTokens, r.CompressionRatio)
 	return err
 }
 
@@ -180,7 +189,9 @@ func (s *SQLite) QueryRequests(ctx context.Context, q LogQuery) ([]*RequestLog, 
 		COALESCE(client_ip,''), model, COALESCE(internal_model,''), COALESCE(backend_id,''),
 		endpoint, stream, status_code, COALESCE(error_code,''), prompt_tokens, completion_tokens,
 		total_tokens, reasoning_tokens, latency_ms, ttft_ms, COALESCE(raw_request,''),
-		COALESCE(raw_response,''), COALESCE(metadata,''), created_at
+		COALESCE(raw_response,''), COALESCE(metadata,''), created_at,
+		COALESCE(compression_applied,0), COALESCE(original_tokens,0), COALESCE(compressed_tokens,0),
+		COALESCE(compression_ratio,0)
 		FROM request_logs %s ORDER BY created_at DESC LIMIT ? OFFSET ?`, where)
 	args = append(args, limit, q.Offset)
 	rows, err := s.db.QueryContext(ctx, sqlStr, args...)
@@ -194,14 +205,17 @@ func (s *SQLite) QueryRequests(ctx context.Context, q LogQuery) ([]*RequestLog, 
 		var createdAt int64
 		var streamInt int
 		var metadata string
+		var compApplied int
 		if err := rows.Scan(&r.ID, &r.RequestID, &r.APIKeyID, &r.APIKeyName, &r.ClientIP,
 			&r.Model, &r.InternalModel, &r.BackendID, &r.Endpoint, &streamInt, &r.StatusCode,
 			&r.ErrorCode, &r.PromptTokens, &r.CompletionTokens, &r.TotalTokens,
 			&r.ReasoningTokens, &r.LatencyMS, &r.TTFTMS, &r.RawRequest, &r.RawResponse,
-			&metadata, &createdAt); err != nil {
+			&metadata, &createdAt, &compApplied, &r.OriginalTokens, &r.CompressedTokens,
+			&r.CompressionRatio); err != nil {
 			return nil, err
 		}
 		r.Stream = streamInt != 0
+		r.CompressionApplied = compApplied != 0
 		r.CreatedAt = time.UnixMilli(createdAt).UTC()
 		if metadata != "" {
 			_ = json.Unmarshal([]byte(metadata), &r.Metadata)
@@ -226,10 +240,14 @@ func (s *SQLite) StatsSince(ctx context.Context, since time.Time) (*Stats, error
 		SUM(CASE WHEN status_code >= 400 OR status_code = 0 THEN 1 ELSE 0 END),
 		COALESCE(SUM(prompt_tokens),0),
 		COALESCE(SUM(completion_tokens),0),
-		COALESCE(SUM(total_tokens),0)
+		COALESCE(SUM(total_tokens),0),
+		COALESCE(SUM(compression_applied),0),
+		COALESCE(SUM(CASE WHEN compression_applied <> 0 THEN original_tokens ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN compression_applied <> 0 THEN compressed_tokens ELSE 0 END),0)
 		FROM request_logs WHERE created_at >= ?`, sinceMS)
 	if err := row.Scan(&stats.TotalRequests, &stats.SuccessTotal, &stats.ErrorTotal,
-		&stats.PromptTokens, &stats.CompletionTokens, &stats.TotalTokens); err != nil {
+		&stats.PromptTokens, &stats.CompletionTokens, &stats.TotalTokens,
+		&stats.CompressedRequests, &stats.OriginalTokens, &stats.CompressedTokens); err != nil {
 		return nil, err
 	}
 
@@ -274,6 +292,7 @@ func (s *SQLite) StatsSince(ctx context.Context, since time.Time) (*Stats, error
 		}); err != nil {
 		return nil, err
 	}
+	finalizeCompressionStats(stats)
 	return stats, nil
 }
 
