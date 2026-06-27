@@ -39,29 +39,74 @@ func lossyPass(env *envelope, cfg Config, stats *Stats, transforms map[string]bo
 		if !ok {
 			cand, _ := maybeReviveToArray(m.content, cfg)
 			if items, ok = decodeArray(cand); !ok {
+				// Not an array: a whole-content opaque blob (§3d) can be offloaded
+				// behind a marker; otherwise try the §3e prose path.
+				if kind, opaque := classifyOpaque(m.content, cfg); opaque {
+					hash := contentHash([]byte(m.content))
+					env.setContent(m, opaqueMarker(hash, kind, len(m.content)))
+					stats.Markers = append(stats.Markers, Marker{Hash: hash, Content: []byte(m.content), Kind: kind})
+					transforms["opaque"] = true
+					applied = true
+				} else if out, marker, ok := proseLossy(m.content, query, cfg); ok {
+					env.setContent(m, out)
+					stats.Markers = append(stats.Markers, marker)
+					transforms["prose"] = true
+					applied = true
+				}
 				continue
 			}
 		}
 		rows, ok := asObjectRows(items)
-		if !ok || len(rows) <= target {
-			continue
-		}
-		keep, dropped := selectKeep(rows, query, target, cfg)
-		if len(dropped) == 0 {
-			continue
-		}
-		keptItems := pickItems(items, keep)
-		droppedItems := pickItems(items, dropped)
-		droppedBytes := canonicalJSON(droppedItems)
-		hash := contentHash(droppedBytes)
-		content, ok := renderLossy(keptItems, droppedItems, hash, cfg)
 		if !ok {
 			continue
 		}
+
+		if len(rows) > target {
+			// Row-drop path. Hash the dropped rows BEFORE any opaque rewrite so a
+			// row-drop retrieval returns the original full rows.
+			keep, dropped := selectKeep(rows, query, target, cfg)
+			if len(dropped) == 0 {
+				continue
+			}
+			keptItems := pickItems(items, keep)
+			droppedItems := pickItems(items, dropped)
+			droppedBytes := canonicalJSON(droppedItems)
+			hash := contentHash(droppedBytes)
+			// Offload opaque blobs inside the kept rows too (§3d).
+			keptItems, opaqueMarkers := replaceOpaqueRows(keptItems, cfg)
+			content, ok := renderLossy(keptItems, droppedItems, hash, cfg)
+			if !ok {
+				continue
+			}
+			env.setContent(m, content)
+			stats.Markers = append(stats.Markers, Marker{Hash: hash, Content: droppedBytes, Kind: "rows"})
+			stats.Markers = append(stats.Markers, opaqueMarkers...)
+			stats.RowsOffloaded += len(dropped)
+			transforms["row-drop"] = true
+			if len(opaqueMarkers) > 0 {
+				transforms["opaque"] = true
+			}
+			applied = true
+			continue
+		}
+
+		// Not oversized, but we're over budget: still offload any opaque blobs
+		// in the array's cells and re-encode if that helped.
+		newItems, opaqueMarkers := replaceOpaqueRows(items, cfg)
+		if len(opaqueMarkers) == 0 {
+			continue
+		}
+		content, ok := compactArray(newItems, cfg, 0, "")
+		if !ok {
+			b, err := json.Marshal(newItems)
+			if err != nil {
+				continue
+			}
+			content = string(b)
+		}
 		env.setContent(m, content)
-		stats.Markers = append(stats.Markers, Marker{Hash: hash, Content: droppedBytes, Kind: "rows"})
-		stats.RowsOffloaded += len(dropped)
-		transforms["row-drop"] = true
+		stats.Markers = append(stats.Markers, opaqueMarkers...)
+		transforms["opaque"] = true
 		applied = true
 	}
 	return applied

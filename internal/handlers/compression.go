@@ -62,7 +62,11 @@ func (h *Handler) maybeCompress(internalModel string, k *store.APIKey, endpoint 
 	case merged.TokenBudget != nil && *merged.TokenBudget > 0:
 		ccfg.TokenBudget = *merged.TokenBudget
 	case model != nil && model.ContextLength > 0:
-		ccfg.TokenBudget = model.ContextLength
+		// Default the lossy budget to a fraction of the context window so the
+		// conservative-lossy stage engages before the hard ceiling rather than
+		// only when a request would already overflow the model. Explicit
+		// token_budget always wins.
+		ccfg.TokenBudget = model.ContextLength * 8 / 10
 	}
 
 	out, stats := compress.Compress(*body, ccfg)

@@ -226,7 +226,9 @@ compression:
   enabled: false          # global on/off; set true to enable fleet-wide
   min_input_tokens: 4000  # only compress requests larger than this
   lossless_only: false    # true => never drop rows / emit markers
-  # token_budget: 0       # absolute lossy budget; defaults to the model context_length
+  # token_budget: 0       # absolute lossy budget; when unset, defaults to 80% of
+                          # the model context_length so row-drop engages before the
+                          # hard ceiling. Set explicitly to tune when lossy kicks in.
 
 models:
   - name: llama-3.1-70b

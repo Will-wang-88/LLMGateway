@@ -45,16 +45,16 @@ func TestInputCompressionEndToEnd(t *testing.T) {
 	}
 	arr, _ := json.Marshal(rows)
 
-	// The tool result sits in an older turn (outside the protected recent 2),
-	// so it is eligible for compression.
+	// The big tool result is the OLDEST of three; the protected window is the
+	// most recent 2 tool results, so this one is eligible for compression.
 	body := map[string]any{
 		"model": "llama-3.1-70b",
 		"messages": []any{
 			map[string]any{"role": "user", "content": "first question"},
 			map[string]any{"role": "assistant", "content": "calling tool"},
 			map[string]any{"role": "tool", "tool_call_id": "c1", "content": string(arr)},
-			map[string]any{"role": "user", "content": "follow up"},
-			map[string]any{"role": "assistant", "content": "ok"},
+			map[string]any{"role": "tool", "tool_call_id": "c2", "content": "ok recent A"},
+			map[string]any{"role": "tool", "tool_call_id": "c3", "content": "ok recent B"},
 			map[string]any{"role": "user", "content": "another"},
 		},
 	}
@@ -86,18 +86,36 @@ func TestInputCompressionEndToEnd(t *testing.T) {
 	if got.Model != "llama-3.1-70b" {
 		t.Fatalf("model field altered: %q", got.Model)
 	}
-	var toolContent string
+	var toolContents []string
 	for _, m := range got.Messages {
 		if m.Role == "tool" {
-			_ = json.Unmarshal(m.Content, &toolContent)
+			var s string
+			_ = json.Unmarshal(m.Content, &s)
+			toolContents = append(toolContents, s)
 		}
 	}
-	if !strings.HasPrefix(toolContent, "[30]{") {
-		t.Fatalf("tool content not CSV-schema compacted:\n%s", toolContent)
+	// The oldest (big) tool result is compacted; the recent two are untouched.
+	var compacted string
+	for _, s := range toolContents {
+		if strings.HasPrefix(s, "[30]{") {
+			compacted = s
+		}
 	}
-	decoded, ok := compress.DecodeCSVSchema(toolContent)
+	if compacted == "" {
+		t.Fatalf("no CSV-schema compacted tool content found:\n%v", toolContents)
+	}
+	decoded, ok := compress.DecodeCSVSchema(compacted)
 	if !ok || len(decoded) != 30 {
 		t.Fatalf("compacted tool content does not decode to 30 rows (ok=%v len=%d)", ok, len(decoded))
+	}
+	recentUntouched := false
+	for _, s := range toolContents {
+		if s == "ok recent B" {
+			recentUntouched = true
+		}
+	}
+	if !recentUntouched {
+		t.Fatalf("most recent tool result should be untouched; got %v", toolContents)
 	}
 	// Recent user prose must be untouched.
 	lastUser := ""

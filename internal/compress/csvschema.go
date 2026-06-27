@@ -51,6 +51,9 @@ func encodeBuckets(rows []map[string]any, disc string, cfg Config, droppedN int,
 		bucket := groups[key]
 		// Build columns for this bucket, excluding the discriminator column.
 		cols := buildColumns(bucket, cfg)
+		if len(cols) == 0 {
+			return "", false // unsafe (e.g. dotted keys) -> passthrough
+		}
 		cols = dropColumn(cols, disc)
 		if !safeColumns(cols) {
 			return "", false
@@ -119,6 +122,13 @@ func cellString(row map[string]any, c column) string {
 	v, present := getPath(row, c.path)
 	if !present || v == nil {
 		return "" // null / missing -> empty cell
+	}
+	// In a json-typed (mixed) column every value — including strings, numbers,
+	// and bools — must be rendered as compact JSON so the decoder can tell a
+	// string "42" from the number 42. Rendering by dynamic type here would emit
+	// a bare 42 that decodeCell would parse back as a number (a lossless bug).
+	if c.typ == typeJSON {
+		return csvEscape(compactJSON(v))
 	}
 	switch t := v.(type) {
 	case bool:

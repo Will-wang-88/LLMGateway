@@ -26,12 +26,12 @@ import (
 // captureBackend records every request body it receives so tests can assert
 // transparent passthrough.
 type captureBackend struct {
-	server      *httptest.Server
-	lastBody    []byte
-	lastModel   string
-	lastHeader  http.Header
-	requestCnt  int64
-	responseFn  func(w http.ResponseWriter, r *http.Request, body []byte)
+	server     *httptest.Server
+	lastBody   []byte
+	lastModel  string
+	lastHeader http.Header
+	requestCnt int64
+	responseFn func(w http.ResponseWriter, r *http.Request, body []byte)
 }
 
 func newCaptureBackend() *captureBackend {
@@ -47,7 +47,9 @@ func newCaptureBackend() *captureBackend {
 		cb.lastBody = body
 		cb.lastHeader = r.Header.Clone()
 		// Extract model from body
-		var peek struct{ Model string `json:"model"` }
+		var peek struct {
+			Model string `json:"model"`
+		}
 		_ = json.Unmarshal(body, &peek)
 		cb.lastModel = peek.Model
 		if cb.responseFn != nil {

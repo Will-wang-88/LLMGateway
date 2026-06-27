@@ -115,6 +115,9 @@ func compactArray(items []any, cfg Config, droppedN int, marker string) (string,
 	switch d.kind {
 	case decHomogeneous, decSparse:
 		cols := buildColumns(rows, cfg)
+		if len(cols) == 0 {
+			return "", false // unsafe (e.g. dotted keys) -> passthrough
+		}
 		return encodeTable(rows, cols, droppedN, marker)
 	case decBuckets:
 		return encodeBuckets(rows, d.discriminator, cfg, droppedN, marker)

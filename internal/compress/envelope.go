@@ -63,12 +63,35 @@ func parseEnvelope(reqBody []byte, cfg Config) (*envelope, bool) {
 		newAnthropic:  make(map[int]map[int]string),
 	}
 
-	boundary := protectedBoundary(msgs, cfg.ProtectRecentTurns)
-
-	for i, mr := range msgs {
-		if i >= boundary {
-			continue // within the protected recent turns
+	// Gather every tool-result block in conversation order (regardless of size),
+	// then protect the most recent N of them (the cache-stable tail and the
+	// model's working memory). The rest are eligible for compression. Counting
+	// tool results — not user turns — means a single-user-turn agent loop with
+	// many tool calls still compresses its older results.
+	candidates := collectToolBlocks(msgs, env)
+	protectStart := len(candidates) - cfg.ProtectRecentTurns
+	if cfg.ProtectRecentTurns <= 0 {
+		protectStart = len(candidates) // protect nothing
+	}
+	for i, c := range candidates {
+		if i >= protectStart {
+			continue // within the protected recent N tool results
 		}
+		if !eligible(c.content, cfg) {
+			continue
+		}
+		env.movables = append(env.movables, c)
+	}
+	return env, true
+}
+
+// collectToolBlocks enumerates every tool-result text block (OpenAI role=="tool"
+// string content, or Anthropic content[].type=="tool_result" string content) in
+// conversation order. It also records Anthropic content arrays in env so render
+// can rebuild only the blocks that change.
+func collectToolBlocks(msgs []json.RawMessage, env *envelope) []movable {
+	var out []movable
+	for i, mr := range msgs {
 		var head struct {
 			Role    string          `json:"role"`
 			Content json.RawMessage `json:"content"`
@@ -78,17 +101,12 @@ func parseEnvelope(reqBody []byte, cfg Config) (*envelope, bool) {
 		}
 		switch head.Role {
 		case "tool":
-			// OpenAI tool result: content is a JSON string.
 			var s string
 			if err := json.Unmarshal(head.Content, &s); err != nil {
-				continue // non-string content => not movable
+				continue // non-string content => not a movable tool result
 			}
-			if !eligible(s, cfg) {
-				continue
-			}
-			env.movables = append(env.movables, movable{msgIdx: i, blockIdx: -1, content: s})
+			out = append(out, movable{msgIdx: i, blockIdx: -1, content: s})
 		case "user":
-			// Anthropic: tool_result blocks live in user messages as an array.
 			var blocks []json.RawMessage
 			if err := json.Unmarshal(head.Content, &blocks); err != nil {
 				continue // string content (plain user prose) => never touch
@@ -109,14 +127,11 @@ func parseEnvelope(reqBody []byte, cfg Config) (*envelope, bool) {
 				if err := json.Unmarshal(bh.Content, &s); err != nil {
 					continue // tool_result with array content => skip
 				}
-				if !eligible(s, cfg) {
-					continue
-				}
-				env.movables = append(env.movables, movable{msgIdx: i, blockIdx: bi, content: s})
+				out = append(out, movable{msgIdx: i, blockIdx: bi, content: s})
 			}
 		}
 	}
-	return env, true
+	return out
 }
 
 // eligible reports whether a tool-result string is worth compressing: large
@@ -127,30 +142,6 @@ func eligible(s string, cfg Config) bool {
 		return false
 	}
 	return estimateString(s) > cfg.MinTokensToCrush
-}
-
-// protectedBoundary returns the message index at and after which messages are
-// protected (the most recent N turns). A turn boundary is a "user" message.
-func protectedBoundary(msgs []json.RawMessage, protectRecentTurns int) int {
-	if protectRecentTurns <= 0 {
-		return len(msgs)
-	}
-	var userIdx []int
-	for i, mr := range msgs {
-		var head struct {
-			Role string `json:"role"`
-		}
-		if err := json.Unmarshal(mr, &head); err != nil {
-			continue
-		}
-		if head.Role == "user" {
-			userIdx = append(userIdx, i)
-		}
-	}
-	if len(userIdx) <= protectRecentTurns {
-		return 0 // fewer turns than we protect => protect everything
-	}
-	return userIdx[len(userIdx)-protectRecentTurns]
 }
 
 // queryText returns the text of the most recent user message, used as the

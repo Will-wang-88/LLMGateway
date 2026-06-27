@@ -150,6 +150,16 @@ func buildColumns(rows []map[string]any, cfg Config) []column {
 		}
 	}
 
+	// A literal '.' in a top-level key is ambiguous with the dotted column names
+	// produced by §3c flattening — the decoder splits column names on '.', so it
+	// would reconstruct {"a.b":v} as {"a":{"b":v}}. Bail (no columns) so such an
+	// array passes through uncompacted, preserving losslessness.
+	for k := range topKeys {
+		if strings.Contains(k, ".") {
+			return nil
+		}
+	}
+
 	// Determine which top keys are flattenable: present in every row, always an
 	// object, with an identical inner-key set of size in [1, MaxFlattenInnerKeys].
 	flatten := map[string][]string{} // top key -> sorted inner keys
@@ -174,6 +184,11 @@ func buildColumns(rows []map[string]any, cfg Config) []column {
 				ok = false
 				break
 			}
+		}
+		// Don't flatten if an inner key contains '.', which would make the dotted
+		// column name ambiguous on decode; render that field as a json cell instead.
+		if ok && anyContainsDot(innerSig) {
+			ok = false
 		}
 		if ok && len(innerSig) >= 1 && len(innerSig) <= cfg.MaxFlattenInnerKeys {
 			flatten[k] = innerSig
@@ -249,6 +264,15 @@ func getPath(row map[string]any, path []string) (any, bool) {
 	return cur, true
 }
 
+func anyContainsDot(keys []string) bool {
+	for _, k := range keys {
+		if strings.Contains(k, ".") {
+			return true
+		}
+	}
+	return false
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
@@ -268,6 +292,11 @@ func decodeArray(s string) ([]any, bool) {
 	dec.UseNumber()
 	var items []any
 	if err := dec.Decode(&items); err != nil {
+		return nil, false
+	}
+	// Reject trailing data after the array: re-encoding would silently drop it,
+	// which would not be lossless. Treat as "not a clean array" -> no-op.
+	if dec.More() {
 		return nil, false
 	}
 	return items, true

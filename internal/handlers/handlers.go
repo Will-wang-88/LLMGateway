@@ -31,17 +31,17 @@ import (
 )
 
 type Handler struct {
-	cfg          *config.Config
-	store        *store.Store
-	proxy        *proxy.Proxy
-	balancer     *balancer.Balancer
-	limiter      ratelimit.Backend
-	concurrency  *ratelimit.Concurrency
-	logger       *logging.Logger
-	metrics      *metrics.Metrics
-	logstore     logstore.Store
-	quota        *quota.Manager
-	queue        *queue.Manager
+	cfg           *config.Config
+	store         *store.Store
+	proxy         *proxy.Proxy
+	balancer      *balancer.Balancer
+	limiter       ratelimit.Backend
+	concurrency   *ratelimit.Concurrency
+	logger        *logging.Logger
+	metrics       *metrics.Metrics
+	logstore      logstore.Store
+	quota         *quota.Manager
+	queue         *queue.Manager
 	tracer        *tracing.Tracer
 	orchestrator  *orchestrator.Orchestrator
 	compressStore *compress.MemoryRetrievalStore

@@ -29,7 +29,7 @@ type Config struct {
 	LosslessMinSavingsRatio float64 // adopt a transform only if it saves at least this fraction
 	LosslessOnly            bool    // true => never emit markers, row-drop, or opaque blobs
 	CompactionFormat        string  // "csv-schema" (default) | "json"
-	ProtectRecentTurns      int     // never touch tool results in the most recent N turns
+	ProtectRecentTurns      int     // never touch the most recent N tool results (cache-stable tail)
 	FactorOutConstants      bool    // §3a, MVP off
 
 	// Lossy (budget-gated) knobs.
