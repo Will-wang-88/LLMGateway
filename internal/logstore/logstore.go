@@ -30,6 +30,14 @@ type RequestLog struct {
 	RawResponse      string            `json:"raw_response,omitempty"`
 	Metadata         map[string]string `json:"metadata,omitempty"`
 	CreatedAt        time.Time         `json:"created_at"`
+
+	// Input-token compression metrics (see internal/compress). When
+	// CompressionApplied is false the token fields are zero and the dashboard
+	// shows "-". CompressionRatio is CompressedTokens/OriginalTokens.
+	CompressionApplied bool    `json:"compression_applied"`
+	OriginalTokens     int64   `json:"original_tokens,omitempty"`
+	CompressedTokens   int64   `json:"compressed_tokens,omitempty"`
+	CompressionRatio   float64 `json:"compression_ratio,omitempty"`
 }
 
 // AuditEvent is a record of an admin action.
@@ -77,16 +85,25 @@ type AuditQuery struct {
 
 // Stats aggregates totals over a window.
 type Stats struct {
-	TotalRequests int64                    `json:"total_requests"`
-	SuccessTotal  int64                    `json:"success_total"`
-	ErrorTotal    int64                    `json:"error_total"`
-	PromptTokens  int64                    `json:"prompt_tokens"`
-	CompletionTokens int64                 `json:"completion_tokens"`
-	TotalTokens   int64                    `json:"total_tokens"`
-	ByModel       map[string]ModelStat     `json:"by_model"`
-	ByBackend     map[string]BackendStat   `json:"by_backend"`
-	ByAPIKey      map[string]KeyStat       `json:"by_api_key"`
-	ByClientIP    map[string]ClientIPStat  `json:"by_client_ip"`
+	TotalRequests    int64                   `json:"total_requests"`
+	SuccessTotal     int64                   `json:"success_total"`
+	ErrorTotal       int64                   `json:"error_total"`
+	PromptTokens     int64                   `json:"prompt_tokens"`
+	CompletionTokens int64                   `json:"completion_tokens"`
+	TotalTokens      int64                   `json:"total_tokens"`
+	ByModel          map[string]ModelStat    `json:"by_model"`
+	ByBackend        map[string]BackendStat  `json:"by_backend"`
+	ByAPIKey         map[string]KeyStat      `json:"by_api_key"`
+	ByClientIP       map[string]ClientIPStat `json:"by_client_ip"`
+
+	// Compression aggregates over the window. AvgCompressionRatio is computed
+	// from summed token counts (CompressedTokens/OriginalTokens), not by
+	// averaging per-row ratios, so large payloads are weighted correctly.
+	CompressedRequests  int64   `json:"compressed_requests"`
+	OriginalTokens      int64   `json:"original_tokens"`
+	CompressedTokens    int64   `json:"compressed_tokens"`
+	TokensSaved         int64   `json:"tokens_saved"`
+	AvgCompressionRatio float64 `json:"avg_compression_ratio"`
 }
 
 type ModelStat struct {
@@ -211,6 +228,12 @@ func (m *Memory) StatsSince(_ context.Context, since time.Time) (*Stats, error) 
 		s.CompletionTokens += r.CompletionTokens
 		s.TotalTokens += r.TotalTokens
 
+		if r.CompressionApplied {
+			s.CompressedRequests++
+			s.OriginalTokens += r.OriginalTokens
+			s.CompressedTokens += r.CompressedTokens
+		}
+
 		ms := s.ByModel[r.Model]
 		ms.Requests++
 		ms.Tokens += r.TotalTokens
@@ -245,7 +268,17 @@ func (m *Memory) StatsSince(_ context.Context, since time.Time) (*Stats, error) 
 			s.ByClientIP[r.ClientIP] = cs
 		}
 	}
+	finalizeCompressionStats(s)
 	return s, nil
+}
+
+// finalizeCompressionStats derives TokensSaved and AvgCompressionRatio from the
+// summed token counts. Shared by all store implementations.
+func finalizeCompressionStats(s *Stats) {
+	s.TokensSaved = s.OriginalTokens - s.CompressedTokens
+	if s.OriginalTokens > 0 {
+		s.AvgCompressionRatio = float64(s.CompressedTokens) / float64(s.OriginalTokens)
+	}
 }
 
 func (m *Memory) AppendAudit(_ context.Context, evt *AuditEvent) error {

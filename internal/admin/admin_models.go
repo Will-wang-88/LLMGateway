@@ -6,6 +6,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/will-wang-88/llmgateway/internal/config"
 	"github.com/will-wang-88/llmgateway/internal/logstore"
 	"github.com/will-wang-88/llmgateway/internal/proxy"
 	"github.com/will-wang-88/llmgateway/internal/store"
@@ -34,12 +35,13 @@ func (s *Server) patchModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body := struct {
-		Type           *string          `json:"type"`
-		Enabled        *bool            `json:"enabled"`
-		ContextLength  *int             `json:"context_length"`
-		CapabilityMode *string          `json:"capability_mode"`
-		Capabilities   *map[string]bool `json:"capabilities"`
-		RoutingPolicy  *string          `json:"routing_policy"`
+		Type           *string                   `json:"type"`
+		Enabled        *bool                     `json:"enabled"`
+		ContextLength  *int                      `json:"context_length"`
+		CapabilityMode *string                   `json:"capability_mode"`
+		Capabilities   *map[string]bool          `json:"capabilities"`
+		RoutingPolicy  *string                   `json:"routing_policy"`
+		Compression    *config.CompressionConfig `json:"compression"`
 	}{}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest("Invalid JSON: "+err.Error(), "invalid_json"))
@@ -70,6 +72,9 @@ func (s *Server) patchModel(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.RoutingPolicy != nil {
 		m.RoutingPolicy = *body.RoutingPolicy
+	}
+	if body.Compression != nil {
+		m.Compression = body.Compression
 	}
 	s.store.UpsertModel(m)
 	s.audit(r, "model.update", "model", m.Name, oldVal, modelEntry(m))
@@ -136,6 +141,7 @@ func modelEntry(m *store.Model) map[string]any {
 		"capability_mode": m.CapabilityMode,
 		"capabilities":    m.Capabilities,
 		"routing_policy":  m.RoutingPolicy,
+		"compression":     m.Compression,
 	}
 }
 
@@ -176,6 +182,9 @@ func (s *Server) adminMetrics(w http.ResponseWriter, r *http.Request) {
 			out["success_total"] = stats.SuccessTotal
 			out["error_total"] = stats.ErrorTotal
 			out["total_tokens"] = stats.TotalTokens
+			out["compressed_requests"] = stats.CompressedRequests
+			out["tokens_saved"] = stats.TokensSaved
+			out["avg_compression_ratio"] = stats.AvgCompressionRatio
 			elapsed := time.Since(since).Seconds()
 			if elapsed > 0 {
 				out["qps"] = float64(stats.TotalRequests) / elapsed

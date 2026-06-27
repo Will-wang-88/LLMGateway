@@ -22,6 +22,7 @@ import (
 	"github.com/will-wang-88/llmgateway/internal/auth"
 	"github.com/will-wang-88/llmgateway/internal/backend"
 	"github.com/will-wang-88/llmgateway/internal/balancer"
+	"github.com/will-wang-88/llmgateway/internal/compress"
 	"github.com/will-wang-88/llmgateway/internal/config"
 	"github.com/will-wang-88/llmgateway/internal/handlers"
 	"github.com/will-wang-88/llmgateway/internal/logging"
@@ -219,7 +220,8 @@ func main() {
 		WithLogStore(ls).
 		WithQuota(qm).
 		WithQueue(qq).
-		WithTracer(tr)
+		WithTracer(tr).
+		WithCompressionStore(compress.NewMemoryRetrievalStore(0))
 	if cfg.Orchestration.Enabled {
 		orch := orchestrator.New(cfg.Orchestration, s, bal, logger).
 			WithRouting(cfg.Routing.AllowDegradedBackends).
@@ -285,6 +287,7 @@ func main() {
 	mux.Handle("POST /v1/audio/transcriptions", v1Auth(h.ForwardMultipart("/audio/transcriptions")))
 	mux.Handle("POST /v1/audio/translations", v1Auth(h.ForwardMultipart("/audio/translations")))
 	mux.Handle("POST /v1/audio/speech", v1Auth(h.Forward("/audio/speech")))
+	mux.Handle("GET /v1/retrieve/{hash}", v1Auth(http.HandlerFunc(h.Retrieve)))
 
 	// Admin API.
 	adminSrv.Register(mux)

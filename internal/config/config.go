@@ -23,6 +23,7 @@ type Config struct {
 	Dashboard     DashboardConfig     `yaml:"dashboard"`
 	Notifications NotificationsConfig `yaml:"notifications"`
 	Orchestration OrchestrationConfig `yaml:"orchestration"`
+	Compression   CompressionConfig   `yaml:"compression"`
 
 	Backends     []BackendConfig    `yaml:"backends"`
 	Models       []ModelConfig      `yaml:"models"`
@@ -242,13 +243,49 @@ type BackendConfig struct {
 }
 
 type ModelConfig struct {
-	Name           string          `yaml:"name"`
-	Type           string          `yaml:"type"`
-	Enabled        bool            `yaml:"enabled"`
-	ContextLength  int             `yaml:"context_length"`
-	CapabilityMode string          `yaml:"capability_mode"`
-	Capabilities   map[string]bool `yaml:"capabilities"`
-	RoutingPolicy  string          `yaml:"routing_policy"`
+	Name           string             `yaml:"name"`
+	Type           string             `yaml:"type"`
+	Enabled        bool               `yaml:"enabled"`
+	ContextLength  int                `yaml:"context_length"`
+	CapabilityMode string             `yaml:"capability_mode"`
+	Capabilities   map[string]bool    `yaml:"capabilities"`
+	RoutingPolicy  string             `yaml:"routing_policy"`
+	Compression    *CompressionConfig `yaml:"compression,omitempty"`
+}
+
+// CompressionConfig controls the input-token compression pass. All fields are
+// pointers so the three layers (global default <- model <- API key) overlay
+// cleanly: a nil field inherits from the layer below. Resolve with Resolve.
+type CompressionConfig struct {
+	Enabled        *bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	MinInputTokens *int  `yaml:"min_input_tokens,omitempty" json:"min_input_tokens,omitempty"`
+	LosslessOnly   *bool `yaml:"lossless_only,omitempty" json:"lossless_only,omitempty"`
+	TokenBudget    *int  `yaml:"token_budget,omitempty" json:"token_budget,omitempty"`
+}
+
+// Resolve overlays an override on top of the receiver, returning a new config
+// where each non-nil field of override wins. Either side may be nil.
+func (c *CompressionConfig) Resolve(override *CompressionConfig) CompressionConfig {
+	var out CompressionConfig
+	if c != nil {
+		out = *c
+	}
+	if override == nil {
+		return out
+	}
+	if override.Enabled != nil {
+		out.Enabled = override.Enabled
+	}
+	if override.MinInputTokens != nil {
+		out.MinInputTokens = override.MinInputTokens
+	}
+	if override.LosslessOnly != nil {
+		out.LosslessOnly = override.LosslessOnly
+	}
+	if override.TokenBudget != nil {
+		out.TokenBudget = override.TokenBudget
+	}
+	return out
 }
 
 type ModelAliasConfig struct {
@@ -259,21 +296,22 @@ type ModelAliasConfig struct {
 }
 
 type APIKeyConfig struct {
-	ID               string           `yaml:"id"`
-	Name             string           `yaml:"name"`
-	Key              string           `yaml:"key"`
-	KeyPrefix        string           `yaml:"key_prefix"`
-	KeyHash          string           `yaml:"key_hash"`
-	Enabled          bool             `yaml:"enabled"`
-	AllowedModels    []string         `yaml:"allowed_models"`
-	DeniedModels     []string         `yaml:"denied_models"`
-	AllowedClientIPs []string         `yaml:"allowed_client_ips"`
-	DeniedClientIPs  []string         `yaml:"denied_client_ips"`
-	RateLimit        *APIKeyRateLimit `yaml:"rate_limit,omitempty"`
-	Quota            *APIKeyQuota     `yaml:"quota,omitempty"`
-	DelayMS          int              `yaml:"delay_ms"`
-	Logging          *APIKeyLogging   `yaml:"logging,omitempty"`
-	ExpiresAt        string           `yaml:"expires_at"`
+	ID               string             `yaml:"id"`
+	Name             string             `yaml:"name"`
+	Key              string             `yaml:"key"`
+	KeyPrefix        string             `yaml:"key_prefix"`
+	KeyHash          string             `yaml:"key_hash"`
+	Enabled          bool               `yaml:"enabled"`
+	AllowedModels    []string           `yaml:"allowed_models"`
+	DeniedModels     []string           `yaml:"denied_models"`
+	AllowedClientIPs []string           `yaml:"allowed_client_ips"`
+	DeniedClientIPs  []string           `yaml:"denied_client_ips"`
+	RateLimit        *APIKeyRateLimit   `yaml:"rate_limit,omitempty"`
+	Quota            *APIKeyQuota       `yaml:"quota,omitempty"`
+	DelayMS          int                `yaml:"delay_ms"`
+	Logging          *APIKeyLogging     `yaml:"logging,omitempty"`
+	Compression      *CompressionConfig `yaml:"compression,omitempty"`
+	ExpiresAt        string             `yaml:"expires_at"`
 }
 
 type APIKeyRateLimit struct {

@@ -56,8 +56,17 @@ func (p *Postgres) migrate() error {
 			raw_request TEXT,
 			raw_response TEXT,
 			metadata JSONB,
-			created_at BIGINT NOT NULL
+			created_at BIGINT NOT NULL,
+			compression_applied BOOLEAN NOT NULL DEFAULT FALSE,
+			original_tokens BIGINT NOT NULL DEFAULT 0,
+			compressed_tokens BIGINT NOT NULL DEFAULT 0,
+			compression_ratio DOUBLE PRECISION NOT NULL DEFAULT 0
 		)`,
+		// In-place upgrades for databases created before these columns existed.
+		`ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS compression_applied BOOLEAN NOT NULL DEFAULT FALSE`,
+		`ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS original_tokens BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS compressed_tokens BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS compression_ratio DOUBLE PRECISION NOT NULL DEFAULT 0`,
 		`CREATE INDEX IF NOT EXISTS idx_request_logs_created ON request_logs(created_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_request_logs_api_key ON request_logs(api_key_id, created_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_request_logs_client_ip ON request_logs(client_ip, created_at)`,
@@ -95,14 +104,15 @@ func (p *Postgres) AppendRequest(ctx context.Context, r *RequestLog) error {
 		(id, request_id, api_key_id, api_key_name, client_ip, model, internal_model, backend_id,
 		 endpoint, stream, status_code, error_code, prompt_tokens, completion_tokens,
 		 total_tokens, reasoning_tokens, latency_ms, ttft_ms, raw_request, raw_response,
-		 metadata, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
+		 metadata, created_at, compression_applied, original_tokens, compressed_tokens, compression_ratio)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)`,
 		r.ID, r.RequestID, nullable(r.APIKeyID), nullable(r.APIKeyName), nullable(r.ClientIP),
 		r.Model, nullable(r.InternalModel), nullable(r.BackendID), r.Endpoint, r.Stream,
 		r.StatusCode, nullable(r.ErrorCode), r.PromptTokens, r.CompletionTokens,
 		r.TotalTokens, r.ReasoningTokens, r.LatencyMS, r.TTFTMS,
 		nullable(r.RawRequest), nullable(r.RawResponse), string(meta),
-		r.CreatedAt.UTC().UnixMilli())
+		r.CreatedAt.UTC().UnixMilli(), r.CompressionApplied, r.OriginalTokens,
+		r.CompressedTokens, r.CompressionRatio)
 	return err
 }
 
@@ -161,7 +171,9 @@ func (p *Postgres) QueryRequests(ctx context.Context, q LogQuery) ([]*RequestLog
 		COALESCE(client_ip,''), model, COALESCE(internal_model,''), COALESCE(backend_id,''),
 		endpoint, stream, status_code, COALESCE(error_code,''), prompt_tokens, completion_tokens,
 		total_tokens, reasoning_tokens, latency_ms, ttft_ms, COALESCE(raw_request,''),
-		COALESCE(raw_response,''), COALESCE(metadata::text,''), created_at
+		COALESCE(raw_response,''), COALESCE(metadata::text,''), created_at,
+		COALESCE(compression_applied,FALSE), COALESCE(original_tokens,0),
+		COALESCE(compressed_tokens,0), COALESCE(compression_ratio,0)
 		FROM request_logs %s ORDER BY created_at DESC LIMIT $%d OFFSET $%d`,
 		where, len(args)-1, len(args))
 	rows, err := p.db.QueryContext(ctx, sqlStr, args...)
@@ -178,7 +190,8 @@ func (p *Postgres) QueryRequests(ctx context.Context, q LogQuery) ([]*RequestLog
 			&r.Model, &r.InternalModel, &r.BackendID, &r.Endpoint, &r.Stream, &r.StatusCode,
 			&r.ErrorCode, &r.PromptTokens, &r.CompletionTokens, &r.TotalTokens,
 			&r.ReasoningTokens, &r.LatencyMS, &r.TTFTMS, &r.RawRequest, &r.RawResponse,
-			&metadata, &createdAt); err != nil {
+			&metadata, &createdAt, &r.CompressionApplied, &r.OriginalTokens,
+			&r.CompressedTokens, &r.CompressionRatio); err != nil {
 			return nil, err
 		}
 		r.CreatedAt = time.UnixMilli(createdAt).UTC()
@@ -204,10 +217,14 @@ func (p *Postgres) StatsSince(ctx context.Context, since time.Time) (*Stats, err
 		COALESCE(SUM(CASE WHEN status_code >= 400 OR status_code = 0 THEN 1 ELSE 0 END),0),
 		COALESCE(SUM(prompt_tokens),0),
 		COALESCE(SUM(completion_tokens),0),
-		COALESCE(SUM(total_tokens),0)
+		COALESCE(SUM(total_tokens),0),
+		COALESCE(SUM(CASE WHEN compression_applied THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN compression_applied THEN original_tokens ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN compression_applied THEN compressed_tokens ELSE 0 END),0)
 		FROM request_logs WHERE created_at >= $1`, sinceMS)
 	if err := row.Scan(&stats.TotalRequests, &stats.SuccessTotal, &stats.ErrorTotal,
-		&stats.PromptTokens, &stats.CompletionTokens, &stats.TotalTokens); err != nil {
+		&stats.PromptTokens, &stats.CompletionTokens, &stats.TotalTokens,
+		&stats.CompressedRequests, &stats.OriginalTokens, &stats.CompressedTokens); err != nil {
 		return nil, err
 	}
 	groupQ := func(q string, fn func(string, int64, int64, int64)) error {
@@ -263,6 +280,7 @@ func (p *Postgres) StatsSince(ctx context.Context, since time.Time) (*Stats, err
 		}); err != nil {
 		return nil, err
 	}
+	finalizeCompressionStats(stats)
 	return stats, nil
 }
 

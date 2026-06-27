@@ -175,7 +175,7 @@ func (h *Handler) ForwardMultipart(upstreamPath string) http.HandlerFunc {
 		}
 		h.recordLog(r.Context(), requestID, apiKey, auth.ClientIPFromContext(r.Context()), model, internalModel, picked.ID,
 			upstreamPath, false, statusCode, errorCodeFromForward(ferr, statusCode),
-			nil, latencyMS, 0, nil, nil)
+			nil, latencyMS, 0, nil, nil, nil)
 	}
 }
 

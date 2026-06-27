@@ -212,6 +212,22 @@ backends:
     stream_idle_timeout_ms: 45000
     tags: [gpu, dense, coding, zh]
 
+# Input-token compression. Deterministically rewrites large, uniform tool-result
+# payloads (arrays of objects) into a compact CSV-schema before forwarding, and
+# — only when still over the token budget — drops low-value rows behind a
+# retrievable <<ccr:HASH>> marker (fetch via GET /v1/retrieve/{hash}).
+#
+# This block is the GLOBAL DEFAULT. It is overlaid by a per-model `compression:`
+# block, which is in turn overlaid by a per-API-key `compression:` block (each
+# field inherits from the layer below when unset). Disabled unless enabled here
+# or at a lower layer. min_input_tokens is the gate: compression runs only when
+# the estimated input (~bytes/4) exceeds it.
+compression:
+  enabled: false          # global on/off; set true to enable fleet-wide
+  min_input_tokens: 4000  # only compress requests larger than this
+  lossless_only: false    # true => never drop rows / emit markers
+  # token_budget: 0       # absolute lossy budget; defaults to the model context_length
+
 models:
   - name: llama-3.1-70b
     type: chat
@@ -219,6 +235,10 @@ models:
     context_length: 131072
     capability_mode: passthrough
     routing_policy: weighted_round_robin
+    # Per-model override: enable compression for this model above 8k input tokens.
+    compression:
+      enabled: true
+      min_input_tokens: 8000
   - name: llama-3.1-8b
     type: chat
     enabled: true

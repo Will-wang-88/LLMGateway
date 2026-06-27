@@ -35,6 +35,7 @@ func (s *Server) getAPIKey(w http.ResponseWriter, r *http.Request) {
 		"quota":              k.Quota,
 		"delay_ms":           k.DelayMS,
 		"logging":            k.Logging,
+		"compression":        k.Compression,
 		"total_requests":     totalReqs,
 		"total_tokens":       totalToks,
 	}
@@ -69,9 +70,10 @@ func (s *Server) patchAPIKey(w http.ResponseWriter, r *http.Request) {
 		DeniedClientIPs  *[]string               `json:"denied_client_ips"`
 		RateLimit        *config.APIKeyRateLimit `json:"rate_limit"`
 		Quota            *config.APIKeyQuota     `json:"quota"`
-		DelayMS          *int                    `json:"delay_ms"`
-		Logging          *config.APIKeyLogging   `json:"logging"`
-		ExpiresAt        *string                 `json:"expires_at"`
+		DelayMS          *int                      `json:"delay_ms"`
+		Logging          *config.APIKeyLogging     `json:"logging"`
+		Compression      *config.CompressionConfig `json:"compression"`
+		ExpiresAt        *string                   `json:"expires_at"`
 	}{}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest("Invalid JSON: "+err.Error(), "invalid_json"))
@@ -108,6 +110,9 @@ func (s *Server) patchAPIKey(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Logging != nil {
 		k.Logging = body.Logging
+	}
+	if body.Compression != nil {
+		k.Compression = body.Compression
 	}
 	if body.ExpiresAt != nil {
 		if *body.ExpiresAt == "" {
@@ -256,6 +261,7 @@ func summarizeKey(k *store.APIKey) map[string]any {
 		"quota":              k.Quota,
 		"delay_ms":           k.DelayMS,
 		"logging":            k.Logging,
+		"compression":        k.Compression,
 		"total_requests":     totalReqs,
 		"total_tokens":       totalToks,
 	}

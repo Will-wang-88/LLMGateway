@@ -16,6 +16,7 @@ import (
 	"github.com/will-wang-88/llmgateway/internal/auth"
 	"github.com/will-wang-88/llmgateway/internal/balancer"
 	"github.com/will-wang-88/llmgateway/internal/capability"
+	"github.com/will-wang-88/llmgateway/internal/compress"
 	"github.com/will-wang-88/llmgateway/internal/config"
 	"github.com/will-wang-88/llmgateway/internal/logging"
 	"github.com/will-wang-88/llmgateway/internal/logstore"
@@ -41,8 +42,9 @@ type Handler struct {
 	logstore     logstore.Store
 	quota        *quota.Manager
 	queue        *queue.Manager
-	tracer       *tracing.Tracer
-	orchestrator *orchestrator.Orchestrator
+	tracer        *tracing.Tracer
+	orchestrator  *orchestrator.Orchestrator
+	compressStore *compress.MemoryRetrievalStore
 }
 
 func New(
@@ -79,6 +81,13 @@ func (h *Handler) WithQueue(q *queue.Manager) *Handler { h.queue = q; return h }
 // WithTracer attaches an OpenTelemetry tracer used to emit a span per
 // request.
 func (h *Handler) WithTracer(t *tracing.Tracer) *Handler { h.tracer = t; return h }
+
+// WithCompressionStore attaches the retrieval store used to persist offloaded
+// (row-dropped) payloads so they can be fetched via GET /v1/retrieve/{hash}.
+func (h *Handler) WithCompressionStore(s *compress.MemoryRetrievalStore) *Handler {
+	h.compressStore = s
+	return h
+}
 
 // rawForLog returns raw only if the effective logging policy permits
 // persisting the client-original request body. All error paths must use
@@ -222,7 +231,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 			// raw may be partial / truncated here; even if logging policy
 			// allowed raw_request, persisting a partial body is more
 			// confusing than useful, so we drop it.
-			h.recordLog(r.Context(), requestID, apiKey, clientIP, "", "", "", upstreamPath, false, status, code, nil, time.Since(started).Milliseconds(), 0, nil, nil)
+			h.recordLog(r.Context(), requestID, apiKey, clientIP, "", "", "", upstreamPath, false, status, code, nil, time.Since(started).Milliseconds(), 0, nil, nil, nil)
 			if errors.As(err, &maxErr) {
 				proxy.WriteError(w, http.StatusRequestEntityTooLarge, proxy.APIError{
 					Message: "Request body too large",
@@ -238,7 +247,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 			return
 		}
 		if len(raw) == 0 {
-			h.recordLog(r.Context(), requestID, apiKey, clientIP, "", "", "", upstreamPath, false, http.StatusBadRequest, "invalid_body", nil, time.Since(started).Milliseconds(), 0, nil, nil)
+			h.recordLog(r.Context(), requestID, apiKey, clientIP, "", "", "", upstreamPath, false, http.StatusBadRequest, "invalid_body", nil, time.Since(started).Milliseconds(), 0, nil, nil, nil)
 			proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest("Empty request body", "invalid_body"))
 			return
 		}
@@ -251,7 +260,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 			SecretLevel *int   `json:"secret_level"`
 		}
 		if err := json.Unmarshal(raw, &peek); err != nil {
-			h.recordLog(r.Context(), requestID, apiKey, clientIP, "", "", "", upstreamPath, false, http.StatusBadRequest, "invalid_json", nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil)
+			h.recordLog(r.Context(), requestID, apiKey, clientIP, "", "", "", upstreamPath, false, http.StatusBadRequest, "invalid_json", nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil, nil)
 			proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest(
 				"Invalid JSON: "+err.Error(),
 				"invalid_json",
@@ -259,7 +268,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 			return
 		}
 		if peek.Model == "" {
-			h.recordLog(r.Context(), requestID, apiKey, clientIP, "", "", "", upstreamPath, false, http.StatusBadRequest, "missing_model", nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil)
+			h.recordLog(r.Context(), requestID, apiKey, clientIP, "", "", "", upstreamPath, false, http.StatusBadRequest, "missing_model", nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil, nil)
 			proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest(
 				"Missing required field: model",
 				"missing_model",
@@ -275,7 +284,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 		// resolved internal model are checked so an alias cannot bypass
 		// DeniedModels.
 		if apiKey != nil && !apiKey.ModelAllowedResolved(peek.Model, internalModel) {
-			h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusForbidden, "model_not_allowed", nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil)
+			h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusForbidden, "model_not_allowed", nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil, nil)
 			proxy.WriteError(w, http.StatusForbidden, proxy.PermissionError(
 				fmt.Sprintf("The API key is not allowed to use model: %s", peek.Model),
 				"model_not_allowed",
@@ -296,7 +305,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 			// dropped.
 			if m, ok := h.store.Model(internalModel); ok {
 				if reason := capability.Check(m.CapabilityMode, m.Capabilities, raw); reason != "" {
-					h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusBadRequest, reason, nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil)
+					h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusBadRequest, reason, nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil, nil)
 					proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest(
 						fmt.Sprintf("Model %s does not support this capability: %s", peek.Model, reason),
 						reason,
@@ -320,7 +329,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 		// of only hiding the model from /v1/models.
 		if m, ok := h.store.Model(internalModel); ok {
 			if !m.Enabled {
-				h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusNotFound, "model_not_found", nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil)
+				h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusNotFound, "model_not_found", nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil, nil)
 				proxy.WriteError(w, http.StatusNotFound, proxy.NotFound(
 					fmt.Sprintf("Model is disabled: %s", peek.Model),
 					"model_not_found",
@@ -328,7 +337,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 				return
 			}
 			if reason := capability.Check(m.CapabilityMode, m.Capabilities, raw); reason != "" {
-				h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusBadRequest, reason, nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil)
+				h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusBadRequest, reason, nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil, nil)
 				proxy.WriteError(w, http.StatusBadRequest, proxy.InvalidRequest(
 					fmt.Sprintf("Model %s does not support this capability: %s", peek.Model, reason),
 					reason,
@@ -340,7 +349,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 		// Look up backends supporting this model.
 		candidates := h.store.BackendsForModel(internalModel)
 		if len(candidates) == 0 {
-			h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusNotFound, "model_not_found", nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil)
+			h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusNotFound, "model_not_found", nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil, nil)
 			proxy.WriteError(w, http.StatusNotFound, proxy.NotFound(
 				fmt.Sprintf("Unknown model: %s", peek.Model),
 				"model_not_found",
@@ -354,7 +363,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 			if isQuotaCode(code) {
 				h.metrics.QuotaHits.WithLabelValues(apiKeyID(apiKey), code).Inc()
 			}
-			h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, status, code, nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil)
+			h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, status, code, nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil, nil)
 			proxy.WriteError(w, status, proxy.RateLimit("Rejected: "+code, code))
 			return
 		}
@@ -363,7 +372,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 		// Filter for healthy + within-capacity, then pick one.
 		ready := filterRoutable(candidates, h.cfg.Routing.AllowDegradedBackends)
 		if len(ready) == 0 {
-			h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusServiceUnavailable, "no_healthy_backend", nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil)
+			h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, "", upstreamPath, isStream, http.StatusServiceUnavailable, "no_healthy_backend", nil, time.Since(started).Milliseconds(), 0, h.rawForLog(apiKey, raw), nil, nil)
 			proxy.WriteError(w, http.StatusServiceUnavailable, proxy.BackendUnavailable(
 				fmt.Sprintf("No healthy backend available for model: %s", peek.Model),
 				"no_healthy_backend",
@@ -406,6 +415,11 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 		if forwardName != peek.Model {
 			forwardBody = rewriteModelInBody(raw, forwardName)
 		}
+
+		// Input-token compression (before forwarding). Never touches raw, so a
+		// log_raw_request policy still captures the client-original body. Any
+		// failure is an internal no-op: forwardBody stays as-is.
+		compStats := h.maybeCompress(internalModel, apiKey, upstreamPath, &forwardBody)
 
 		apiKeyLabel := "anonymous"
 		if apiKey != nil {
@@ -568,7 +582,7 @@ func (h *Handler) Forward(upstreamPath string) http.HandlerFunc {
 			}
 			h.recordLog(r.Context(), requestID, apiKey, clientIP, peek.Model, internalModel, picked.ID,
 				upstreamPath, isStream, statusCode, errorCodeFromForward(ferr, statusCode),
-				&capturedUsage, latencyMS, ttftMS, rawReqForLog, rawRespForLog)
+				&capturedUsage, latencyMS, ttftMS, rawReqForLog, rawRespForLog, compStats)
 		}
 	}
 }
@@ -587,7 +601,7 @@ func errorCodeFromForward(err error, statusCode int) string {
 func (h *Handler) recordLog(ctx context.Context, requestID string, k *store.APIKey,
 	clientIP, model, internalModel, backendID, endpoint string, stream bool, statusCode int,
 	errorCode string, usage *proxy.Usage, latencyMS, ttftMS int64,
-	rawReq, rawResp []byte) {
+	rawReq, rawResp []byte, comp *compress.Stats) {
 	if h.logstore == nil {
 		return
 	}
@@ -605,6 +619,12 @@ func (h *Handler) recordLog(ctx context.Context, requestID string, k *store.APIK
 		LatencyMS:     latencyMS,
 		TTFTMS:        ttftMS,
 		CreatedAt:     time.Now().UTC(),
+	}
+	if comp != nil && comp.Applied {
+		rec.CompressionApplied = true
+		rec.OriginalTokens = int64(comp.TokensBefore)
+		rec.CompressedTokens = int64(comp.TokensAfter)
+		rec.CompressionRatio = comp.Ratio
 	}
 	if k != nil {
 		rec.APIKeyID = k.ID

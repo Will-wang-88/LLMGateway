@@ -189,6 +189,7 @@ type Model struct {
 	CapabilityMode string
 	Capabilities   map[string]bool
 	RoutingPolicy  string
+	Compression    *config.CompressionConfig
 }
 
 type ModelAlias struct {
@@ -212,6 +213,7 @@ type APIKey struct {
 	Quota            *config.APIKeyQuota
 	DelayMS          int
 	Logging          *config.APIKeyLogging
+	Compression      *config.CompressionConfig
 	ExpiresAt        time.Time
 
 	mu            sync.RWMutex
@@ -414,6 +416,7 @@ func (s *Store) LoadFromConfig(cfg *config.Config) error {
 			CapabilityMode: mc.CapabilityMode,
 			Capabilities:   mc.Capabilities,
 			RoutingPolicy:  mc.RoutingPolicy,
+			Compression:    mc.Compression,
 		}
 		if m.Type == "" {
 			m.Type = "chat"
@@ -450,6 +453,7 @@ func (s *Store) LoadFromConfig(cfg *config.Config) error {
 			Quota:            kc.Quota,
 			DelayMS:          kc.DelayMS,
 			Logging:          kc.Logging,
+			Compression:      kc.Compression,
 		}
 		if kc.Key != "" {
 			k.KeyHash = s.HashKey(kc.Key)
